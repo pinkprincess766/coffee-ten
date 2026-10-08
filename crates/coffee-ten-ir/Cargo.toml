@@ -1,0 +1,8 @@
+[package]
+name = "coffee-ten-ir"
+description = "Graph IR and shapes for coffee-ten."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
