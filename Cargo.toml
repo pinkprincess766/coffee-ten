@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/coffee-ten-ir"]
+members = ["crates/coffee-ten-ir", "crates/coffee-ten-loop"]
 
 [workspace.package]
 version = "0.0.0"
