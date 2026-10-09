@@ -1,5 +1,8 @@
 //! Loop IR for coffee-ten: perfect loop nests with one store and affine indices.
 
+pub mod schedule;
+pub use schedule::{Schedule, ScheduleParseError, Step};
+
 use std::fmt;
 
 /// `for name in 0..extent`, step 1.
