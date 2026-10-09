@@ -1,0 +1,11 @@
+[package]
+name = "coffee-ten-codegen-c"
+description = "C99 backend for coffee-ten."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+coffee-ten-loop = { path = "../coffee-ten-loop" }
