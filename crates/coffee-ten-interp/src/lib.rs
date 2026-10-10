@@ -225,6 +225,10 @@ fn evaluate<T: Scalar>(
                     data,
                 }
             }
+            Op::MatMul(a, b) => Tensor {
+                shape: node.shape.clone(),
+                data: matmul(operand(&values, *a), operand(&values, *b)),
+            },
         };
         values[index] = Some(value);
     }
@@ -272,7 +276,7 @@ fn needed_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         match &graph.nodes()[index].op {
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => needed[x.index()] = true,
-            Op::Binary(_, a, b) => {
+            Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 needed[a.index()] = true;
                 needed[b.index()] = true;
             }
@@ -315,6 +319,27 @@ fn broadcast_strides(operand: &Shape, out: &Shape) -> Vec<usize> {
         stride *= dim;
     }
     strides
+}
+
+/// `a (M, K) @ b (K, N)` as a flat row-major `(M, N)` buffer. For each `(i, j)`, `acc = 0`,
+/// then for `k` ascending `acc = acc + a[i,k] * b[k,j]`. The product and the sum are two
+/// roundings, never fused, and this is the order of the C kernel (init nest writes 0,
+/// update nest adds `A*B` with `k` ascending), so f32 results agree bit for bit.
+fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
+    let (m, k) = (a.shape().dims()[0], a.shape().dims()[1]);
+    let n = b.shape().dims()[1];
+    let mut data = Vec::with_capacity(m * n);
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = T::zero();
+            for kk in 0..k {
+                let product = a.data[i * k + kk].mul(b.data[kk * n + j]);
+                acc = acc.add(product);
+            }
+            data.push(acc);
+        }
+    }
+    data
 }
 
 fn broadcast_binary<T: Scalar>(
@@ -655,6 +680,73 @@ mod tests {
         let a_t = tensor(&[2], &[1.0, -2.0]);
         // -[1,-2] = [-1,2]
         check_both(&g, neg, &[("A", &a_t)], &[2], &[-1.0, 2.0]);
+    }
+
+    #[test]
+    fn matmul_hand_values_in_both_modes() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let prod = g.matmul(a, b).unwrap();
+        let a_t = tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b_t = tensor(&[3, 2], &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        // [[1,2,3],[4,5,6]] @ [[7,8],[9,10],[11,12]] = [[58,64],[139,154]]
+        check_both(
+            &g,
+            prod,
+            &[("A", &a_t), ("B", &b_t)],
+            &[2, 2],
+            &[58.0, 64.0, 139.0, 154.0],
+        );
+    }
+
+    #[test]
+    fn matmul_then_bias_then_relu() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let bias = g.input("bias", shape(&[2])).unwrap();
+        let prod = g.matmul(a, b).unwrap();
+        let sum = g.binary(BinaryOp::Add, prod, bias).unwrap();
+        let out = g.unary(UnaryOp::Relu, sum).unwrap();
+        let a_t = tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b_t = tensor(&[3, 2], &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let bias_t = tensor(&[2], &[-100.0, -150.0]);
+        // [[58,64],[139,154]] + [-100,-150] = [[-42,-86],[39,4]], relu = [[0,0],[39,4]]
+        check_both(
+            &g,
+            out,
+            &[("A", &a_t), ("B", &b_t), ("bias", &bias_t)],
+            &[2, 2],
+            &[0.0, 0.0, 39.0, 4.0],
+        );
+    }
+
+    #[test]
+    fn matmul_f32_matches_canonical_order_bit_for_bit() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[4, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let prod = g.matmul(a, b).unwrap();
+        // A[i][k] at flat index i*3+k, B[k][j] at flat index k*2+j.
+        let a_data: Vec<f32> = (0..12usize).map(|x| x as f32 * 0.1 + 1.0 / 3.0).collect();
+        let b_data: Vec<f32> = (0..6usize).map(|x| x as f32 * 0.7 - 0.25).collect();
+        let a_t = tensor(&[4, 3], &a_data);
+        let b_t = tensor(&[3, 2], &b_data);
+        let out = run_f32(&g, prod, &[("A", &a_t), ("B", &b_t)]).unwrap();
+        for i in 0..4 {
+            for j in 0..2 {
+                let mut acc = 0.0f32;
+                for k in 0..3 {
+                    acc += a_data[i * 3 + k] * b_data[k * 2 + j];
+                }
+                assert_eq!(
+                    out.data()[i * 2 + j].to_bits(),
+                    acc.to_bits(),
+                    "element ({i}, {j})"
+                );
+            }
+        }
     }
 
     #[test]

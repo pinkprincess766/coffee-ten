@@ -14,6 +14,9 @@ pub const MAX_EXPR_NODES: usize = 1000;
 
 /// Lowers the elementwise graph ending at `output` into a kernel with one loop nest.
 pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerError> {
+    if let Some(matmul) = find_matmul(graph, output)? {
+        return Err(LowerError::NotElementwise(matmul));
+    }
     let out_dims = node(graph, output)?.shape.dims().to_vec();
     if out_dims.contains(&0) {
         return Err(LowerError::ZeroSizedOutput);
@@ -84,12 +87,15 @@ pub enum LowerError {
     ExpressionTooLarge {
         nodes: usize,
     },
+    /// A matmul is reachable from the output; only elementwise graphs lower to one nest.
+    NotElementwise(NodeId),
 }
 
 impl fmt::Display for LowerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LowerError::UnknownNode(id) => write!(f, "unknown node %{}", id.index()),
+            LowerError::NotElementwise(id) => write!(f, "node %{} is not elementwise", id.index()),
             LowerError::NameClash(name) => {
                 write!(f, "input {name} clashes with the output or a loop variable")
             }
@@ -107,6 +113,26 @@ fn node(graph: &Graph, id: NodeId) -> Result<&Node, LowerError> {
     graph.get(id).ok_or(LowerError::UnknownNode(id))
 }
 
+/// The first MatMul reachable from `output`. Each node is expanded once, so a shared
+/// subgraph is not walked once per use.
+fn find_matmul(graph: &Graph, output: NodeId) -> Result<Option<NodeId>, LowerError> {
+    let mut seen = vec![false; graph.nodes().len()];
+    let mut stack = vec![output];
+    while let Some(id) = stack.pop() {
+        let node = node(graph, id)?;
+        if std::mem::replace(&mut seen[id.index()], true) {
+            continue;
+        }
+        match &node.op {
+            Op::MatMul(..) => return Ok(Some(id)),
+            Op::Input { .. } | Op::Const(_) => {}
+            Op::Unary(_, x) => stack.push(*x),
+            Op::Binary(_, a, b) => stack.extend([*a, *b]),
+        }
+    }
+    Ok(None)
+}
+
 /// Marks the nodes that `output` depends on. Operands are added before their users,
 /// so one backward pass from `output` finds them all.
 fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
@@ -120,7 +146,7 @@ fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         match &nodes[index].op {
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => is_reachable[x.index()] = true,
-            Op::Binary(_, a, b) => {
+            Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 is_reachable[a.index()] = true;
                 is_reachable[b.index()] = true;
             }
@@ -138,7 +164,7 @@ fn tree_size(graph: &Graph, output: NodeId) -> usize {
         size[index] = match &nodes[index].op {
             Op::Input { .. } | Op::Const(_) => 1,
             Op::Unary(_, x) => size[x.index()].saturating_add(1),
-            Op::Binary(_, a, b) => size[a.index()]
+            Op::Binary(_, a, b) | Op::MatMul(a, b) => size[a.index()]
                 .saturating_add(size[b.index()])
                 .saturating_add(1),
         };
@@ -189,6 +215,7 @@ fn lower_value(
             Box::new(lower_value(graph, buffer_of, out_rank, *a)?),
             Box::new(lower_value(graph, buffer_of, out_rank, *b)?),
         ),
+        Op::MatMul(..) => return Err(LowerError::NotElementwise(id)),
     };
     Ok(expr)
 }
@@ -414,6 +441,73 @@ mod tests {
         assert_eq!(
             lower_elementwise(&g, x, "k"),
             Err(LowerError::ExpressionTooLarge { nodes: 2047 })
+        );
+    }
+
+    #[test]
+    fn matmul_under_elementwise_ops_is_not_elementwise() {
+        // relu(A @ B + bias): the matmul is node %3.
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let bias = g.input("bias", shape(&[2])).unwrap();
+        let prod = g.matmul(a, b).unwrap();
+        let sum = g.binary(coffee_ten_ir::BinaryOp::Add, prod, bias).unwrap();
+        let out = g.unary(coffee_ten_ir::UnaryOp::Relu, sum).unwrap();
+        assert_eq!(prod.index(), 3);
+        let err = lower_elementwise(&g, out, "k").unwrap_err();
+        assert_eq!(err, LowerError::NotElementwise(prod));
+        assert_eq!(err.to_string(), "node %3 is not elementwise");
+    }
+
+    #[test]
+    fn matmul_outside_the_output_does_not_block_lowering() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 2])).unwrap();
+        let b = g.input("B", shape(&[2, 2])).unwrap();
+        g.matmul(a, b).unwrap();
+        let out = g.unary(coffee_ten_ir::UnaryOp::Neg, a).unwrap();
+        assert_eq!(
+            lowered_text(&g, out),
+            concat!(
+                "kernel k(A: f32[2, 2], out: f32[2, 2])\n",
+                "for i0 in 0..2:\n",
+                "  for i1 in 0..2:\n",
+                "    out[i0, i1] = -(A[i0, i1])\n",
+            )
+        );
+    }
+
+    #[test]
+    fn matmul_is_reported_before_expression_size() {
+        // A @ A, then x = x + x twelve times: far over the node limit.
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 2])).unwrap();
+        let mm = g.matmul(a, a).unwrap();
+        let mut x = mm;
+        for _ in 0..12 {
+            x = g.binary(coffee_ten_ir::BinaryOp::Add, x, x).unwrap();
+        }
+        assert_eq!(
+            lower_elementwise(&g, x, "k"),
+            Err(LowerError::NotElementwise(mm))
+        );
+    }
+
+    #[test]
+    fn shared_elementwise_dag_is_walked_once_for_the_matmul_check() {
+        // x = x + x sixty times: 2^61 - 1 tree nodes from 61 graph nodes. The matmul check
+        // must visit each graph node once, or this test does not finish.
+        let mut g = Graph::new();
+        let mut x = g.input("A", shape(&[2])).unwrap();
+        for _ in 0..60 {
+            x = g.binary(coffee_ten_ir::BinaryOp::Add, x, x).unwrap();
+        }
+        assert_eq!(
+            lower_elementwise(&g, x, "k"),
+            Err(LowerError::ExpressionTooLarge {
+                nodes: (1 << 61) - 1
+            })
         );
     }
 }
