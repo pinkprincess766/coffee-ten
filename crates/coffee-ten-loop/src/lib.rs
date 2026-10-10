@@ -5,7 +5,7 @@ pub use schedule::{Schedule, ScheduleParseError, Step};
 pub mod lower;
 pub use lower::{LowerError, MAX_EXPR_NODES, lower, lower_elementwise};
 pub mod apply;
-pub use apply::{ScheduleError, apply};
+pub use apply::{OrderClass, ScheduleError, apply, apply_classified};
 
 use std::fmt;
 
