@@ -279,6 +279,7 @@ fn elementwise_nest(
         .map(|(&extent, loop_name)| Loop {
             name: loop_name.clone(),
             extent,
+            vectorize: false,
         })
         .collect();
     let target = Access {
@@ -306,6 +307,7 @@ fn matmul_nests(
     let lp = |name: &str, extent| Loop {
         name: name.to_string(),
         extent,
+        vectorize: false,
     };
     let at = |buffer, names: [&str; 2]| Access {
         buffer,
