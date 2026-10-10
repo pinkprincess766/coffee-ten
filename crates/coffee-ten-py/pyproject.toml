@@ -1,0 +1,14 @@
+[build-system]
+# maturin >= 1.9.4 sets PYO3_BUILD_EXTENSION_MODULE itself (see .cargo/config.toml).
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "coffee-ten"
+description = "A tiny tensor compiler: Python builder and reference interpreter."
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy"]
+
+[tool.maturin]
+module-name = "coffee_ten"
