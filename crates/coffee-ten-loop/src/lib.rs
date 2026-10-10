@@ -9,11 +9,13 @@ pub use apply::{OrderClass, ScheduleError, apply, apply_classified};
 
 use std::fmt;
 
-/// `for name in 0..extent`, step 1.
+/// `for name in 0..extent`, step 1. A `vectorize` loop asks the backend to vectorize it;
+/// per nest at most one loop has it and it is the innermost (see `Kernel::validate`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loop {
     pub name: String,
     pub extent: usize,
+    pub vectorize: bool,
 }
 
 /// Row-major f32 buffer.
@@ -102,6 +104,10 @@ pub enum LoopIrError {
         nest: usize,
         loop_name: String,
     },
+    /// More than one loop of the nest is vectorized, or the vectorized loop is not the innermost.
+    BadVectorize {
+        nest: usize,
+    },
     /// A guard can never hold: its smallest value is already `>= bound`.
     EmptyGuard {
         nest: usize,
@@ -137,6 +143,9 @@ impl fmt::Display for LoopIrError {
             }
             Self::UnknownLoop { nest, loop_name } => {
                 write!(f, "nest {nest}: unknown loop {loop_name}")
+            }
+            Self::BadVectorize { nest } => {
+                write!(f, "nest {nest}: only the innermost loop may be vectorized")
             }
             Self::EmptyGuard { nest } => write!(f, "nest {nest}: a guard never holds"),
             Self::UnknownBuffer { nest, buffer } => {
@@ -199,6 +208,14 @@ fn validate_nest(buffers: &[Buffer], nest_no: usize, nest: &LoopNest) -> Result<
                 loop_name: l.name.clone(),
             });
         }
+    }
+    let last = loops.len().saturating_sub(1);
+    let is_vectorize_ok = loops
+        .iter()
+        .enumerate()
+        .all(|(pos, l)| !l.vectorize || pos == last);
+    if !is_vectorize_ok {
+        return Err(LoopIrError::BadVectorize { nest: nest_no });
     }
     for guard in &nest.guards {
         check_terms(nest_no, loops, &guard.expr)?;
@@ -383,7 +400,14 @@ impl fmt::Display for Kernel {
 
 fn write_nest(f: &mut fmt::Formatter<'_>, buffers: &[Buffer], nest: &LoopNest) -> fmt::Result {
     for (depth, l) in nest.loops.iter().enumerate() {
-        writeln!(f, "{}for {} in 0..{}:", indent(depth), l.name, l.extent)?;
+        let mark = if l.vectorize { " (vectorize)" } else { "" };
+        writeln!(
+            f,
+            "{}for {} in 0..{}{mark}:",
+            indent(depth),
+            l.name,
+            l.extent
+        )?;
     }
     let mut depth = nest.loops.len();
     for guard in &nest.guards {
@@ -458,6 +482,7 @@ mod tests {
         Loop {
             name: name.to_string(),
             extent,
+            vectorize: false,
         }
     }
 
@@ -557,6 +582,35 @@ mod tests {
             )
         );
         assert_eq!(k.validate(), Ok(()));
+    }
+
+    #[test]
+    fn vectorized_innermost_loop_prints_and_validates() {
+        let mut k = matmul();
+        k.nests[1].loops[2].vectorize = true;
+        assert!(k.to_string().contains("    for j in 0..2 (vectorize):\n"));
+        assert_eq!(k.to_string().matches("(vectorize)").count(), 1);
+        assert_eq!(k.validate(), Ok(()));
+    }
+
+    #[test]
+    fn vectorized_loop_that_is_not_innermost_is_rejected() {
+        let bad = Err(LoopIrError::BadVectorize { nest: 1 });
+        for marked in [
+            [true, false, false],
+            [false, true, false],
+            [true, false, true],
+        ] {
+            let mut k = matmul();
+            for (l, mark) in k.nests[1].loops.iter_mut().zip(marked) {
+                l.vectorize = mark;
+            }
+            assert_eq!(k.validate(), bad);
+        }
+        assert_eq!(
+            LoopIrError::BadVectorize { nest: 1 }.to_string(),
+            "nest 1: only the innermost loop may be vectorized"
+        );
     }
 
     #[test]
