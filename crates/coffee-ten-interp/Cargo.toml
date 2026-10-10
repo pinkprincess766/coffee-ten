@@ -1,0 +1,11 @@
+[package]
+name = "coffee-ten-interp"
+description = "Reference interpreter for coffee-ten graphs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+coffee-ten-ir = { path = "../coffee-ten-ir" }
