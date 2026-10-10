@@ -3,7 +3,7 @@
 pub mod schedule;
 pub use schedule::{Schedule, ScheduleParseError, Step};
 pub mod lower;
-pub use lower::{LowerError, MAX_EXPR_NODES, lower_elementwise};
+pub use lower::{LowerError, MAX_EXPR_NODES, lower, lower_elementwise};
 pub mod apply;
 pub use apply::{ScheduleError, apply};
 

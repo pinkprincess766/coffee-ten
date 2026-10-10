@@ -10,3 +10,7 @@ publish.workspace = true
 [dependencies]
 coffee-ten-loop = { path = "../coffee-ten-loop" }
 libloading = { workspace = true }
+
+[dev-dependencies]
+coffee-ten-ir = { path = "../coffee-ten-ir" }
+coffee-ten-interp = { path = "../coffee-ten-interp" }
