@@ -234,3 +234,60 @@ def test_expression_depth_limit_is_1000():
         y + 1.0
     with pytest.raises(ValueError, match="nested more than 1000 levels"):
         ct.relu(y)
+
+
+def test_matmul_hand_values():
+    a = f32([[1, 2, 3], [4, 5, 6]])
+    b = f32([[7, 8], [9, 10], [11, 12]])
+    A = ct.input("A", (2, 3))
+    B = ct.input("B", (3, 2))
+    assert (A @ B).shape == (2, 2)
+    expected = f32([[58, 64], [139, 154]])
+    np.testing.assert_array_equal(ct.run(A @ B, A=a, B=b), expected)
+    np.testing.assert_array_equal(ct.run(ct.matmul(A, B), A=a, B=b), expected)
+    # Operand order matters: (3,2) @ (2,3) is a different (3,3) product.
+    out = ct.run(B @ A, A=a, B=b)
+    assert out.shape == (3, 3)
+    np.testing.assert_array_equal(out, b @ a)
+
+
+def test_matmul_shape_errors_use_the_graph_message():
+    A = ct.input("A", (2, 3))
+    with pytest.raises(ValueError, match=r"^cannot matmul shapes \(2, 3\) and \(4, 2\)$"):
+        A @ ct.input("B", (4, 2))
+    with pytest.raises(ValueError, match=r"^cannot matmul shapes \(2, 3\) and \(2, 3\)$"):
+        A @ A
+    with pytest.raises(ValueError, match=r"^cannot matmul shapes \(3,\) and \(3, 2\)$"):
+        ct.input("v", (3,)) @ ct.input("B", (3, 2))
+    with pytest.raises(ValueError, match=r"^cannot matmul shapes \(2, 3\) and \(3,\)$"):
+        ct.matmul(A, ct.input("v", (3,)))
+    with pytest.raises(ValueError, match=r"^cannot matmul shapes \(\) and \(2, 3\)$"):
+        ct.matmul(ct.input("s", ()), A)
+
+
+def test_matmul_with_a_non_tensor_is_a_type_error():
+    A = ct.input("A", (2, 2))
+    with pytest.raises(TypeError):
+        A @ 2.0
+    with pytest.raises(TypeError):
+        2.0 @ A
+    with pytest.raises(TypeError):
+        A @ np.eye(2, dtype=np.float32)
+    with pytest.raises(TypeError):
+        np.eye(2, dtype=np.float32) @ A
+    with pytest.raises(TypeError):
+        ct.matmul(A, 2.0)
+
+
+def test_matmul_depth_limit_is_1000():
+    eye = np.eye(2, dtype=np.float32)
+    w = ct.input("w", (2, 2))
+    y = ct.input("x", (2, 2))
+    for _ in range(999):  # the input is level 1, so this makes level 1000
+        y = y @ w
+    x = f32([[1, 2], [3, 4]])
+    np.testing.assert_array_equal(ct.run(y, x=x, w=eye), x)
+    with pytest.raises(ValueError, match="nested more than 1000 levels"):
+        y @ w
+    with pytest.raises(ValueError, match="nested more than 1000 levels"):
+        ct.matmul(w, y)

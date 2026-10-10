@@ -23,6 +23,7 @@ enum Expr {
     Const(f32),
     Unary(UnaryOp, Arc<Expr>),
     Binary(BinaryOp, Arc<Expr>, Arc<Expr>),
+    MatMul(Arc<Expr>, Arc<Expr>),
 }
 
 /// A lazily evaluated tensor expression; it computes nothing until `run`.
@@ -56,6 +57,26 @@ impl PyTensor {
         let shape = a.shape.broadcast(&b.shape).map_err(value_error)?;
         let depth = check_depth(a.depth.max(b.depth) + 1)?;
         let expr = Expr::Binary(op, Arc::clone(&a.expr), Arc::clone(&b.expr));
+        Ok(PyTensor {
+            expr: Arc::new(expr),
+            shape,
+            depth,
+        })
+    }
+
+    fn matmul(a: &PyTensor, b: &PyTensor) -> PyResult<PyTensor> {
+        // Same rule and message as `Graph::matmul`, so the error shows at op time.
+        let shape = match (a.shape.dims(), b.shape.dims()) {
+            ([m, k], [k_right, n]) if k == k_right => Shape::new(vec![*m, *n]),
+            _ => {
+                return Err(value_error(GraphError::MatMulShape {
+                    left: a.shape.clone(),
+                    right: b.shape.clone(),
+                }));
+            }
+        };
+        let depth = check_depth(a.depth.max(b.depth) + 1)?;
+        let expr = Expr::MatMul(Arc::clone(&a.expr), Arc::clone(&b.expr));
         Ok(PyTensor {
             expr: Arc::new(expr),
             shape,
@@ -136,6 +157,11 @@ impl PyTensor {
     fn __rmul__(&self, other: Operand<'_>) -> PyResult<PyTensor> {
         PyTensor::binary(BinaryOp::Mul, &other.into_tensor(), self)
     }
+
+    // Tensor @ Tensor only: any other operand makes pyo3 return NotImplemented.
+    fn __matmul__(&self, other: PyRef<'_, PyTensor>) -> PyResult<PyTensor> {
+        PyTensor::matmul(self, &other)
+    }
 }
 
 /// Declares a named input of the given static shape (a tuple of ints >= 0).
@@ -176,6 +202,12 @@ fn relu(x: &PyTensor) -> PyResult<PyTensor> {
 #[pyfunction]
 fn maximum(a: Operand<'_>, b: Operand<'_>) -> PyResult<PyTensor> {
     PyTensor::binary(BinaryOp::Max, &a.into_tensor(), &b.into_tensor())
+}
+
+/// Matrix product `(M, K) @ (K, N) -> (M, N)`; both arguments must be rank 2 Tensors.
+#[pyfunction]
+fn matmul(a: &PyTensor, b: &PyTensor) -> PyResult<PyTensor> {
+    PyTensor::matmul(a, b)
 }
 
 /// Evaluates `output` with the reference interpreter in float32.
@@ -231,6 +263,11 @@ fn lower(
             let b = lower(b, graph, memo)?;
             graph.binary(*op, a, b)?
         }
+        Expr::MatMul(a, b) => {
+            let a = lower(a, graph, memo)?;
+            let b = lower(b, graph, memo)?;
+            graph.matmul(a, b)?
+        }
     };
     memo.insert(key, id);
     Ok(id)
@@ -260,5 +297,5 @@ fn read_input(name: &str, value: &Bound<'_, PyAny>) -> PyResult<DenseTensor<f32>
 #[pymodule]
 mod coffee_ten {
     #[pymodule_export]
-    use super::{PyTensor, input, maximum, relu, run};
+    use super::{PyTensor, input, matmul, maximum, relu, run};
 }
