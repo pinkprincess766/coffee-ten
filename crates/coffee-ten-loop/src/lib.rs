@@ -2,6 +2,8 @@
 
 pub mod schedule;
 pub use schedule::{Schedule, ScheduleParseError, Step};
+pub mod lower;
+pub use lower::{LowerError, MAX_EXPR_NODES, lower_elementwise};
 
 use std::fmt;
 
