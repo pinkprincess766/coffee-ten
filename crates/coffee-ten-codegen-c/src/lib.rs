@@ -3,6 +3,9 @@
 use coffee_ten_loop::{Access, BinaryOp, Buffer, Expr, Kernel, LoopIrError, LoopNest, UnaryOp};
 use std::fmt;
 
+mod compile;
+pub use compile::{CompileError, CompiledKernel, RunError, TEST_FLAGS, compile};
+
 /// Why `emit_c` refused a kernel.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CodegenError {
@@ -41,7 +44,7 @@ const MAX_HELPER: &str =
     "static inline float ct_max(float a, float b) { return a > b ? a : b; }\n\n";
 
 /// Names a kernel, buffer or loop must not take: C99 keywords and our helpers.
-const RESERVED: [&str; 39] = [
+const RESERVED: [&str; 40] = [
     "auto",
     "break",
     "case",
@@ -81,6 +84,7 @@ const RESERVED: [&str; 39] = [
     "_Imaginary",
     "ct_relu",
     "ct_max",
+    "ct_entry",
 ];
 
 /// Emits `kernel` as one C99 function. Buffers that are stored to are `restrict` outputs.
