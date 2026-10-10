@@ -291,7 +291,7 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use coffee_ten_loop::{
-        Access, AffineExpr, BinaryOp, Buffer, Expr, Loop, LoopNest, Store, UnaryOp,
+        Access, AffineExpr, BinaryOp, Buffer, Expr, Loop, LoopNest, Schedule, Store, UnaryOp, apply,
     };
 
     fn lp(name: &str, extent: usize) -> Loop {
@@ -326,6 +326,7 @@ mod tests {
     fn nest(loops: Vec<Loop>, buffer: usize, index: Vec<AffineExpr>, value: Expr) -> LoopNest {
         LoopNest {
             loops,
+            guards: Vec::new(),
             body: Store {
                 target: Access { buffer, index },
                 value,
@@ -438,6 +439,36 @@ mod tests {
                     "C[{i}][{j}]: got {got:?}, expected {expected:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn split_matmul_with_remainder_matches_unsplit_bit_for_bit() {
+        // K = 3 split by 2: the guard must skip k = 3, whose A and B reads are out of range.
+        let split = apply(
+            &matmul(),
+            &Schedule::parse("split(1, k, ko, ki, 2)").unwrap(),
+        )
+        .unwrap();
+        let dir = TempDir::new("split");
+        let (a, b) = matmul_inputs();
+        // Nonzero values behind A and B, so that an out-of-range read changes C.
+        let mut a_storage = [a.as_slice(), &[1e3; 8]].concat();
+        let mut b_storage = [b.as_slice(), &[1e3; 8]].concat();
+        let mut outputs = Vec::new();
+        for kernel in [matmul(), split] {
+            let compiled = compile(&kernel, &dir.0).unwrap();
+            let mut c = vec![f32::NAN; 8];
+            let (a, b) = (&mut a_storage[..12], &mut b_storage[..6]);
+            compiled.run(&mut [a, b, &mut c]).unwrap();
+            outputs.push(c);
+        }
+        for (n, (split_c, plain_c)) in outputs[1].iter().zip(&outputs[0]).enumerate() {
+            assert_eq!(
+                split_c.to_bits(),
+                plain_c.to_bits(),
+                "C[{n}]: split {split_c:?}, unsplit {plain_c:?}"
+            );
         }
     }
 
