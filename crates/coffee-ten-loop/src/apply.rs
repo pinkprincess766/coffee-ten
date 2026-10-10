@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::{Access, AffineExpr, Expr, Guard, Kernel, Loop, LoopIrError, Schedule, Step};
+use crate::{Access, AffineExpr, BinaryOp, Expr, Guard, Kernel, Loop, LoopIrError, Schedule, Step};
 
 /// Why `apply` refused a schedule. `step` counts from 0 in `Schedule::steps`.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,7 +25,7 @@ pub enum ScheduleError {
     ZeroFactor {
         step: usize,
     },
-    /// The step is valid but not applied yet (reorder and vectorize come in later PRs).
+    /// The step is valid but not applied yet (vectorize comes in a later PR).
     NotImplemented {
         step: usize,
         what: &'static str,
@@ -33,6 +33,17 @@ pub enum ScheduleError {
     /// A factor, extent or scaled coefficient does not fit the loop IR's `i64`.
     NumberTooLarge {
         step: usize,
+    },
+    /// The `order` of a reorder is not a permutation of the loops of the nest.
+    BadReorder {
+        step: usize,
+        nest: usize,
+    },
+    /// The nest reads its store target at another index than it writes, so iterations
+    /// depend on each other in a way reordering would break (see `reorder`).
+    IllegalReorder {
+        step: usize,
+        nest: usize,
     },
     /// The result failed `Kernel::validate`; this is a bug in `apply` or the input kernel.
     Invalid(LoopIrError),
@@ -57,6 +68,18 @@ impl fmt::Display for ScheduleError {
             Self::NumberTooLarge { step } => {
                 write!(f, "step {step}: a number does not fit in i64")
             }
+            Self::BadReorder { step, nest } => {
+                write!(
+                    f,
+                    "step {step}: order is not a permutation of the loops of nest {nest}"
+                )
+            }
+            Self::IllegalReorder { step, nest } => {
+                write!(
+                    f,
+                    "step {step}: nest {nest} reads its target at another index"
+                )
+            }
             Self::Invalid(e) => write!(f, "schedule produced an invalid kernel: {e}"),
         }
     }
@@ -64,13 +87,32 @@ impl fmt::Display for ScheduleError {
 
 impl std::error::Error for ScheduleError {}
 
+/// How a schedule changes the order of float operations (spec §5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderClass {
+    /// Every target element receives its contributions in the same order, so f32 results
+    /// are bit for bit equal.
+    Preserving,
+    /// Only the multiset of contributions per target element is the same; the order of a
+    /// float sum changes, so results are equal only within a tolerance.
+    Reordering,
+}
+
 /// Applies the steps in order to a copy of `kernel` and validates the result. On error
-/// `kernel` is untouched, as it is only borrowed.
-///
-/// `split` keeps the order of all iterations, hence the order of every float operation,
-/// so it is order-preserving: results stay bit for bit equal (spec §5.3).
+/// `kernel` is untouched, as it is only borrowed. See `apply_classified` for the order class.
 pub fn apply(kernel: &Kernel, schedule: &Schedule) -> Result<Kernel, ScheduleError> {
+    apply_classified(kernel, schedule).map(|(result, _)| result)
+}
+
+/// Like `apply`, and also says whether the schedule is order-preserving or reordering.
+/// A schedule is `Reordering` if any step is. `split` keeps the order of all iterations,
+/// hence of every float operation, so it is `Preserving`; see `reorder` for the rest.
+pub fn apply_classified(
+    kernel: &Kernel,
+    schedule: &Schedule,
+) -> Result<(Kernel, OrderClass), ScheduleError> {
     let mut result = kernel.clone();
+    let mut class = OrderClass::Preserving;
     for (step_no, step) in schedule.steps.iter().enumerate() {
         match step {
             Step::Split {
@@ -88,16 +130,180 @@ pub fn apply(kernel: &Kernel, schedule: &Schedule) -> Result<Kernel, ScheduleErr
                 inner,
                 *factor,
             )?,
-            Step::Reorder { .. } => return Err(not_implemented(step_no, "reorder")),
+            Step::Reorder { nest, order } => {
+                if reorder(&mut result, step_no, *nest, order)? == OrderClass::Reordering {
+                    class = OrderClass::Reordering;
+                }
+            }
             Step::Vectorize { .. } => return Err(not_implemented(step_no, "vectorize")),
         }
     }
     result.validate().map_err(ScheduleError::Invalid)?;
-    Ok(result)
+    Ok((result, class))
 }
 
 fn not_implemented(step: usize, what: &'static str) -> ScheduleError {
     ScheduleError::NotImplemented { step, what }
+}
+
+/// Rearranges the loops of nest `nest_no` into `order`, which must name every loop once.
+/// Extents, guards and the body stay as they are.
+///
+/// Legality: let `T[I]` be the store target and R the reduction loops (see below). The
+/// nest is legal to reorder if
+/// - the map from iteration to element `T[I]` is injective on the loops not in R (see
+///   `is_injective`), so iterations of different non-reduction points write different
+///   elements and are independent;
+/// - if R is empty, the body has no load of `T` at an index other than `I`: an iteration
+///   then reads at most the element it writes itself;
+/// - if R is not empty, the value is `T[I] + e` or `e + T[I]` with no load of `T` in `e`.
+///   The only dependence is then the reassociation of a sum into the same element, which
+///   is exactly what the `Reordering` class allows. Other forms, like `T[I] * 2 + e` or an
+///   overwrite `T[I] = e`, depend on the order of the iterations in a way that is not
+///   rounding, so they are refused.
+///
+/// Class: a loop is a reduction loop if its name is not in the store index (non-zero
+/// coefficient). The step is `Reordering` iff it changes the relative order of the
+/// reduction loops, as that is the order in which an element receives its contributions.
+fn reorder(
+    kernel: &mut Kernel,
+    step: usize,
+    nest_no: usize,
+    order: &[String],
+) -> Result<OrderClass, ScheduleError> {
+    let nest = kernel
+        .nests
+        .get_mut(nest_no)
+        .ok_or(ScheduleError::NoSuchNest {
+            step,
+            nest: nest_no,
+        })?;
+    let names_each_loop_once = order.len() == nest.loops.len()
+        && nest
+            .loops
+            .iter()
+            .all(|l| order.iter().filter(|name| **name == l.name).count() == 1);
+    if !names_each_loop_once {
+        return Err(ScheduleError::BadReorder {
+            step,
+            nest: nest_no,
+        });
+    }
+    let target = &nest.body.target;
+    let value = &nest.body.value;
+    let is_reduction = |name: &str| {
+        let in_index = |e: &AffineExpr| e.terms.iter().any(|(n, coeff)| n == name && *coeff != 0);
+        !target.index.iter().any(in_index)
+    };
+    let has_reduction = nest.loops.iter().any(|l| is_reduction(&l.name));
+    let is_value_legal = if has_reduction {
+        is_accumulation(value, target)
+    } else {
+        !any_load(value, &|x| is_other_element(x, target))
+    };
+    if !is_value_legal || !is_injective(&nest.loops, target) {
+        return Err(ScheduleError::IllegalReorder {
+            step,
+            nest: nest_no,
+        });
+    }
+    let before = nest.loops.iter().map(|l| l.name.as_str());
+    let after = order.iter().map(String::as_str);
+    let is_same_reduction_order = before
+        .filter(|name| is_reduction(name))
+        .eq(after.filter(|name| is_reduction(name)));
+    let loops: Vec<Loop> = order
+        .iter()
+        .map(|name| {
+            let l = nest.loops.iter().find(|l| &l.name == name);
+            l.expect("invariant: order is a permutation of the loops")
+                .clone()
+        })
+        .collect();
+    nest.loops = loops;
+    Ok(if is_same_reduction_order {
+        OrderClass::Preserving
+    } else {
+        OrderClass::Reordering
+    })
+}
+
+/// True if `value` is `target + e` or `e + target`, where `e` has no load of the buffer
+/// of `target`.
+fn is_accumulation(value: &Expr, target: &Access) -> bool {
+    let Expr::Binary(BinaryOp::Add, a, b) = value else {
+        return false;
+    };
+    let is_target =
+        |e: &Expr| matches!(e, Expr::Load(x) if x.buffer == target.buffer && same_index(x, target));
+    let has_buffer = |e: &Expr| any_load(e, &|x| x.buffer == target.buffer);
+    (is_target(a) && !has_buffer(b)) || (is_target(b) && !has_buffer(a))
+}
+
+/// True if `x` loads the buffer of `target` at an index other than that of `target`.
+fn is_other_element(x: &Access, target: &Access) -> bool {
+    x.buffer == target.buffer && !same_index(x, target)
+}
+
+/// True if some load in `e` satisfies `pred`.
+fn any_load(e: &Expr, pred: &dyn Fn(&Access) -> bool) -> bool {
+    match e {
+        Expr::Load(access) => pred(access),
+        Expr::Const(_) => false,
+        Expr::Unary(_, x) => any_load(x, pred),
+        Expr::Binary(_, a, b) => any_load(a, pred) || any_load(b, pred),
+    }
+}
+
+/// Sufficient check that different values of the loops that appear in `target` give
+/// different elements. Every such loop must appear in only one dimension of the index;
+/// within a dimension, sort the terms by |coeff|, ascending; each |coeff| must exceed the
+/// sum over the earlier terms of |coeff| * (extent - 1), the largest value they can add up
+/// to. The terms are then the digits of a mixed-radix number, which determines them
+/// uniquely: `i`, `2*ko + ki` with ki in 0..2, `4*io + ii` pass; `i + k` does not.
+fn is_injective(loops: &[Loop], target: &Access) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for dim in &target.index {
+        let mut terms: Vec<(u128, u128)> = Vec::new();
+        for (name, coeff) in dim.terms.iter().filter(|(_, c)| *c != 0) {
+            let extent = loops
+                .iter()
+                .find(|l| &l.name == name)
+                .map_or(1, |l| l.extent);
+            if seen.contains(&name.as_str()) {
+                return false;
+            }
+            seen.push(name);
+            terms.push((
+                u128::from(coeff.unsigned_abs()),
+                extent.saturating_sub(1) as u128,
+            ));
+        }
+        terms.sort();
+        let mut reach = 0u128;
+        for (coeff, last) in terms {
+            if coeff <= reach {
+                return false;
+            }
+            reach = reach.saturating_add(coeff.saturating_mul(last));
+        }
+    }
+    true
+}
+
+/// Equal constants and equal terms in any order, in every dimension; zero coefficients
+/// are ignored.
+fn same_index(a: &Access, b: &Access) -> bool {
+    let sorted_terms = |e: &AffineExpr| {
+        let mut terms: Vec<_> = e.terms.iter().filter(|(_, c)| *c != 0).cloned().collect();
+        terms.sort();
+        terms
+    };
+    a.index.len() == b.index.len()
+        && a.index
+            .iter()
+            .zip(&b.index)
+            .all(|(x, y)| x.constant == y.constant && sorted_terms(x) == sorted_terms(y))
 }
 
 /// Replaces loop `loop_name` of extent `n` by `outer` (extent ceil(n/factor)) and `inner`
@@ -242,6 +448,7 @@ mod tests {
     use crate::{BinaryOp, Buffer, LoopNest, Store, lower_elementwise};
     use coffee_ten_ir::{Graph, Shape};
     use proptest::prelude::*;
+    use std::collections::BTreeMap;
 
     fn lp(name: &str, extent: usize) -> Loop {
         Loop {
@@ -284,17 +491,21 @@ mod tests {
     }
 
     fn matmul() -> Kernel {
+        matmul_sized(4, 3, 2)
+    }
+
+    fn matmul_sized(m: usize, k: usize, n: usize) -> Kernel {
         Kernel {
             name: "matmul".to_string(),
-            buffers: vec![buf("A", &[4, 3]), buf("B", &[3, 2]), buf("C", &[4, 2])],
+            buffers: vec![buf("A", &[m, k]), buf("B", &[k, n]), buf("C", &[m, n])],
             nests: vec![
                 nest(
-                    vec![lp("i", 4), lp("j", 2)],
+                    vec![lp("i", m), lp("j", n)],
                     vec![var("i"), var("j")],
                     Expr::Const(0.0),
                 ),
                 nest(
-                    vec![lp("i", 4), lp("k", 3), lp("j", 2)],
+                    vec![lp("i", m), lp("k", k), lp("j", n)],
                     vec![var("i"), var("j")],
                     bin(
                         BinaryOp::Add,
@@ -522,15 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn reorder_and_vectorize_are_not_implemented() {
-        assert_refused(
-            &matmul(),
-            &schedule("split(1, k, ko, ki, 2); reorder(1, i, j, ko, ki)"),
-            ScheduleError::NotImplemented {
-                step: 1,
-                what: "reorder",
-            },
-        );
+    fn vectorize_is_not_implemented() {
         assert_refused(
             &matmul(),
             &schedule("vectorize(1, j)"),
@@ -539,6 +742,306 @@ mod tests {
                 what: "vectorize",
             },
         );
+    }
+
+    fn classified(kernel: &Kernel, text: &str) -> (Kernel, OrderClass) {
+        apply_classified(kernel, &schedule(text)).expect("test schedule applies")
+    }
+
+    #[test]
+    fn reorder_prints_the_new_order() {
+        let k = matmul();
+        let (s, class) = classified(&k, "reorder(1, i, j, k)");
+        assert_eq!(
+            nest_text(&s, 1),
+            concat!(
+                "for i in 0..4:\n",
+                "  for j in 0..2:\n",
+                "    for k in 0..3:\n",
+                "      C[i, j] = C[i, j] + (A[i, k] * B[k, j])\n",
+            )
+        );
+        assert_eq!(s.nests[0], k.nests[0]);
+        assert_eq!(s.validate(), Ok(()));
+        assert_eq!(class, OrderClass::Preserving);
+    }
+
+    #[test]
+    fn reorder_keeps_guards_and_extents() {
+        let (s, _) = classified(
+            &matmul(),
+            "split(1, k, ko, ki, 2); reorder(1, ki, j, i, ko)",
+        );
+        assert_eq!(
+            nest_text(&s, 1),
+            concat!(
+                "for ki in 0..2:\n",
+                "  for j in 0..2:\n",
+                "    for i in 0..4:\n",
+                "      for ko in 0..2:\n",
+                "        if 2*ko + ki < 3:\n",
+                "          C[i, j] = C[i, j] + (A[i, 2*ko + ki] * B[2*ko + ki, j])\n",
+            )
+        );
+    }
+
+    #[test]
+    fn swapping_the_split_reduction_loops_is_reordering() {
+        let (_, class) = classified(
+            &matmul(),
+            "split(1, k, ko, ki, 2); reorder(1, i, ki, ko, j)",
+        );
+        assert_eq!(class, OrderClass::Reordering);
+    }
+
+    #[test]
+    fn moving_other_loops_around_the_reduction_loops_is_preserving() {
+        let (_, class) = classified(
+            &matmul(),
+            "split(1, k, ko, ki, 2); reorder(1, ko, i, ki, j)",
+        );
+        assert_eq!(class, OrderClass::Preserving);
+    }
+
+    #[test]
+    fn one_reordering_step_makes_the_schedule_reordering() {
+        let (_, class) = classified(
+            &matmul(),
+            "split(1, k, ko, ki, 2); reorder(1, i, ki, ko, j); reorder(1, i, ko, ki, j)",
+        );
+        assert_eq!(class, OrderClass::Reordering);
+    }
+
+    #[test]
+    fn every_order_of_an_elementwise_nest_is_preserving() {
+        let mut g = Graph::new();
+        let a = g.input("A", Shape::new(vec![2, 3, 2])).unwrap();
+        let y = g.unary(coffee_ten_ir::UnaryOp::Relu, a).unwrap();
+        let k = lower_elementwise(&g, y, "k").unwrap();
+        let names: Vec<String> = k.nests[0].loops.iter().map(|l| l.name.clone()).collect();
+        for picks in [
+            [0, 0, 0],
+            [0, 1, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [2, 0, 0],
+            [2, 1, 0],
+        ] {
+            let steps = vec![Step::Reorder {
+                nest: 0,
+                order: permute(&names, &picks),
+            }];
+            let (_, class) = apply_classified(&k, &Schedule { steps }).unwrap();
+            assert_eq!(class, OrderClass::Preserving);
+        }
+    }
+
+    /// The permutation of `names` given by `picks`: take `names[picks[n] % len]` out of
+    /// the names left, for n = 0, 1, ...; missing picks count as 0.
+    fn permute(names: &[String], picks: &[usize]) -> Vec<String> {
+        let mut left = names.to_vec();
+        let mut order = Vec::new();
+        for n in 0..names.len() {
+            let pick = picks.get(n).copied().unwrap_or(0);
+            order.push(left.remove(pick % left.len()));
+        }
+        order
+    }
+
+    fn reorder_step(nest: usize, names: &[&str]) -> Step {
+        Step::Reorder {
+            nest,
+            order: names.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn order_that_is_not_a_permutation_is_refused() {
+        let bad = ScheduleError::BadReorder { step: 0, nest: 1 };
+        // Missing a loop, an extra loop, an unknown name, a repeated loop (the parser
+        // forbids repeats, so these steps are built by hand).
+        for names in [
+            vec!["i", "j"],
+            vec!["i", "k", "j", "x"],
+            vec!["i", "j", "x"],
+            vec!["i", "k", "k"],
+            vec!["i", "i", "j", "k"],
+            vec![],
+        ] {
+            let steps = vec![reorder_step(1, &names)];
+            assert_refused(&matmul(), &Schedule { steps }, bad.clone());
+        }
+        // The step number is that of the reorder.
+        assert_refused(
+            &matmul(),
+            &schedule("split(1, k, ko, ki, 2); reorder(1, i, j, k)"),
+            ScheduleError::BadReorder { step: 1, nest: 1 },
+        );
+        assert_refused(
+            &matmul(),
+            &schedule("reorder(5, i, j, k)"),
+            ScheduleError::NoSuchNest { step: 0, nest: 5 },
+        );
+    }
+
+    /// `for i in 0..4: Y[i] = Y[0] + A[i]`: reads `Y` at another index than it writes.
+    fn reads_y_at_zero() -> Kernel {
+        let zero = AffineExpr {
+            constant: 0,
+            terms: Vec::new(),
+        };
+        let value = bin(BinaryOp::Add, load(2, vec![zero]), load(0, vec![var("i")]));
+        Kernel {
+            name: "reads_y".to_string(),
+            buffers: vec![buf("A", &[4]), buf("B", &[4]), buf("Y", &[4])],
+            nests: vec![nest(vec![lp("i", 4)], vec![var("i")], value)],
+        }
+    }
+
+    #[test]
+    fn reading_the_target_at_another_index_is_illegal() {
+        let k = reads_y_at_zero();
+        assert_eq!(k.validate(), Ok(()));
+        assert_refused(
+            &k,
+            &schedule("reorder(0, i)"),
+            ScheduleError::IllegalReorder { step: 0, nest: 0 },
+        );
+    }
+
+    #[test]
+    fn target_loads_may_order_terms_differently_but_not_change_the_index() {
+        // Y[4*i + j] = Y[j + 4*i] + A[i]: same element, terms in another order.
+        let flat = |terms: Vec<(&str, i64)>, constant: i64| AffineExpr {
+            constant,
+            terms: terms.into_iter().map(|(n, c)| (n.to_string(), c)).collect(),
+        };
+        let kernel = |load_index: AffineExpr| Kernel {
+            name: "flat".to_string(),
+            buffers: vec![buf("A", &[4]), buf("B", &[4]), buf("Y", &[20])],
+            nests: vec![nest(
+                vec![lp("i", 4), lp("j", 4)],
+                vec![flat(vec![("i", 4), ("j", 1)], 0)],
+                bin(
+                    BinaryOp::Add,
+                    load(2, vec![load_index]),
+                    load(0, vec![var("i")]),
+                ),
+            )],
+        };
+        let same = kernel(flat(vec![("j", 1), ("i", 4)], 0));
+        let (_, class) = classified(&same, "reorder(0, j, i)");
+        assert_eq!(class, OrderClass::Preserving);
+        let shifted = kernel(flat(vec![("j", 1), ("i", 4)], 1));
+        assert_eq!(shifted.validate(), Ok(()));
+        assert_refused(
+            &shifted,
+            &schedule("reorder(0, j, i)"),
+            ScheduleError::IllegalReorder { step: 0, nest: 0 },
+        );
+    }
+
+    fn affine(terms: &[(&str, i64)]) -> AffineExpr {
+        AffineExpr {
+            constant: 0,
+            terms: terms.iter().map(|(n, c)| (n.to_string(), *c)).collect(),
+        }
+    }
+
+    /// `for i in 0..4: for k in 0..3: Y[target] = value`, with A: f32[4, 3], B: f32[3] and
+    /// Y: f32[y_len] as buffers 0, 1 and 2.
+    fn ik_kernel(y_len: usize, target: AffineExpr, value: Expr) -> Kernel {
+        let k = Kernel {
+            name: "ik".to_string(),
+            buffers: vec![buf("A", &[4, 3]), buf("B", &[3]), buf("Y", &[y_len])],
+            nests: vec![nest(vec![lp("i", 4), lp("k", 3)], vec![target], value)],
+        };
+        assert_eq!(k.validate(), Ok(()));
+        k
+    }
+
+    fn a_ik() -> Expr {
+        load(0, vec![var("i"), var("k")])
+    }
+
+    #[test]
+    fn sum_into_the_target_is_legal_in_both_operand_orders() {
+        let y_i = || load(2, vec![var("i")]);
+        for value in [
+            bin(BinaryOp::Add, y_i(), a_ik()),
+            bin(BinaryOp::Add, a_ik(), y_i()),
+        ] {
+            let k = ik_kernel(4, var("i"), value);
+            assert_eq!(classified(&k, "reorder(0, k, i)").1, OrderClass::Preserving);
+        }
+    }
+
+    #[test]
+    fn accumulation_that_is_not_a_plain_sum_is_illegal() {
+        let y_i = || load(2, vec![var("i")]);
+        let two = || Expr::Const(2.0);
+        let illegal = ScheduleError::IllegalReorder { step: 0, nest: 0 };
+        let values = [
+            // Horner: the order of the k iterations changes the value.
+            bin(BinaryOp::Add, bin(BinaryOp::Mul, y_i(), two()), a_ik()),
+            bin(BinaryOp::Sub, y_i(), a_ik()),
+            bin(BinaryOp::Add, y_i(), bin(BinaryOp::Add, y_i(), a_ik())),
+            bin(
+                BinaryOp::Add,
+                load(
+                    2,
+                    vec![AffineExpr {
+                        constant: 1,
+                        terms: vec![],
+                    }],
+                ),
+                a_ik(),
+            ),
+            // Overwrite: the last k iteration wins.
+            a_ik(),
+        ];
+        for value in values {
+            let k = ik_kernel(4, var("i"), value);
+            assert_refused(&k, &schedule("reorder(0, k, i)"), illegal.clone());
+        }
+    }
+
+    #[test]
+    fn target_index_that_is_not_injective_is_illegal() {
+        // Y[i + k] += A[i, k]: (i, k) = (0, 1) and (1, 0) hit the same element.
+        let target = affine(&[("i", 1), ("k", 1)]);
+        let y = load(2, vec![target.clone()]);
+        let k = ik_kernel(6, target, bin(BinaryOp::Add, y, a_ik()));
+        assert_refused(
+            &k,
+            &schedule("reorder(0, k, i)"),
+            ScheduleError::IllegalReorder { step: 0, nest: 0 },
+        );
+    }
+
+    #[test]
+    fn zero_coefficient_terms_do_not_change_an_index() {
+        // C[i + 0*k] and C[i] are the same element, and `k` is still a reduction loop.
+        let with_zero = affine(&[("i", 1), ("k", 0)]);
+        for (target, read) in [(var("i"), with_zero.clone()), (with_zero, var("i"))] {
+            let value = bin(BinaryOp::Add, load(2, vec![read]), a_ik());
+            let k = ik_kernel(4, target, value);
+            assert_eq!(classified(&k, "reorder(0, k, i)").1, OrderClass::Preserving);
+        }
+    }
+
+    #[test]
+    fn mixed_radix_target_of_a_split_is_legal() {
+        let (_, class) = classified(
+            &matmul(),
+            "split(1, i, io, ii, 3); split(1, k, ko, ki, 2); reorder(1, ki, j, ii, io, ko)",
+        );
+        assert_eq!(class, OrderClass::Reordering);
+        let (_, class) = classified(
+            &matmul(),
+            "split(1, j, jo, ji, 2); reorder(1, ji, k, i, jo)",
+        );
+        assert_eq!(class, OrderClass::Preserving);
     }
 
     #[test]
@@ -725,6 +1228,24 @@ mod tests {
         prop_oneof![1 => Just(matmul()), 4 => elementwise_kernel()]
     }
 
+    /// Small random kernels with reduction loops (matmul) and without (elementwise).
+    fn reorderable_kernel() -> impl Strategy<Value = Kernel> {
+        let matmul =
+            (1usize..=4, 1usize..=6, 1usize..=4).prop_map(|(m, k, n)| matmul_sized(m, k, n));
+        prop_oneof![2 => matmul, 1 => elementwise_kernel()]
+    }
+
+    type ByElement = BTreeMap<(usize, Vec<i64>), Vec<Vec<(usize, Vec<i64>)>>>;
+
+    /// The trace entries grouped by the element they store to, each group in trace order.
+    fn by_element(trace: Trace) -> ByElement {
+        let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (buffer, index, loads) in trace {
+            groups.entry((buffer, index)).or_default().push(loads);
+        }
+        groups
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             max_global_rejects: 8192,
@@ -777,6 +1298,56 @@ mod tests {
                 Err(e) => return Err(TestCaseError::fail(e.to_string())),
             };
             prop_assert_eq!(trace(&twice), trace(&kernel));
+        }
+
+        #[test]
+        fn reorder_after_split_keeps_the_contributions_of_every_element(
+            kernel in reorderable_kernel(),
+            nest_pick in any::<usize>(),
+            loop_pick in any::<usize>(),
+            factor in 1usize..=6,
+            picks in prop::collection::vec(any::<usize>(), 5),
+        ) {
+            let nest = nest_pick % kernel.nests.len();
+            let loops = &kernel.nests[nest].loops;
+            prop_assume!(!loops.is_empty());
+            let name = &loops[loop_pick % loops.len()].name;
+            let split = Step::Split {
+                nest,
+                loop_name: name.clone(),
+                outer: "so".to_string(),
+                inner: "si".to_string(),
+                factor,
+            };
+            let split_only = Schedule { steps: vec![split.clone()] };
+            let names: Vec<String> = apply(&kernel, &split_only)
+                .expect("split applies")
+                .nests[nest]
+                .loops
+                .iter()
+                .map(|l| l.name.clone())
+                .collect();
+            let order = permute(&names, &picks);
+            let steps = vec![split, Step::Reorder { nest, order }];
+            let (reordered, class) =
+                apply_classified(&kernel, &Schedule { steps }).expect("reorder is legal");
+
+            let (before, after) = (trace(&kernel), trace(&reordered));
+            let (mut sorted_before, mut sorted_after) = (before.clone(), after.clone());
+            sorted_before.sort();
+            sorted_after.sort();
+            prop_assert_eq!(sorted_after, sorted_before);
+
+            let (before, after) = (by_element(before), by_element(after));
+            prop_assert_eq!(before.keys().collect::<Vec<_>>(), after.keys().collect::<Vec<_>>());
+            for (element, mut expected) in before {
+                let mut got = after[&element].clone();
+                if class == OrderClass::Reordering {
+                    got.sort();
+                    expected.sort();
+                }
+                prop_assert_eq!(got, expected, "element {:?}", element);
+            }
         }
     }
 }
