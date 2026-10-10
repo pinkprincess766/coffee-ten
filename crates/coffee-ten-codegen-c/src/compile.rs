@@ -298,6 +298,7 @@ mod tests {
         Loop {
             name: name.to_string(),
             extent,
+            vectorize: false,
         }
     }
 

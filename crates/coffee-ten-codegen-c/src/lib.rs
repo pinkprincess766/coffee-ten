@@ -197,6 +197,12 @@ fn indent(level: usize) -> String {
 
 fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
     for (depth, l) in nest.loops.iter().enumerate() {
+        if l.vectorize {
+            out.push_str(&format!(
+                "{}#pragma clang loop vectorize(enable)\n",
+                indent(depth + 1)
+            ));
+        }
         out.push_str(&format!(
             "{}for (long {name} = 0; {name} < {extent}; {name}++) {{\n",
             indent(depth + 1),
@@ -291,6 +297,7 @@ mod tests {
         Loop {
             name: name.to_string(),
             extent,
+            vectorize: false,
         }
     }
 
@@ -467,6 +474,31 @@ mod tests {
                 "}\n",
             )
         );
+    }
+
+    #[test]
+    fn vectorize_puts_one_pragma_before_the_innermost_for() {
+        let schedule = Schedule::parse("vectorize(1, j)").unwrap();
+        let text = emit_c(&apply(&matmul(), &schedule).unwrap()).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        let pragmas: Vec<usize> = (0..lines.len())
+            .filter(|&n| lines[n].contains("#pragma"))
+            .collect();
+        assert_eq!(pragmas.len(), 1, "{text}");
+        let at = pragmas[0];
+        assert_eq!(
+            lines[at],
+            "            #pragma clang loop vectorize(enable)"
+        );
+        assert_eq!(lines[at + 1], "            for (long j = 0; j < 2; j++) {");
+        // Nest 0 also has a `j` loop; the marked one is the last in the text, in nest 1.
+        assert_eq!(
+            lines.iter().rposition(|l| l.contains("for (long j")),
+            Some(at + 1)
+        );
+        // Nothing else changes.
+        lines.remove(at);
+        assert_eq!(lines.join("\n") + "\n", emit_c(&matmul()).unwrap());
     }
 
     #[test]

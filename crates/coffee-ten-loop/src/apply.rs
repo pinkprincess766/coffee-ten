@@ -25,7 +25,7 @@ pub enum ScheduleError {
     ZeroFactor {
         step: usize,
     },
-    /// The step is valid but not applied yet (vectorize comes in a later PR).
+    /// The step is valid but not applied yet.
     NotImplemented {
         step: usize,
         what: &'static str,
@@ -44,6 +44,12 @@ pub enum ScheduleError {
     IllegalReorder {
         step: usize,
         nest: usize,
+    },
+    /// Loop `loop_name` of the nest cannot be vectorized, for `reason` (see `vectorize`).
+    IllegalVectorize {
+        step: usize,
+        nest: usize,
+        reason: &'static str,
     },
     /// The result failed `Kernel::validate`; this is a bug in `apply` or the input kernel.
     Invalid(LoopIrError),
@@ -80,6 +86,9 @@ impl fmt::Display for ScheduleError {
                     "step {step}: nest {nest} reads its target at another index"
                 )
             }
+            Self::IllegalVectorize { step, nest, reason } => {
+                write!(f, "step {step}: cannot vectorize in nest {nest}: {reason}")
+            }
             Self::Invalid(e) => write!(f, "schedule produced an invalid kernel: {e}"),
         }
     }
@@ -106,7 +115,8 @@ pub fn apply(kernel: &Kernel, schedule: &Schedule) -> Result<Kernel, ScheduleErr
 
 /// Like `apply`, and also says whether the schedule is order-preserving or reordering.
 /// A schedule is `Reordering` if any step is. `split` keeps the order of all iterations,
-/// hence of every float operation, so it is `Preserving`; see `reorder` for the rest.
+/// hence of every float operation, so it is `Preserving`; see `reorder` and `vectorize`
+/// for the rest.
 pub fn apply_classified(
     kernel: &Kernel,
     schedule: &Schedule,
@@ -135,15 +145,78 @@ pub fn apply_classified(
                     class = OrderClass::Reordering;
                 }
             }
-            Step::Vectorize { .. } => return Err(not_implemented(step_no, "vectorize")),
+            Step::Vectorize { nest, loop_name } => {
+                vectorize(&mut result, step_no, *nest, loop_name)?;
+            }
         }
     }
     result.validate().map_err(ScheduleError::Invalid)?;
     Ok((result, class))
 }
 
-fn not_implemented(step: usize, what: &'static str) -> ScheduleError {
-    ScheduleError::NotImplemented { step, what }
+/// Marks loop `loop_name` of nest `nest_no` for the backend to vectorize. Legal iff
+/// - the loop is the innermost of the nest and not vectorized yet;
+/// - it is not a reduction loop: its name appears with a non-zero coefficient in the store
+///   target index (vectorized reductions are out of scope);
+/// - in the target index it appears only in the last dimension, with coefficient exactly 1,
+///   so adjacent lanes write adjacent elements.
+///
+/// Class: `Preserving`. Each lane computes and writes its own element, and the backend
+/// keeps every operation a separate rounding (`-ffp-contract=off`), so every float result is
+/// bit for bit the same. The mark is a request: loop-carried reads of the target are not
+/// checked here, the backend refuses to vectorize such a loop itself.
+fn vectorize(
+    kernel: &mut Kernel,
+    step: usize,
+    nest_no: usize,
+    loop_name: &str,
+) -> Result<(), ScheduleError> {
+    let nest = kernel
+        .nests
+        .get_mut(nest_no)
+        .ok_or(ScheduleError::NoSuchNest {
+            step,
+            nest: nest_no,
+        })?;
+    let pos = nest
+        .loops
+        .iter()
+        .position(|l| l.name == loop_name)
+        .ok_or_else(|| ScheduleError::NoSuchLoop {
+            step,
+            nest: nest_no,
+            loop_name: loop_name.to_string(),
+        })?;
+    let illegal = |reason| ScheduleError::IllegalVectorize {
+        step,
+        nest: nest_no,
+        reason,
+    };
+    if nest.loops[pos].vectorize {
+        return Err(illegal("already vectorized"));
+    }
+    if pos + 1 != nest.loops.len() {
+        return Err(illegal("not the innermost loop"));
+    }
+    let index = &nest.body.target.index;
+    let coeff_in = |e: &AffineExpr| {
+        let terms = e.terms.iter().filter(|(n, _)| n == loop_name);
+        terms.fold(0i64, |sum, (_, coeff)| sum.saturating_add(*coeff))
+    };
+    let is_reduction = !index.iter().any(|e| {
+        e.terms
+            .iter()
+            .any(|(n, coeff)| n == loop_name && *coeff != 0)
+    });
+    if is_reduction {
+        return Err(illegal("reduction loop"));
+    }
+    let (last, others) = index.split_last().expect("invariant: loop is in the index");
+    if coeff_in(last) != 1 || others.iter().any(|e| coeff_in(e) != 0) {
+        return Err(illegal("target stride is not 1"));
+    }
+    nest.loops[pos].vectorize = true;
+    Ok(())
 }
 
 /// Rearranges the loops of nest `nest_no` into `order`, which must name every loop once.
@@ -373,14 +446,17 @@ fn split(
             bound: extent_i64,
         });
     }
+    // A vectorized loop stays vectorized as `inner`, which is then the innermost loop.
     let new_loops = [
         Loop {
             name: outer.to_string(),
             extent: extent.div_ceil(factor),
+            vectorize: false,
         },
         Loop {
             name: inner.to_string(),
             extent: factor,
+            vectorize: nest.loops[pos].vectorize,
         },
     ];
     nest.loops.splice(pos..=pos, new_loops);
@@ -454,6 +530,7 @@ mod tests {
         Loop {
             name: name.to_string(),
             extent,
+            vectorize: false,
         }
     }
 
@@ -733,15 +810,140 @@ mod tests {
     }
 
     #[test]
-    fn vectorize_is_not_implemented() {
+    fn vectorize_marks_the_innermost_loop() {
+        let k = matmul();
+        let (s, class) = classified(&k, "vectorize(1, j)");
+        assert_eq!(
+            nest_text(&s, 1),
+            concat!(
+                "for i in 0..4:\n",
+                "  for k in 0..3:\n",
+                "    for j in 0..2 (vectorize):\n",
+                "      C[i, j] = C[i, j] + (A[i, k] * B[k, j])\n",
+            )
+        );
+        assert_eq!(s.nests[0], k.nests[0]);
+        assert_eq!(s.validate(), Ok(()));
+        assert_eq!(class, OrderClass::Preserving);
+    }
+
+    fn illegal_vectorize(step: usize, nest: usize, reason: &'static str) -> ScheduleError {
+        ScheduleError::IllegalVectorize { step, nest, reason }
+    }
+
+    #[test]
+    fn vectorizing_a_loop_that_is_not_innermost_is_refused() {
         assert_refused(
             &matmul(),
-            &schedule("vectorize(1, j)"),
-            ScheduleError::NotImplemented {
+            &schedule("vectorize(1, k)"),
+            illegal_vectorize(0, 1, "not the innermost loop"),
+        );
+        // `j` is no longer innermost once the order changes.
+        assert_refused(
+            &matmul(),
+            &schedule("reorder(1, i, j, k); vectorize(1, j)"),
+            illegal_vectorize(1, 1, "not the innermost loop"),
+        );
+    }
+
+    #[test]
+    fn vectorizing_a_reduction_loop_is_refused() {
+        assert_refused(
+            &matmul(),
+            &schedule("reorder(1, i, j, k); vectorize(1, k)"),
+            illegal_vectorize(1, 1, "reduction loop"),
+        );
+    }
+
+    /// `for i in 0..4: for j in 0..4: Y[target] = A[j]`, with Y: f32[8, 8], or f32[16] for rank 1.
+    fn target_kernel(target: Vec<AffineExpr>) -> Kernel {
+        let y_shape: &[usize] = if target.len() == 2 { &[8, 8] } else { &[16] };
+        let k = Kernel {
+            name: "target".to_string(),
+            buffers: vec![buf("A", &[4]), buf("B", &[4]), buf("Y", y_shape)],
+            nests: vec![nest(
+                vec![lp("i", 4), lp("j", 4)],
+                target,
+                load(0, vec![var("j")]),
+            )],
+        };
+        assert_eq!(k.validate(), Ok(()));
+        k
+    }
+
+    #[test]
+    fn target_stride_other_than_one_is_refused() {
+        let stride = illegal_vectorize(0, 0, "target stride is not 1");
+        let cases = [
+            // Stride 2, and stride -1.
+            vec![affine(&[("j", 2)])],
+            vec![AffineExpr {
+                constant: 3,
+                terms: vec![("j".to_string(), -1)],
+            }],
+            // `j` in a dimension other than the last, alone and next to a unit stride.
+            vec![var("j"), var("i")],
+            vec![var("j"), affine(&[("i", 1), ("j", 1)])],
+        ];
+        for target in cases {
+            let k = target_kernel(target);
+            assert_refused(&k, &schedule("vectorize(0, j)"), stride.clone());
+        }
+        // Control: a unit stride is legal, also with other loops in the index.
+        let ok = target_kernel(vec![affine(&[("i", 4), ("j", 1)])]);
+        assert_eq!(classified(&ok, "vectorize(0, j)").1, OrderClass::Preserving);
+        let ok = target_kernel(vec![var("i"), var("j")]);
+        assert_eq!(classified(&ok, "vectorize(0, j)").1, OrderClass::Preserving);
+    }
+
+    #[test]
+    fn vectorizing_twice_is_refused() {
+        assert_refused(
+            &matmul(),
+            &schedule("vectorize(1, j); vectorize(1, j)"),
+            illegal_vectorize(1, 1, "already vectorized"),
+        );
+    }
+
+    #[test]
+    fn vectorize_names_a_missing_nest_or_loop() {
+        assert_refused(
+            &matmul(),
+            &schedule("vectorize(2, j)"),
+            ScheduleError::NoSuchNest { step: 0, nest: 2 },
+        );
+        assert_refused(
+            &matmul(),
+            &schedule("vectorize(1, x)"),
+            ScheduleError::NoSuchLoop {
                 step: 0,
-                what: "vectorize",
+                nest: 1,
+                loop_name: "x".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn splitting_the_vectorized_loop_vectorizes_the_inner_loop() {
+        let (s, _) = classified(&matmul(), "vectorize(1, j); split(1, j, jo, ji, 1)");
+        let names: Vec<_> = s.nests[1].loops.iter().map(|l| l.name.as_str()).collect();
+        let marks: Vec<_> = s.nests[1].loops.iter().map(|l| l.vectorize).collect();
+        assert_eq!(names, ["i", "k", "jo", "ji"]);
+        assert_eq!(marks, [false, false, false, true]);
+        // Splitting another loop keeps the mark.
+        let (s, _) = classified(&matmul(), "vectorize(1, j); split(1, k, ko, ki, 2)");
+        assert!(s.nests[1].loops[3].vectorize);
+    }
+
+    #[test]
+    fn reorder_that_moves_the_vectorized_loop_is_invalid() {
+        assert_refused(
+            &matmul(),
+            &schedule("vectorize(1, j); reorder(1, j, i, k)"),
+            ScheduleError::Invalid(LoopIrError::BadVectorize { nest: 1 }),
+        );
+        let (s, _) = classified(&matmul(), "vectorize(1, j); reorder(1, k, i, j)");
+        assert!(s.nests[1].loops[2].vectorize);
     }
 
     fn classified(kernel: &Kernel, text: &str) -> (Kernel, OrderClass) {

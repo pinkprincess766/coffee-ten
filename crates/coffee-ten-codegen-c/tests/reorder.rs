@@ -18,6 +18,7 @@ fn lp(name: &str, extent: usize) -> Loop {
     Loop {
         name: name.to_string(),
         extent,
+        vectorize: false,
     }
 }
 
