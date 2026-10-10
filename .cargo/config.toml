@@ -1,0 +1,6 @@
+[env]
+# Build coffee-ten-py as a Python extension module: do not link libpython, the
+# interpreter that imports the module provides it. Without this, `cargo test`
+# needs a linkable libpython (the macOS system python3 has none). maturin sets
+# the same variable for wheels.
+PYO3_BUILD_EXTENSION_MODULE = "1"

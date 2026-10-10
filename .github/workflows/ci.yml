@@ -26,3 +26,19 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --release --locked
+
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - run: python -m pip install ./crates/coffee-ten-py pytest numpy
+      - run: python -m pytest crates/coffee-ten-py/tests -q
