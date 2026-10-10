@@ -4,6 +4,8 @@ pub mod schedule;
 pub use schedule::{Schedule, ScheduleParseError, Step};
 pub mod lower;
 pub use lower::{LowerError, MAX_EXPR_NODES, lower_elementwise};
+pub mod apply;
+pub use apply::{ScheduleError, apply};
 
 use std::fmt;
 
@@ -63,10 +65,18 @@ pub struct Store {
     pub value: Expr,
 }
 
-/// Perfect nest: loops outermost first, one Store in the innermost body.
+/// The body runs only when `expr < bound`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Guard {
+    pub expr: AffineExpr,
+    pub bound: i64,
+}
+
+/// Perfect nest: loops outermost first, guards (all must hold), one Store in the innermost body.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoopNest {
     pub loops: Vec<Loop>,
+    pub guards: Vec<Guard>,
     pub body: Store,
 }
 
@@ -91,6 +101,10 @@ pub enum LoopIrError {
     UnknownLoop {
         nest: usize,
         loop_name: String,
+    },
+    /// A guard can never hold: its smallest value is already `>= bound`.
+    EmptyGuard {
+        nest: usize,
     },
     UnknownBuffer {
         nest: usize,
@@ -124,6 +138,7 @@ impl fmt::Display for LoopIrError {
             Self::UnknownLoop { nest, loop_name } => {
                 write!(f, "nest {nest}: unknown loop {loop_name}")
             }
+            Self::EmptyGuard { nest } => write!(f, "nest {nest}: a guard never holds"),
             Self::UnknownBuffer { nest, buffer } => {
                 write!(f, "nest {nest}: unknown buffer {buffer}")
             }
@@ -185,23 +200,31 @@ fn validate_nest(buffers: &[Buffer], nest_no: usize, nest: &LoopNest) -> Result<
             });
         }
     }
-    validate_access(buffers, nest_no, loops, &nest.body.target)?;
-    validate_expr(buffers, nest_no, loops, &nest.body.value)
+    for guard in &nest.guards {
+        check_terms(nest_no, loops, &guard.expr)?;
+        if affine_bounds(&guard.expr, loops).0 >= guard.bound {
+            return Err(LoopIrError::EmptyGuard { nest: nest_no });
+        }
+    }
+    let guards = &nest.guards;
+    validate_access(buffers, nest_no, loops, guards, &nest.body.target)?;
+    validate_expr(buffers, nest_no, loops, guards, &nest.body.value)
 }
 
 fn validate_expr(
     buffers: &[Buffer],
     nest_no: usize,
     loops: &[Loop],
+    guards: &[Guard],
     e: &Expr,
 ) -> Result<(), LoopIrError> {
     match e {
-        Expr::Load(access) => validate_access(buffers, nest_no, loops, access),
+        Expr::Load(access) => validate_access(buffers, nest_no, loops, guards, access),
         Expr::Const(_) => Ok(()),
-        Expr::Unary(_, x) => validate_expr(buffers, nest_no, loops, x),
+        Expr::Unary(_, x) => validate_expr(buffers, nest_no, loops, guards, x),
         Expr::Binary(_, a, b) => {
-            validate_expr(buffers, nest_no, loops, a)?;
-            validate_expr(buffers, nest_no, loops, b)
+            validate_expr(buffers, nest_no, loops, guards, a)?;
+            validate_expr(buffers, nest_no, loops, guards, b)
         }
     }
 }
@@ -210,6 +233,7 @@ fn validate_access(
     buffers: &[Buffer],
     nest_no: usize,
     loops: &[Loop],
+    guards: &[Guard],
     access: &Access,
 ) -> Result<(), LoopIrError> {
     let Some(buffer) = buffers.get(access.buffer) else {
@@ -227,17 +251,11 @@ fn validate_access(
         });
     }
     for index in &access.index {
-        for (name, _) in &index.terms {
-            if !loops.iter().any(|l| &l.name == name) {
-                return Err(LoopIrError::UnknownLoop {
-                    nest: nest_no,
-                    loop_name: name.clone(),
-                });
-            }
-        }
+        check_terms(nest_no, loops, index)?;
     }
     for (dim, (index, &size)) in access.index.iter().zip(&buffer.shape).enumerate() {
         let (min, max) = affine_bounds(index, loops);
+        let max = guarded_max(index, max, guards);
         let in_bounds = min >= 0 && usize::try_from(max).is_ok_and(|max_idx| max_idx < size);
         if !in_bounds {
             return Err(LoopIrError::OutOfBounds {
@@ -251,6 +269,40 @@ fn validate_access(
         }
     }
     Ok(())
+}
+
+/// Every term of `expr` must name a loop.
+fn check_terms(nest_no: usize, loops: &[Loop], expr: &AffineExpr) -> Result<(), LoopIrError> {
+    for (name, _) in &expr.terms {
+        if !loops.iter().any(|l| &l.name == name) {
+            return Err(LoopIrError::UnknownLoop {
+                nest: nest_no,
+                loop_name: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Tightens `max`, the plain upper bound of `index`, by the guards whose terms equal the
+/// terms of `index` (same (name, coeff) pairs in any order). For such a guard `g`,
+/// `g.expr < g.bound` gives `index <= g.bound - 1 + (index.constant - g.expr.constant)`.
+/// This is the only reasoning about guards; it is enough for split, where the index is
+/// exactly the guarded expression.
+fn guarded_max(index: &AffineExpr, max: i64, guards: &[Guard]) -> i64 {
+    let sorted_terms = |e: &AffineExpr| {
+        let mut terms = e.terms.clone();
+        terms.sort();
+        terms
+    };
+    let index_terms = sorted_terms(index);
+    guards
+        .iter()
+        .filter(|g| sorted_terms(&g.expr) == index_terms)
+        .fold(max, |max, g| {
+            let shift = index.constant.saturating_sub(g.expr.constant);
+            max.min(g.bound.saturating_sub(1).saturating_add(shift))
+        })
 }
 
 /// Smallest and largest value of `expr` over all iterations of `loops`.
@@ -333,9 +385,14 @@ fn write_nest(f: &mut fmt::Formatter<'_>, buffers: &[Buffer], nest: &LoopNest) -
     for (depth, l) in nest.loops.iter().enumerate() {
         writeln!(f, "{}for {} in 0..{}:", indent(depth), l.name, l.extent)?;
     }
+    let mut depth = nest.loops.len();
+    for guard in &nest.guards {
+        writeln!(f, "{}if {} < {}:", indent(depth), guard.expr, guard.bound)?;
+        depth += 1;
+    }
     let target = access_str(buffers, &nest.body.target);
     let value = expr_str(buffers, &nest.body.value);
-    writeln!(f, "{}{} = {}", indent(nest.loops.len()), target, value)
+    writeln!(f, "{}{} = {}", indent(depth), target, value)
 }
 
 fn indent(depth: usize) -> String {
@@ -445,7 +502,11 @@ mod tests {
         Kernel {
             name: "k".to_string(),
             buffers,
-            nests: vec![LoopNest { loops, body }],
+            nests: vec![LoopNest {
+                loops,
+                guards: Vec::new(),
+                body,
+            }],
         }
     }
 
@@ -456,10 +517,12 @@ mod tests {
             nests: vec![
                 LoopNest {
                     loops: vec![lp("i", 4), lp("j", 2)],
+                    guards: Vec::new(),
                     body: store(at(2, vec![var("i"), var("j")]), Expr::Const(0.0)),
                 },
                 LoopNest {
                     loops: vec![lp("i", 4), lp("k", 3), lp("j", 2)],
+                    guards: Vec::new(),
                     body: store(
                         at(2, vec![var("i"), var("j")]),
                         bin(
@@ -696,6 +759,144 @@ mod tests {
                 max: 2,
                 size: 4,
             })
+        );
+    }
+
+    fn guard(expr: AffineExpr, bound: i64) -> Guard {
+        Guard { expr, bound }
+    }
+
+    /// `Y[io*2 + ii + offset] = 0.0` under the guard `2*io + ii < 3`, for `Y: f32[y_len]`.
+    fn guarded_store(y_len: usize, offset: i64) -> Kernel {
+        let mut k = kernel(
+            vec![buf("Y", &[y_len])],
+            vec![lp("io", 2), lp("ii", 2)],
+            store(
+                at(0, vec![aff(offset, &[("io", 2), ("ii", 1)])]),
+                Expr::Const(0.0),
+            ),
+        );
+        k.nests[0].guards = vec![guard(aff(0, &[("io", 2), ("ii", 1)]), 3)];
+        k
+    }
+
+    #[test]
+    fn guard_prints_between_loops_and_store() {
+        let k = guarded_store(3, 0);
+        assert_eq!(
+            k.to_string(),
+            concat!(
+                "kernel k(Y: f32[3])\n",
+                "for io in 0..2:\n",
+                "  for ii in 0..2:\n",
+                "    if 2*io + ii < 3:\n",
+                "      Y[2*io + ii] = 0.0\n",
+            )
+        );
+        assert_eq!(k.validate(), Ok(()));
+    }
+
+    #[test]
+    fn several_guards_print_nested() {
+        let mut k = guarded_store(3, 0);
+        k.nests[0].guards.push(guard(var("ii"), 1));
+        assert_eq!(
+            k.to_string(),
+            concat!(
+                "kernel k(Y: f32[3])\n",
+                "for io in 0..2:\n",
+                "  for ii in 0..2:\n",
+                "    if 2*io + ii < 3:\n",
+                "      if ii < 1:\n",
+                "        Y[2*io + ii] = 0.0\n",
+            )
+        );
+    }
+
+    #[test]
+    fn guard_clamps_the_index_with_the_same_terms() {
+        // Without the guard the index reaches 3, outside Y: f32[3].
+        let mut k = guarded_store(3, 0);
+        k.nests[0].guards.clear();
+        assert_eq!(
+            k.validate(),
+            Err(LoopIrError::OutOfBounds {
+                nest: 0,
+                buffer: "Y".to_string(),
+                dim: 0,
+                min: 0,
+                max: 3,
+                size: 3,
+            })
+        );
+        // Guarded: max = 3 - 1 = 2 fits Y: f32[3]; a Y: f32[2] is still too small.
+        assert_eq!(guarded_store(3, 0).validate(), Ok(()));
+        assert_eq!(
+            guarded_store(2, 0).validate(),
+            Err(LoopIrError::OutOfBounds {
+                nest: 0,
+                buffer: "Y".to_string(),
+                dim: 0,
+                min: 0,
+                max: 2,
+                size: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn guard_clamp_follows_the_constant_offset_and_ignores_term_order() {
+        // Index 2*io + ii + 1 <= 2 + 1 = 3 fits Y: f32[4] but not Y: f32[3].
+        assert_eq!(guarded_store(4, 1).validate(), Ok(()));
+        assert!(guarded_store(3, 1).validate().is_err());
+        let mut k = guarded_store(3, 0);
+        k.nests[0].body.target.index = vec![aff(0, &[("ii", 1), ("io", 2)])];
+        assert_eq!(k.validate(), Ok(()));
+    }
+
+    #[test]
+    fn guard_does_not_clamp_an_index_with_other_terms() {
+        let mut k = guarded_store(3, 0);
+        k.nests[0].body.target.index = vec![aff(0, &[("io", 1), ("ii", 1)])];
+        k.buffers[0].shape = vec![2];
+        // Index io + ii reaches 2: the guard 2*io + ii < 3 is not about it.
+        assert_eq!(
+            k.validate(),
+            Err(LoopIrError::OutOfBounds {
+                nest: 0,
+                buffer: "Y".to_string(),
+                dim: 0,
+                min: 0,
+                max: 2,
+                size: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn guard_naming_unknown_loop_is_rejected() {
+        let mut k = guarded_store(3, 0);
+        k.nests[0].guards = vec![guard(var("k"), 3)];
+        assert_eq!(
+            k.validate(),
+            Err(LoopIrError::UnknownLoop {
+                nest: 0,
+                loop_name: "k".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn guard_that_never_holds_is_rejected() {
+        // `ii + 3 < 3` never holds, `ii + 2 < 3` holds for ii = 0.
+        let mut k = guarded_store(4, 0);
+        k.nests[0].guards = vec![guard(aff(3, &[("ii", 1)]), 3)];
+        assert_eq!(k.validate(), Err(LoopIrError::EmptyGuard { nest: 0 }));
+        k.nests[0].guards = vec![guard(aff(2, &[("ii", 1)]), 3)];
+        assert_eq!(k.validate(), Ok(()));
+        assert_eq!(
+            LoopIrError::EmptyGuard { nest: 1 }.to_string(),
+            "nest 1: a guard never holds"
         );
     }
 }

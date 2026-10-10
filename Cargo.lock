@@ -47,6 +47,7 @@ name = "coffee-ten-loop"
 version = "0.0.0"
 dependencies = [
  "coffee-ten-ir",
+ "proptest",
 ]
 
 [[package]]

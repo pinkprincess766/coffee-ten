@@ -9,3 +9,6 @@ publish.workspace = true
 
 [dependencies]
 coffee-ten-ir = { path = "../coffee-ten-ir" }
+
+[dev-dependencies]
+proptest = { workspace = true }
