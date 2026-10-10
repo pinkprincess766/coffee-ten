@@ -29,6 +29,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "coffee-ten-interp"
+version = "0.0.0"
+dependencies = [
+ "coffee-ten-ir",
+]
+
+[[package]]
 name = "coffee-ten-ir"
 version = "0.0.0"
 dependencies = [
