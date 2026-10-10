@@ -71,6 +71,7 @@ pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Ke
         buffers,
         nests: vec![LoopNest {
             loops,
+            guards: Vec::new(),
             body: Store { target, value },
         }],
     })

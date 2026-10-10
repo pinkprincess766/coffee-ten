@@ -204,13 +204,20 @@ fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
             extent = l.extent,
         ));
     }
+    let mut depth = nest.loops.len();
+    for guard in &nest.guards {
+        depth += 1;
+        out.push_str(&format!(
+            "{}if ({} < {}L) {{\n",
+            indent(depth),
+            guard.expr,
+            guard.bound
+        ));
+    }
     let target = access_c(buffers, &nest.body.target);
     let value = expr_c(buffers, &nest.body.value);
-    out.push_str(&format!(
-        "{}{target} = {value};\n",
-        indent(nest.loops.len() + 1)
-    ));
-    for depth in (0..nest.loops.len()).rev() {
+    out.push_str(&format!("{}{target} = {value};\n", indent(depth + 1)));
+    for depth in (0..depth).rev() {
         out.push_str(&format!("{}}}\n", indent(depth + 1)));
     }
 }
@@ -277,7 +284,7 @@ fn operand_c(buffers: &[Buffer], e: &Expr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coffee_ten_loop::{AffineExpr, Loop, Store};
+    use coffee_ten_loop::{AffineExpr, Guard, Loop, Schedule, Store, apply};
     use std::process::Command;
 
     fn lp(name: &str, extent: usize) -> Loop {
@@ -323,6 +330,7 @@ mod tests {
     fn loop_nest(loops: Vec<Loop>, buffer: usize, index: Vec<AffineExpr>, value: Expr) -> LoopNest {
         LoopNest {
             loops,
+            guards: Vec::new(),
             body: Store {
                 target: Access { buffer, index },
                 value,
@@ -426,6 +434,59 @@ mod tests {
                 "}\n",
             )
         );
+    }
+
+    /// The matmul with K = 3 split by 2, so the update nest needs a guard.
+    fn matmul_split_k() -> Kernel {
+        let schedule = Schedule::parse("split(1, k, ko, ki, 2)").unwrap();
+        apply(&matmul(), &schedule).unwrap()
+    }
+
+    #[test]
+    fn guarded_matmul_text_matches_reference() {
+        assert_eq!(
+            emit_c(&matmul_split_k()).unwrap(),
+            concat!(
+                "void matmul(const float *A, const float *B, float *restrict C) {\n",
+                "    for (long i = 0; i < 4; i++) {\n",
+                "        for (long j = 0; j < 2; j++) {\n",
+                "            C[(i) * 2 + (j)] = 0.0f;\n",
+                "        }\n",
+                "    }\n",
+                "    for (long i = 0; i < 4; i++) {\n",
+                "        for (long ko = 0; ko < 2; ko++) {\n",
+                "            for (long ki = 0; ki < 2; ki++) {\n",
+                "                for (long j = 0; j < 2; j++) {\n",
+                "                    if (2*ko + ki < 3L) {\n",
+                "                        C[(i) * 2 + (j)] = C[(i) * 2 + (j)] + (A[(i) * 3 + (2*ko + ki)] * B[(2*ko + ki) * 2 + (j)]);\n",
+                "                    }\n",
+                "                }\n",
+                "            }\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn two_guards_nest_in_order() {
+        let mut k = matmul_split_k();
+        k.nests[1].guards.push(Guard {
+            expr: var("ki"),
+            bound: 2,
+        });
+        let c = emit_c(&k).unwrap();
+        assert!(c.contains(concat!(
+            "                    if (2*ko + ki < 3L) {\n",
+            "                        if (ki < 2L) {\n",
+            "                            C[(i) * 2 + (j)] = ",
+        )));
+        assert!(c.contains(concat!(
+            "                        }\n",
+            "                    }\n",
+            "                }\n",
+        )));
     }
 
     #[test]
@@ -600,6 +661,11 @@ mod tests {
     #[test]
     fn matmul_compiles_with_clang() {
         assert_clang_accepts("matmul", &emit_c(&matmul()).unwrap());
+    }
+
+    #[test]
+    fn guarded_matmul_compiles_with_clang() {
+        assert_clang_accepts("matmul_split_k", &emit_c(&matmul_split_k()).unwrap());
     }
 
     #[test]
