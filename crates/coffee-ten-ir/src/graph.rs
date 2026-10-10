@@ -55,6 +55,8 @@ pub enum Op {
     Const(f32),
     Unary(UnaryOp, NodeId),
     Binary(BinaryOp, NodeId, NodeId),
+    /// `(M, K) @ (K, N) -> (M, N)`, both operands rank 2.
+    MatMul(NodeId, NodeId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +107,22 @@ impl Graph {
         Ok(self.push(Op::Binary(op, a, b), shape))
     }
 
+    /// Two-dimensional matrix product only: no broadcasting, batching or rank-1 operands.
+    pub fn matmul(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, GraphError> {
+        let a_shape = &self.node(a)?.shape;
+        let b_shape = &self.node(b)?.shape;
+        let shape = match (a_shape.dims(), b_shape.dims()) {
+            ([m, k], [k_right, n]) if k == k_right => Shape::new(vec![*m, *n]),
+            _ => {
+                return Err(GraphError::MatMulShape {
+                    left: a_shape.clone(),
+                    right: b_shape.clone(),
+                });
+            }
+        };
+        Ok(self.push(Op::MatMul(a, b), shape))
+    }
+
     pub fn get(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(id.index())
     }
@@ -134,6 +152,7 @@ impl fmt::Display for Graph {
                 Op::Binary(op, a, b) => {
                     format!("{} %{}, %{}", op.name(), a.index(), b.index())
                 }
+                Op::MatMul(a, b) => format!("matmul %{}, %{}", a.index(), b.index()),
             };
             writeln!(f, "%{index} = {text} : {}", node.shape)?;
         }
@@ -146,6 +165,7 @@ pub enum GraphError {
     UnknownNode(NodeId),
     DuplicateInput(String),
     Broadcast(BroadcastError),
+    MatMulShape { left: Shape, right: Shape },
 }
 
 impl fmt::Display for GraphError {
@@ -154,6 +174,9 @@ impl fmt::Display for GraphError {
             GraphError::UnknownNode(id) => write!(f, "unknown node %{}", id.index()),
             GraphError::DuplicateInput(name) => write!(f, "duplicate input {name}"),
             GraphError::Broadcast(err) => write!(f, "{err}"),
+            GraphError::MatMulShape { left, right } => {
+                write!(f, "cannot matmul shapes {left} and {right}")
+            }
         }
     }
 }
@@ -285,7 +308,9 @@ mod tests {
         for (index, node) in g.nodes().iter().enumerate() {
             match &node.op {
                 Op::Unary(_, x) => assert!(x.index() < index),
-                Op::Binary(_, a, b) => assert!(a.index() < index && b.index() < index),
+                Op::Binary(_, a, b) | Op::MatMul(a, b) => {
+                    assert!(a.index() < index && b.index() < index)
+                }
                 Op::Input { .. } | Op::Const(_) => {}
             }
         }
@@ -294,5 +319,86 @@ mod tests {
     #[test]
     fn empty_graph_prints_nothing() {
         assert_eq!(Graph::new().to_string(), "");
+    }
+
+    #[test]
+    fn matmul_shape_is_rows_of_left_and_columns_of_right() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let prod = g.matmul(a, b).unwrap();
+        // (2,3) @ (3,2) -> (2,2)
+        assert_eq!(g.get(prod).unwrap().shape, shape(&[2, 2]));
+    }
+
+    #[test]
+    fn matmul_inner_dim_mismatch_is_an_error_and_adds_no_node() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[4, 2])).unwrap();
+        let err = g.matmul(a, b).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::MatMulShape {
+                left: shape(&[2, 3]),
+                right: shape(&[4, 2]),
+            }
+        );
+        assert_eq!(err.to_string(), "cannot matmul shapes (2, 3) and (4, 2)");
+        assert_eq!(g.nodes().len(), 2);
+    }
+
+    #[test]
+    fn matmul_rank_one_operand_is_an_error() {
+        let mut g = Graph::new();
+        let v = g.input("v", shape(&[3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let err = g.matmul(v, b).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::MatMulShape {
+                left: shape(&[3]),
+                right: shape(&[3, 2]),
+            }
+        );
+        assert_eq!(err.to_string(), "cannot matmul shapes (3,) and (3, 2)");
+        assert_eq!(g.nodes().len(), 2);
+    }
+
+    #[test]
+    fn matmul_unknown_operand_is_reported_left_first() {
+        let mut big = Graph::new();
+        let ids: Vec<NodeId> = (0..6).map(|_| big.constant(0.0)).collect();
+        let (foreign_a, foreign_b) = (ids[4], ids[5]);
+
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 2])).unwrap();
+        assert_eq!(
+            g.matmul(foreign_a, a),
+            Err(GraphError::UnknownNode(foreign_a))
+        );
+        assert_eq!(
+            g.matmul(a, foreign_b),
+            Err(GraphError::UnknownNode(foreign_b))
+        );
+        assert_eq!(
+            g.matmul(foreign_a, foreign_b),
+            Err(GraphError::UnknownNode(foreign_a))
+        );
+        assert_eq!(g.nodes().len(), 1);
+    }
+
+    #[test]
+    fn matmul_prints_with_its_operands_and_shape() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        g.matmul(a, b).unwrap();
+        assert_eq!(
+            g.to_string(),
+            "%0 = input A : (2, 3)\n\
+             %1 = input B : (3, 2)\n\
+             %2 = matmul %0, %1 : (2, 2)\n"
+        );
     }
 }
