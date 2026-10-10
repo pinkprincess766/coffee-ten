@@ -38,6 +38,9 @@ dependencies = [
 [[package]]
 name = "coffee-ten-loop"
 version = "0.0.0"
+dependencies = [
+ "coffee-ten-ir",
+]
 
 [[package]]
 name = "getrandom"
