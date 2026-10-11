@@ -49,7 +49,8 @@ order (`crates/coffee-ten-loop/src/lower.rs`); tiles come from `split` and `reor
 and the `j` loop is vectorized (`crates/coffee-ten-loop/src/apply.rs`). Checked by:
 `crates/coffee-ten-codegen-c/tests/vectorize.rs` (clang's `-Rpass=loop-vectorize`
 remarks) and `crates/coffee-ten-codegen-c/tests/reorder.rs`. Speed: measured by
-`crates/coffee-ten-bench` (variants interleaved over rounds, median and IQR);
+`crates/coffee-ten-bench` (variants interleaved over rounds, median and IQR), one run of
+all sizes with `bench/run.sh`;
 numbers planned (an idle-machine run).
 
 ### Legality of loop reordering — [L24]
