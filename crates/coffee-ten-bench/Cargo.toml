@@ -1,0 +1,13 @@
+[package]
+name = "coffee-ten-bench"
+description = "Benchmark harness for coffee-ten kernels and schedules."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+coffee-ten-ir = { path = "../coffee-ten-ir" }
+coffee-ten-loop = { path = "../coffee-ten-loop" }
+coffee-ten-codegen-c = { path = "../coffee-ten-codegen-c" }

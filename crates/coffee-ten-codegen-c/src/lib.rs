@@ -4,7 +4,9 @@ use coffee_ten_loop::{Access, BinaryOp, Buffer, Expr, Kernel, LoopIrError, LoopN
 use std::fmt;
 
 mod compile;
-pub use compile::{CompileError, CompiledKernel, RunError, TEST_FLAGS, compile};
+pub use compile::{
+    BENCH_FLAGS, CompileError, CompiledKernel, RunError, TEST_FLAGS, compile, compile_with_flags,
+};
 
 /// Why `emit_c` refused a kernel.
 #[derive(Clone, Debug, PartialEq)]
