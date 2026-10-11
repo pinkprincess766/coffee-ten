@@ -8,7 +8,7 @@ use std::sync::Arc;
 use coffee_ten_codegen_c::{CompiledKernel, compile, emit_c};
 use coffee_ten_interp::{Tensor as DenseTensor, run_f32};
 use coffee_ten_ir::{BinaryOp, Graph, GraphError, NodeId, Op, Shape, UnaryOp};
-use coffee_ten_loop::{Buffer, OrderClass, Schedule, apply_classified};
+use coffee_ten_loop::{Buffer, Kernel, OrderClass, Schedule, apply_classified};
 use numpy::{
     PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyUntypedArray,
     PyUntypedArrayMethods, ndarray,
@@ -317,6 +317,11 @@ struct PyKernel {
     /// The emitted C source.
     #[pyo3(get)]
     c_source: String,
+    /// The loop IR after the schedule, as `ct.loop_ir` returns it. Nests are numbered from
+    /// 0 in the order they are printed; schedule steps name a nest by that number and loops
+    /// by the names shown.
+    #[pyo3(get)]
+    loop_ir: String,
     /// The canonical text of the schedule that was applied.
     #[pyo3(get)]
     schedule: String,
@@ -376,17 +381,13 @@ impl PyKernel {
     }
 }
 
-/// Compiles `output` to a native kernel: lowers it, applies the schedule text (see
-/// `Schedule::parse`, empty by default) and builds the C code with clang. The built
-/// library is cached in `cache_dir` (default: the system temp dir / coffee-ten-cache).
-#[pyfunction(name = "compile")]
-#[pyo3(signature = (output, schedule = "", cache_dir = None))]
-fn compile_kernel(
-    py: Python<'_>,
+/// Lowers `output` to loop IR and applies the schedule text (see `Schedule::parse`).
+/// Shared by `compile` and `loop_ir`. Returns the number of input buffers, the scheduled
+/// kernel, the parsed schedule and its order class.
+fn lower_scheduled(
     output: &PyTensor,
     schedule: &str,
-    cache_dir: Option<PathBuf>,
-) -> PyResult<PyKernel> {
+) -> PyResult<(usize, Kernel, Schedule, OrderClass)> {
     let mut graph = Graph::new();
     let output_id = lower(&output.expr, &mut graph, &mut HashMap::new()).map_err(value_error)?;
     let input_count = graph
@@ -398,6 +399,33 @@ fn compile_kernel(
     let kernel = coffee_ten_loop::lower(&graph, output_id, "kernel").map_err(value_error)?;
     let schedule = Schedule::parse(schedule).map_err(value_error)?;
     let (kernel, order_class) = apply_classified(&kernel, &schedule).map_err(value_error)?;
+    Ok((input_count, kernel, schedule, order_class))
+}
+
+/// The loop IR of `output` after the schedule text, as text. Nothing is compiled.
+///
+/// Nests are numbered from 0 in the order they are printed; schedule steps name a nest by
+/// that number and loops by the names shown.
+#[pyfunction]
+#[pyo3(signature = (output, schedule = ""))]
+fn loop_ir(output: &PyTensor, schedule: &str) -> PyResult<String> {
+    let (_, kernel, _, _) = lower_scheduled(output, schedule)?;
+    Ok(kernel.to_string())
+}
+
+/// Compiles `output` to a native kernel: lowers it, applies the schedule text (see
+/// `Schedule::parse`, empty by default) and builds the C code with clang. The built
+/// library is cached in `cache_dir` (default: the system temp dir / coffee-ten-cache).
+#[pyfunction(name = "compile")]
+#[pyo3(signature = (output, schedule = "", cache_dir = None))]
+fn compile_kernel(
+    py: Python<'_>,
+    output: &PyTensor,
+    schedule: &str,
+    cache_dir: Option<PathBuf>,
+) -> PyResult<PyKernel> {
+    let (input_count, kernel, schedule, order_class) = lower_scheduled(output, schedule)?;
+    let loop_ir = kernel.to_string();
 
     let cache_dir = cache_dir.unwrap_or_else(|| std::env::temp_dir().join("coffee-ten-cache"));
     let compiled = py
@@ -409,6 +437,7 @@ fn compile_kernel(
         buffers: kernel.buffers,
         input_count,
         c_source,
+        loop_ir,
         schedule: schedule.to_string(),
         order_class: match order_class {
             OrderClass::Preserving => "preserving",
@@ -422,5 +451,5 @@ fn compile_kernel(
 #[pymodule]
 mod coffee_ten {
     #[pymodule_export]
-    use super::{PyKernel, PyTensor, compile_kernel, input, matmul, maximum, relu, run};
+    use super::{PyKernel, PyTensor, compile_kernel, input, loop_ir, matmul, maximum, relu, run};
 }
