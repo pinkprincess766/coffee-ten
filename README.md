@@ -87,8 +87,9 @@ idle-machine run).
 A Python `Tensor` computes nothing; it records a graph that is run by the reference
 interpreter (`ct.run`) or compiled with a schedule (`ct.compile`). Code:
 `crates/coffee-ten-py` (`ct.input`, operators, `@`, `ct.relu`, `ct.maximum`,
-`ct.run`, `ct.compile`). Checked by: `crates/coffee-ten-py/tests/test_api.py`,
-`crates/coffee-ten-py/tests/test_diff_numpy.py`, `crates/coffee-ten-py/tests/test_compile.py`.
+`ct.run`, `ct.compile`, `ct.loop_ir`). Checked by: `crates/coffee-ten-py/tests/test_api.py`,
+`crates/coffee-ten-py/tests/test_diff_numpy.py`, `crates/coffee-ten-py/tests/test_compile.py`,
+`crates/coffee-ten-py/tests/test_loop_ir.py`.
 
 ### Cost-model autotuning (research, after the MVP) — [L21], [L22]
 
