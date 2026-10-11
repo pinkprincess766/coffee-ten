@@ -4,6 +4,7 @@
 use std::fmt;
 
 pub mod cli;
+pub mod log;
 pub mod meta;
 pub mod run;
 pub mod stats;

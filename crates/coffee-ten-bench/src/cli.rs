@@ -2,6 +2,7 @@
 
 use crate::BenchError;
 use coffee_ten_loop::Schedule;
+use std::path::PathBuf;
 
 pub const DEFAULT_SAMPLES: usize = 30;
 pub const DEFAULT_MIN_SAMPLE_MS: u64 = 10;
@@ -14,7 +15,7 @@ pub const MAX_N: usize = 1024;
 
 pub const USAGE: &str = "usage: coffee-ten-bench --kernel matmul|relu-matmul-bias --n <N> \
 --variant <schedule> [--variant <schedule> ...] [--samples <S>] [--min-sample-ms <MS>] \
-[--seed <SEED>] [--quick]\n\
+[--seed <SEED>] [--quick] [--log <path>]\n\
 a variant is a schedule text; --variant \"\" is the naive kernel";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +45,8 @@ pub struct Config {
     pub min_sample_ms: u64,
     pub seed: u64,
     pub quick: bool,
+    /// JSONL file to append one line per variant to; created if missing.
+    pub log: Option<PathBuf>,
 }
 
 /// Parses the arguments after the program name.
@@ -56,6 +59,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Ben
     let mut min_sample_ms = DEFAULT_MIN_SAMPLE_MS;
     let mut seed = DEFAULT_SEED;
     let mut quick = false;
+    let mut log = None;
     while let Some(flag) = args.next() {
         if flag == "--quick" {
             quick = true;
@@ -79,6 +83,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Ben
             "--samples" => samples = parse_number(&flag, &value)?,
             "--min-sample-ms" => min_sample_ms = parse_number(&flag, &value)?,
             "--seed" => seed = parse_number(&flag, &value)?,
+            "--log" => log = Some(PathBuf::from(value)),
             _ => return Err(usage(format!("unknown argument {flag}"))),
         }
     }
@@ -105,6 +110,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Ben
         min_sample_ms,
         seed,
         quick,
+        log,
     })
 }
 
@@ -162,6 +168,18 @@ mod tests {
         assert_eq!(config.samples, DEFAULT_SAMPLES);
         assert_eq!(config.min_sample_ms, DEFAULT_MIN_SAMPLE_MS);
         assert!(!config.quick);
+    }
+
+    #[test]
+    fn log_is_optional_and_taken_as_a_path() {
+        let base = ["--kernel", "matmul", "--n", "8", "--variant", ""];
+        assert_eq!(parse(&base).unwrap().log, None);
+        let mut with_log = base.to_vec();
+        with_log.extend(["--log", "runs.jsonl"]);
+        assert_eq!(
+            parse(&with_log).unwrap().log,
+            Some(PathBuf::from("runs.jsonl"))
+        );
     }
 
     #[test]

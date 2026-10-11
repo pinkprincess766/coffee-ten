@@ -1,7 +1,9 @@
 //! `coffee-ten-bench`: see the library docs and `USAGE`.
 
 use coffee_ten_bench::cli::Config;
+use coffee_ten_bench::log::append_lines;
 use coffee_ten_bench::meta::{self, Metadata};
+use coffee_ten_bench::run::record_json;
 use coffee_ten_bench::stats::{DRIFT_LIMIT, DRIFT_ROUNDS, MIN_ROUNDS_FOR_DRIFT};
 use coffee_ten_bench::{Record, parse_args, run};
 use std::process::ExitCode;
@@ -42,6 +44,16 @@ fn main() -> ExitCode {
     match run(&config) {
         Ok(records) => {
             print_table(&records);
+            if let Some(path) = &config.log {
+                let lines: Vec<String> = records
+                    .iter()
+                    .map(|record| record_json(record, &metadata))
+                    .collect();
+                if let Err(e) = append_lines(path, &lines) {
+                    eprintln!("error: cannot append to {}: {e}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -69,7 +81,12 @@ fn print_header(config: &Config, m: &Metadata) {
     );
     println!("clang {}", m.clang);
     println!("flags {}  (FMA contraction allowed)", m.flags);
-    println!("git {}  date {}", m.git_rev, m.date_utc);
+    let dirty = match m.git_dirty {
+        Some(true) => " (dirty tree)",
+        Some(false) => "",
+        None => " (dirty: unknown)",
+    };
+    println!("git {}{dirty}  date {}", m.git_rev, m.date_utc);
 }
 
 fn print_table(records: &[Record]) {
@@ -79,7 +96,7 @@ fn print_table(records: &[Record]) {
     );
     for (index, r) in records.iter().enumerate() {
         // The check needs two disjoint windows of rounds; "-" means it did not run.
-        let drift = match (r.n >= MIN_ROUNDS_FOR_DRIFT, r.drift) {
+        let drift = match (r.samples >= MIN_ROUNDS_FOR_DRIFT, r.drift) {
             (false, _) => "-",
             (true, false) => "no",
             (true, true) => "true",
@@ -91,7 +108,7 @@ fn print_table(records: &[Record]) {
         };
         println!(
             "{index:>3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>3} {:>6}  {schedule}",
-            r.stats.median, r.stats.p25, r.stats.p75, r.stats.min, r.n, drift
+            r.stats.median, r.stats.p25, r.stats.p75, r.stats.min, r.samples, drift
         );
         if r.drift {
             eprintln!(
