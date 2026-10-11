@@ -48,8 +48,9 @@ reachable fraction of peak. Code: the matmul update nest is lowered in `i, k, j`
 order (`crates/coffee-ten-loop/src/lower.rs`); tiles come from `split` and `reorder`,
 and the `j` loop is vectorized (`crates/coffee-ten-loop/src/apply.rs`). Checked by:
 `crates/coffee-ten-codegen-c/tests/vectorize.rs` (clang's `-Rpass=loop-vectorize`
-remarks) and `crates/coffee-ten-codegen-c/tests/reorder.rs`. Speed: planned
-(benchmarks).
+remarks) and `crates/coffee-ten-codegen-c/tests/reorder.rs`. Speed: measured by
+`crates/coffee-ten-bench` (variants interleaved over rounds, median and IQR);
+numbers planned (an idle-machine run).
 
 ### Legality of loop reordering — [L24]
 
