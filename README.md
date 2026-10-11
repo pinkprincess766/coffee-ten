@@ -7,8 +7,10 @@ random search.
 
 ## Status
 
-Pre-MVP: workspace skeleton only, no compiler code yet. Numbers in this README are
-a baseline, not results.
+Pre-MVP. Python builder and reference interpreter (f32 and f64); graph → loop IR →
+C → clang end to end, bit for bit against the interpreter; schedules split, reorder
+and vectorize. Not yet: `ct.compile`, benchmarks, the autotuner. Numbers in this
+README are a baseline, not results.
 
 ## Basis
 
@@ -19,43 +21,72 @@ Each section names the idea the code rests on, where it lives and what checks it
 
 What to compute is a graph; how to compute it is a schedule, a list of named
 loop-IR transformations (`split`, `reorder`, `vectorize`). Each step either keeps
-the program legal or returns an error. Code: planned. Checked by: planned.
+the program legal or returns an error. Loop indices are affine expressions [L17].
+Code: `crates/coffee-ten-loop/src/schedule.rs` (text form),
+`crates/coffee-ten-loop/src/apply.rs` (split, reorder, vectorize). Checked by:
+trace-equality proptests in `crates/coffee-ten-loop/src/apply.rs`;
+`crates/coffee-ten-codegen-c/tests/reorder.rs` and
+`crates/coffee-ten-codegen-c/tests/vectorize.rs`.
 
 ### Graph IR and fusion — [L5], [L14]
 
 A static-shape SSA DAG. A chain of elementwise ops lowers to one loop nest, so it
 is fused for free; `matmul` is its own node. The backend emits C source, not
-LLVM IR. Code: planned. Checked by: planned.
+LLVM IR. Code: `crates/coffee-ten-ir/src/graph.rs`;
+`crates/coffee-ten-loop/src/lower.rs` (an elementwise chain becomes one nest; matmul
+becomes init and update nests); `crates/coffee-ten-codegen-c` (C source, clang,
+libloading). Checked by: `lower.rs` tests;
+`crates/coffee-ten-codegen-c/tests/end_to_end.rs` (compiled kernels equal the
+interpreter bit for bit).
 
 ### Loop tiling for matmul — [L3], [L7]
 
 `split` and `reorder` give cache tiles, `vectorize` widens the innermost `j` loop.
 Packing and register micro-kernels are out of scope for the MVP, which caps the
-reachable fraction of peak. Code: planned. Checked by: planned.
+reachable fraction of peak. Code: the matmul update nest is lowered in `i, k, j`
+order (`crates/coffee-ten-loop/src/lower.rs`); tiles come from `split` and `reorder`,
+and the `j` loop is vectorized (`crates/coffee-ten-loop/src/apply.rs`). Checked by:
+`crates/coffee-ten-codegen-c/tests/vectorize.rs` (clang's `-Rpass=loop-vectorize`
+remarks) and `crates/coffee-ten-codegen-c/tests/reorder.rs`. Speed: planned
+(benchmarks).
 
 ### Legality of loop reordering — [L24]
 
-Reordering is allowed inside one perfect nest. In the matmul update nest the only
-carried dependence is the reduction over `k`, a simple case of the dependence
-vectors of the polyhedral model. Because float addition is not associative, steps
-that keep the order of the `k` sum are tested bit for bit, the others with a
-tolerance. Code: planned. Checked by: planned.
+`reorder` permutes the loops of one nest. It is legal when the store target is
+injective on the loops (a sufficient check, not the dependence analysis of [L24])
+and the body either reads no other element of the target buffer, or, when there are
+reduction loops, is a sum `target + e` into the same element with `e` not reading
+the target buffer. A schedule is order-preserving if every element receives its
+contributions in the same order; those f32 results are compared bit for bit. Any
+other schedule is reordering and is compared within a tolerance. Code:
+`crates/coffee-ten-loop/src/apply.rs` (`reorder`, `is_injective`, `OrderClass`).
+Checked by: proptests in `crates/coffee-ten-loop/src/apply.rs` (per-element
+contribution order); `crates/coffee-ten-codegen-c/tests/reorder.rs` (bit for bit when
+order-preserving, within the bound otherwise).
 
 ### Floating-point error bounds — [L29]
 
 Tolerances are derived, not tuned: `|fl(xᵀy) − xᵀy| ≤ γ_n Σ|x_i y_i|` with
 `γ_n = nu/(1 − nu)` and `u = 2⁻²⁴` for `f32`, plus an absolute term for subnormal
-products. Code: planned. Checked by: planned.
+products. Code: `crates/coffee-ten-interp` (f32 in canonical order, f64 mode;
+broadcasting by zero strides as in [L30]). Checked by:
+`crates/coffee-ten-py/tests/test_diff_numpy.py` (Hypothesis against NumPy, bound with
+the bias as the (K+1)-th term); `crates/coffee-ten-codegen-c/tests/reorder.rs`.
 
 ### Roofline — [L2]
 
 Speed is reported as a fraction of `min(peak, AI · BW)`, with peak FLOP/s and
-memory bandwidth measured on the same machine. Code: planned. Checked by: planned.
+memory bandwidth measured on the same machine. Code: `bench/peak/peak.c` (single-thread
+FMA peak and STREAM triad). Checked by: its `--check` mode. Numbers: planned (an
+idle-machine run).
 
 ### Tracing frontend — [L15], [L18]
 
-A Python `Tensor` computes nothing; it records a graph that is run by a reference
-interpreter or compiled. Code: planned. Checked by: planned.
+A Python `Tensor` computes nothing; it records a graph that is run by the reference
+interpreter. Compiling from Python is not implemented yet (see Status). Code:
+`crates/coffee-ten-py` (`ct.input`, operators, `@`, `ct.relu`, `ct.maximum`,
+`ct.run`). Checked by: `crates/coffee-ten-py/tests/test_api.py`,
+`crates/coffee-ten-py/tests/test_diff_numpy.py`.
 
 ### Cost-model autotuning (research, after the MVP) — [L21], [L22]
 
@@ -95,6 +126,9 @@ language; ONNX or torch.fx import; MLIR and LLVM; threads and GPU in the MVP.
   Learning Through Dynamic Python Bytecode Transformation and Graph Compilation.
   ASPLOS 2024. https://doi.org/10.1145/3620665.3640366
 - [L15] tinygrad. https://github.com/tinygrad/tinygrad
+- [L17] C. Lattner, M. Amini, U. Bondhugula, A. Cohen et al. MLIR: Scaling Compiler
+  Infrastructure for Domain Specific Computation. CGO 2021.
+  https://doi.org/10.1109/CGO51591.2021.9370308
 - [L18] R. Frostig, M. J. Johnson, C. Leary. Compiling machine learning programs
   via high-level tracing. SysML 2018.
   https://mlsys.org/Conferences/2019/doc/2018/146.pdf
@@ -110,6 +144,8 @@ language; ONNX or torch.fx import; MLIR and LLVM; threads and GPU in the MVP.
   https://doi.org/10.1145/1375581.1375595
 - [L29] N. J. Higham. *Accuracy and Stability of Numerical Algorithms*, 2nd ed.
   SIAM, 2002. https://doi.org/10.1137/1.9780898718027
+- [L30] T. Chen, T. Dettmers. CMU 10-414/714: Deep Learning Systems (Needle).
+  https://dlsyscourse.org/
 
 ## License
 
