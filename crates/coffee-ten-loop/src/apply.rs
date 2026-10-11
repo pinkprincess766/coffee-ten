@@ -1298,30 +1298,6 @@ mod tests {
     }
 
     #[test]
-    fn split_after_exact_split_with_remainder_is_rejected() {
-        // Known limitation: a guard only bounds an index that has exactly its terms.
-        // 9 = 3 * 3 splits without a guard; splitting the outer loop by 2 needs the guard
-        // `2*sso + ssi < 3`, but the index is `6*sso + 3*ssi + si`, whose plain bound is 11.
-        let mut g = Graph::new();
-        let a = g.input("A", Shape::new(vec![9])).unwrap();
-        let y = g.unary(coffee_ten_ir::UnaryOp::Neg, a).unwrap();
-        let k = lower_elementwise(&g, y, "k").unwrap();
-        let once = applied(&k, "split(0, i0, so, si, 3)");
-        assert_refused(
-            &once,
-            &schedule("split(0, so, sso, ssi, 2)"),
-            ScheduleError::Invalid(LoopIrError::OutOfBounds {
-                nest: 0,
-                buffer: "out".to_string(),
-                dim: 0,
-                min: 0,
-                max: 11,
-                size: 9,
-            }),
-        );
-    }
-
-    #[test]
     fn empty_schedule_is_identity() {
         let k = matmul();
         assert_eq!(apply(&k, &Schedule::default()), Ok(k.clone()));
@@ -1377,6 +1353,21 @@ mod tests {
                 collect_loads(b, out);
             }
         }
+    }
+
+    #[test]
+    fn split_after_exact_split_with_remainder_applies() {
+        // 9 = 3 * 3 splits without a guard; splitting the outer loop by 2 needs the guard
+        // `2*sso + ssi < 3`, and the index is `6*sso + 3*ssi + si = 3*(2*sso + ssi) + si`.
+        let mut g = Graph::new();
+        let a = g.input("A", Shape::new(vec![9])).unwrap();
+        let y = g.unary(coffee_ten_ir::UnaryOp::Neg, a).unwrap();
+        let k = lower_elementwise(&g, y, "k").unwrap();
+        let once = applied(&k, "split(0, i0, so, si, 3)");
+        let twice = applied(&once, "split(0, so, sso, ssi, 2)");
+        assert_eq!(twice.nests[0].guards.len(), 1);
+        assert_eq!(twice.validate(), Ok(()));
+        assert_eq!(trace(&twice), trace(&k));
     }
 
     #[test]
@@ -1491,14 +1482,7 @@ mod tests {
             let second = Schedule {
                 steps: vec![split_step(nest, name, "sso", "ssi", again_factor)],
             };
-            let twice = match apply(&once, &second) {
-                Ok(twice) => twice,
-                // Known limitation, see `split_after_exact_split_with_remainder_is_rejected`.
-                Err(ScheduleError::Invalid(LoopIrError::OutOfBounds { .. })) => {
-                    return Err(TestCaseError::reject("index not provable in bounds"));
-                }
-                Err(e) => return Err(TestCaseError::fail(e.to_string())),
-            };
+            let twice = apply(&once, &second).expect("second split applies");
             prop_assert_eq!(trace(&twice), trace(&kernel));
         }
 

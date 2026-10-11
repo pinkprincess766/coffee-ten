@@ -7,6 +7,7 @@ pub use lower::{LowerError, MAX_EXPR_NODES, lower, lower_elementwise};
 pub mod apply;
 pub use apply::{OrderClass, ScheduleError, apply, apply_classified};
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// `for name in 0..extent`, step 1. A `vectorize` loop asks the backend to vectorize it;
@@ -272,7 +273,7 @@ fn validate_access(
     }
     for (dim, (index, &size)) in access.index.iter().zip(&buffer.shape).enumerate() {
         let (min, max) = affine_bounds(index, loops);
-        let max = guarded_max(index, max, guards);
+        let max = guarded_max(index, max, guards, loops);
         let in_bounds = min >= 0 && usize::try_from(max).is_ok_and(|max_idx| max_idx < size);
         if !in_bounds {
             return Err(LoopIrError::OutOfBounds {
@@ -301,25 +302,85 @@ fn check_terms(nest_no: usize, loops: &[Loop], expr: &AffineExpr) -> Result<(), 
     Ok(())
 }
 
-/// Tightens `max`, the plain upper bound of `index`, by the guards whose terms equal the
-/// terms of `index` (same (name, coeff) pairs in any order). For such a guard `g`,
-/// `g.expr < g.bound` gives `index <= g.bound - 1 + (index.constant - g.expr.constant)`.
-/// This is the only reasoning about guards; it is enough for split, where the index is
-/// exactly the guarded expression.
-fn guarded_max(index: &AffineExpr, max: i64, guards: &[Guard]) -> i64 {
-    let sorted_terms = |e: &AffineExpr| {
-        let mut terms = e.terms.clone();
-        terms.sort();
-        terms
+/// Tightens `max`, the plain upper bound of `index`, by the guards.
+///
+/// Take a guard `G + gc < B`, where `G` is the sum of its terms and `gc` its constant, so
+/// `G <= B - 1 - gc`. Suppose an integer `c >= 1` exists such that every term of `G`,
+/// scaled by `c`, occurs in `index` with exactly that coefficient (zero-coefficient terms
+/// are ignored, repeated names are summed). Then `index = c*G + R + ec`, where `R` are the
+/// remaining terms of `index` and `ec` its constant, and
+///
+/// `index <= c*(B - 1 - gc) + max(R) + ec`,
+///
+/// with `max(R)` the plain affine bound of `R`. `c` is fixed by the first guard term:
+/// `coeff_in_index / coeff_in_guard` must be a positive integer, the same for all terms.
+/// The result is the smallest such bound over all guards. `c = 1` with empty `R` is the
+/// split case, the index being exactly the guarded expression; `c > 1` arises when a split
+/// loop is split again, e.g. `6*sso + 3*ssi + si = 3*(2*sso + ssi) + si` under
+/// `2*sso + ssi < 3`.
+///
+/// Checked arithmetic: a guard whose bound overflows i64 is skipped, so an overflow never
+/// makes the result smaller than the true maximum. This is the only reasoning about guards.
+fn guarded_max(index: &AffineExpr, max: i64, guards: &[Guard], loops: &[Loop]) -> i64 {
+    let Some(index_terms) = merged_terms(index) else {
+        return max;
     };
-    let index_terms = sorted_terms(index);
     guards
         .iter()
-        .filter(|g| sorted_terms(&g.expr) == index_terms)
-        .fold(max, |max, g| {
-            let shift = index.constant.saturating_sub(g.expr.constant);
-            max.min(g.bound.saturating_sub(1).saturating_add(shift))
-        })
+        .filter_map(|g| guard_bound(index, &index_terms, g, loops))
+        .fold(max, i64::min)
+}
+
+/// The bound `c*(B - 1 - gc) + max(R) + ec` of `guarded_max` for one guard, if `c` exists.
+fn guard_bound(
+    index: &AffineExpr,
+    index_terms: &BTreeMap<&str, i64>,
+    guard: &Guard,
+    loops: &[Loop],
+) -> Option<i64> {
+    let guard_terms = merged_terms(&guard.expr)?;
+    let (first_name, first_coeff) = guard_terms.iter().next()?;
+    let c = index_terms.get(first_name)?.checked_div(*first_coeff)?;
+    if c < 1 {
+        return None;
+    }
+    for (name, coeff) in &guard_terms {
+        let in_index = *index_terms.get(name)?;
+        if coeff.checked_mul(c) != Some(in_index) {
+            return None;
+        }
+    }
+    let rest = AffineExpr {
+        constant: 0,
+        terms: index_terms
+            .iter()
+            .filter(|(name, _)| !guard_terms.contains_key(*name))
+            .map(|(name, coeff)| (name.to_string(), *coeff))
+            .collect(),
+    };
+    let rest_max = affine_bounds(&rest, loops).1;
+    if rest_max == i64::MAX {
+        // `affine_bounds` saturated: the true maximum may be larger.
+        return None;
+    }
+    let slack = guard
+        .bound
+        .checked_sub(1)?
+        .checked_sub(guard.expr.constant)?;
+    c.checked_mul(slack)?
+        .checked_add(rest_max)?
+        .checked_add(index.constant)
+}
+
+/// Non-zero coefficient per loop name, repeated names summed; None on overflow.
+fn merged_terms(expr: &AffineExpr) -> Option<BTreeMap<&str, i64>> {
+    let mut merged = BTreeMap::new();
+    for (name, coeff) in &expr.terms {
+        let sum: &mut i64 = merged.entry(name.as_str()).or_insert(0);
+        *sum = sum.checked_add(*coeff)?;
+    }
+    merged.retain(|_, coeff| *coeff != 0);
+    Some(merged)
 }
 
 /// Smallest and largest value of `expr` over all iterations of `loops`.
@@ -477,6 +538,7 @@ fn operand_str(buffers: &[Buffer], e: &Expr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn lp(name: &str, extent: usize) -> Loop {
         Loop {
@@ -952,5 +1014,172 @@ mod tests {
             LoopIrError::EmptyGuard { nest: 1 }.to_string(),
             "nest 1: a guard never holds"
         );
+    }
+
+    fn clamped(index: &AffineExpr, guards: &[Guard], loops: &[Loop]) -> i64 {
+        guarded_max(index, affine_bounds(index, loops).1, guards, loops)
+    }
+
+    #[test]
+    fn guard_clamps_a_multiple_of_its_terms_plus_the_rest() {
+        let loops = [lp("sso", 2), lp("ssi", 2), lp("si", 3)];
+        let guards = [guard(aff(0, &[("sso", 2), ("ssi", 1)]), 3)];
+        // 6*sso + 3*ssi + si = 3*(2*sso + ssi) + si <= 3*2 + 2 = 8; the plain bound is 11.
+        let index = aff(0, &[("sso", 6), ("ssi", 3), ("si", 1)]);
+        assert_eq!(affine_bounds(&index, &loops).1, 11);
+        assert_eq!(clamped(&index, &guards, &loops), 8);
+        // Term order and a zero-coefficient term do not matter; the constant is added.
+        let index = aff(1, &[("si", 1), ("sso", 6), ("zero", 0), ("ssi", 3)]);
+        let mut loops_zero = loops.to_vec();
+        loops_zero.push(lp("zero", 5));
+        assert_eq!(clamped(&index, &guards, &loops_zero), 9);
+        // The same index as the whole guard-free validate: Y: f32[9] fits, Y: f32[8] does not.
+        let mut k = guarded_store(9, 0);
+        k.nests[0].loops = loops.to_vec();
+        k.nests[0].guards = guards.to_vec();
+        k.nests[0].body.target.index = vec![aff(0, &[("sso", 6), ("ssi", 3), ("si", 1)])];
+        assert_eq!(k.validate(), Ok(()));
+        k.buffers[0].shape = vec![8];
+        assert!(k.validate().is_err());
+    }
+
+    #[test]
+    fn guard_does_not_clamp_a_non_multiple_of_its_terms() {
+        let loops = [lp("sso", 2), lp("ssi", 2)];
+        let guards = [guard(aff(0, &[("sso", 2), ("ssi", 1)]), 3)];
+        // 5 is not a multiple of 2, so the plain bound 5 + 3 stays.
+        let index = aff(0, &[("sso", 5), ("ssi", 3)]);
+        assert_eq!(clamped(&index, &guards, &loops), 8);
+        // The ratios differ: sso gives c = 3, ssi gives c = 2.
+        let index = aff(0, &[("sso", 6), ("ssi", 2)]);
+        assert_eq!(clamped(&index, &guards, &loops), 8);
+        // A guard term missing from the index.
+        let index = aff(0, &[("sso", 6)]);
+        assert_eq!(clamped(&index, &guards, &loops), 6);
+        // A negative ratio is not a scale by c >= 1.
+        let index = aff(0, &[("sso", -2), ("ssi", -1)]);
+        assert_eq!(clamped(&index, &guards, &loops), 0);
+    }
+
+    #[test]
+    fn guard_clamp_with_c_one_keeps_working() {
+        let loops = [lp("io", 2), lp("ii", 2), lp("j", 4)];
+        let guards = [guard(aff(1, &[("io", 2), ("ii", 1)]), 3)];
+        // G = 2*io + ii <= 3 - 1 - 1 = 1, so 2*io + ii + 2 <= 3.
+        let index = aff(2, &[("io", 2), ("ii", 1)]);
+        assert_eq!(clamped(&index, &guards, &loops), 3);
+        // With remaining terms: + j <= 3 adds 3.
+        let index = aff(2, &[("io", 2), ("ii", 1), ("j", 1)]);
+        assert_eq!(clamped(&index, &guards, &loops), 6);
+        // The smallest bound over several guards wins.
+        let guards = [guards[0].clone(), guard(aff(0, &[("io", 2), ("ii", 1)]), 1)];
+        assert_eq!(clamped(&index, &guards, &loops), 5);
+    }
+
+    #[test]
+    fn guard_clamp_overflow_never_lowers_the_bound() {
+        let loops = [lp("a", 2), lp("b", 4)];
+        let big = i64::MAX / 2 + 1;
+        // c = 2 and slack = i64::MAX - 1 overflow: the guard is skipped.
+        let guards = [guard(var("a"), i64::MAX)];
+        let index = aff(0, &[("a", 2), ("b", 1)]);
+        let plain = affine_bounds(&index, &loops).1;
+        assert_eq!(clamped(&index, &guards, &loops), plain);
+        // A saturated plain bound of the rest is not trusted either.
+        let loops = [lp("a", 2), lp("b", usize::MAX)];
+        let guards = [guard(var("a"), -4)];
+        // Trusting it would give -5 + MAX - big: the sum fits, but is below the true maximum.
+        let index = aff(-big, &[("a", 1), ("b", big)]);
+        let plain = affine_bounds(&index, &loops).1;
+        assert_eq!(clamped(&index, &guards, &loops), plain);
+    }
+
+    /// Loops `l0..` with the given extents.
+    fn numbered_loops(extents: &[usize]) -> Vec<Loop> {
+        let named = extents.iter().enumerate();
+        named
+            .map(|(n, &extent)| lp(&format!("l{n}"), extent))
+            .collect()
+    }
+
+    fn numbered_expr(constant: i64, coeffs: &[i64]) -> AffineExpr {
+        let terms = coeffs.iter().enumerate();
+        AffineExpr {
+            constant,
+            terms: terms.map(|(n, &c)| (format!("l{n}"), c)).collect(),
+        }
+    }
+
+    fn eval(expr: &AffineExpr, values: &[i64]) -> i64 {
+        let term = |(name, coeff): &(String, i64)| {
+            let n: usize = name[1..].parse().expect("test names are l<n>");
+            coeff * values[n]
+        };
+        expr.constant + expr.terms.iter().map(term).sum::<i64>()
+    }
+
+    proptest! {
+        /// The clamp never under-estimates: over all iterations that pass every guard, the
+        /// index stays <= the clamped max. Indices are often built as `c*G + extra`, so the
+        /// clamp has something to do.
+        #[test]
+        fn guarded_max_never_under_estimates(
+            extents in prop::collection::vec(1usize..=4, 1..=3),
+            guard_coeffs in prop::collection::vec(
+                (
+                    prop::collection::vec(prop_oneof![2 => Just(0i64), 3 => -3i64..=3], 3),
+                    -3i64..=3,
+                    -2i64..=8,
+                ),
+                0..=2,
+            ),
+            scale in 1i64..=4,
+            pick in any::<usize>(),
+            extra in prop::collection::vec(
+                prop_oneof![1 => Just(0i64), 1 => -3i64..=3],
+                3,
+            ),
+            constant in -3i64..=3,
+            derived in any::<bool>(),
+        ) {
+            let loops = numbered_loops(&extents);
+            let n = loops.len();
+            let guards: Vec<Guard> = guard_coeffs
+                .iter()
+                .map(|(coeffs, gc, bound)| guard(numbered_expr(*gc, &coeffs[..n]), *bound))
+                .collect();
+            let mut coeffs = extra[..n].to_vec();
+            if derived && !guards.is_empty() {
+                let source = &guards[pick % guards.len()].expr;
+                for ((_, g), c) in source.terms.iter().zip(&mut coeffs) {
+                    *c += scale * g;
+                }
+            }
+            let index = numbered_expr(constant, &coeffs);
+
+            let iterations: usize = extents.iter().product();
+            let mut true_max: Option<i64> = None;
+            for it in 0..iterations {
+                let mut rest = it;
+                let values: Vec<i64> = extents
+                    .iter()
+                    .map(|&e| {
+                        let v = (rest % e) as i64;
+                        rest /= e;
+                        v
+                    })
+                    .collect();
+                if guards.iter().all(|g| eval(&g.expr, &values) < g.bound) {
+                    let v = eval(&index, &values);
+                    true_max = Some(true_max.map_or(v, |m| m.max(v)));
+                }
+            }
+            let plain = affine_bounds(&index, &loops).1;
+            let bound = guarded_max(&index, plain, &guards, &loops);
+            prop_assert!(bound <= plain);
+            if let Some(true_max) = true_max {
+                prop_assert!(bound >= true_max, "clamped {} < true max {}", bound, true_max);
+            }
+        }
     }
 }
