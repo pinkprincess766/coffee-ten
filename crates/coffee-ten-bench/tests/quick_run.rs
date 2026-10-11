@@ -25,7 +25,7 @@ fn quick_run_checks_and_times_naive_and_vectorized_matmul() {
     assert_eq!(records[1].variant, "vectorize(1, j)");
     for record in &records {
         assert!(record.quick);
-        assert_eq!(record.n, QUICK_SAMPLES);
+        assert_eq!(record.samples, QUICK_SAMPLES);
         let s = record.stats;
         assert!(s.min > 0.0, "{record:?}");
         assert!(

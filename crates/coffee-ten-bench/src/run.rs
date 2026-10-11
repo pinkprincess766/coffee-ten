@@ -2,10 +2,11 @@
 
 use crate::BenchError;
 use crate::cli::{Config, KernelKind};
+use crate::meta::Metadata;
 use crate::stats::{Rng, Stats, drifted, summarize};
 use coffee_ten_codegen_c::{BENCH_FLAGS, CompiledKernel, compile_with_flags};
 use coffee_ten_ir::{BinaryOp, Graph, Shape, UnaryOp};
-use coffee_ten_loop::{Kernel, Schedule, apply, lower};
+use coffee_ten_loop::{Kernel, OrderClass, Schedule, apply_classified, lower};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -131,6 +132,8 @@ fn build_kernel(kind: KernelKind, n: usize) -> Result<Kernel, BenchError> {
 /// A variant ready to time: compiled, with its own buffers.
 struct Variant {
     text: String,
+    schedule: Schedule,
+    order_class: OrderClass,
     compiled: CompiledKernel,
     storage: Vec<Vec<f32>>,
 }
@@ -162,11 +165,14 @@ fn make_variant(
     let setup = |what: &str, e: &dyn std::fmt::Display| {
         BenchError::Setup(format!("variant {text:?}: {what}: {e}"))
     };
-    let kernel = apply(naive, schedule).map_err(|e| setup("cannot apply schedule", &e))?;
+    let (kernel, order_class) =
+        apply_classified(naive, schedule).map_err(|e| setup("cannot apply schedule", &e))?;
     let compiled = compile_with_flags(&kernel, &cache_dir(), BENCH_FLAGS)
         .map_err(|e| setup("cannot compile", &e))?;
     Ok(Variant {
         text: text.to_string(),
+        schedule: schedule.clone(),
+        order_class,
         compiled,
         storage: inputs.storage(&kernel),
     })
@@ -191,13 +197,35 @@ fn time_sample(
     Ok(flop_per_call * calls as f64 / elapsed.as_secs_f64() / 1e9)
 }
 
+/// What a run measures; the same for every record of the run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RunInfo {
+    pub kernel: &'static str,
+    /// Matrix size.
+    pub n: usize,
+    /// FNV-1a of the lowered kernel's text before any schedule.
+    pub graph_hash: u64,
+    /// The run was `--quick`: not a measurement.
+    pub quick: bool,
+}
+
 /// What is reported for one variant.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
+    pub kernel: &'static str,
+    /// Matrix size.
+    pub n: usize,
+    pub graph_hash: u64,
+    /// The variant as typed.
     pub variant: String,
+    /// Canonical schedule text, "" for the naive kernel.
+    pub schedule: String,
+    pub order_class: OrderClass,
+    /// Always true: a variant that fails the check aborts the run before it is recorded.
+    pub verified: bool,
     pub stats: Stats,
     /// Number of samples.
-    pub n: usize,
+    pub samples: usize,
     /// Median of the first rounds differs from the median of the last by more than `DRIFT_LIMIT`.
     pub drift: bool,
     /// The run was `--quick`: not a measurement.
@@ -205,15 +233,110 @@ pub struct Record {
 }
 
 /// The one place where a record per variant is assembled; a JSONL line is written from it.
-/// `rates` in round order, GFLOP/s. `None` if there are no samples.
-pub fn make_record(variant: &str, rates: &[f64], quick: bool) -> Option<Record> {
+/// Only called for variants that passed the check. `rates` in round order, GFLOP/s. `None` if
+/// there are no samples.
+pub fn make_record(
+    info: &RunInfo,
+    variant: &str,
+    schedule: &Schedule,
+    order_class: OrderClass,
+    rates: &[f64],
+) -> Option<Record> {
     Some(Record {
+        kernel: info.kernel,
+        n: info.n,
+        graph_hash: info.graph_hash,
         variant: variant.to_string(),
+        schedule: schedule.to_string(),
+        order_class,
+        verified: true,
         stats: summarize(rates)?,
-        n: rates.len(),
+        samples: rates.len(),
         drift: drifted(rates),
-        quick,
+        quick: info.quick,
     })
+}
+
+/// 64-bit FNV-1a.
+pub fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    })
+}
+
+/// `text` as a JSON string literal: `"` and `\` escaped, `\n` and `\t` as such, other control
+/// characters as `\u00XX`.
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A finite number as JSON with the shortest round-trip digits. NaN and infinities have no
+/// JSON form and become `null`.
+fn json_number(x: f64) -> String {
+    if x.is_finite() {
+        format!("{x}")
+    } else {
+        "null".to_string()
+    }
+}
+
+fn order_class_name(class: OrderClass) -> &'static str {
+    match class {
+        OrderClass::Preserving => "preserving",
+        OrderClass::Reordering => "reordering",
+    }
+}
+
+/// One JSONL line of the log: the record and the run's metadata, keys in log-format order.
+pub fn record_json(record: &Record, metadata: &Metadata) -> String {
+    let fields = [
+        format!("\"kernel\":{}", json_string(record.kernel)),
+        format!("\"n\":{}", record.n),
+        format!("\"graph_hash\":\"{:016x}\"", record.graph_hash),
+        format!("\"schedule\":{}", json_string(&record.schedule)),
+        format!(
+            "\"order_class\":{}",
+            json_string(order_class_name(record.order_class))
+        ),
+        format!("\"verified\":{}", record.verified),
+        format!("\"quick\":{}", record.quick),
+        format!("\"samples\":{}", record.samples),
+        format!("\"median\":{}", json_number(record.stats.median)),
+        format!("\"p25\":{}", json_number(record.stats.p25)),
+        format!("\"p75\":{}", json_number(record.stats.p75)),
+        format!("\"min\":{}", json_number(record.stats.min)),
+        format!("\"drift\":{}", record.drift),
+        format!("\"unit\":{}", json_string("GFLOP/s")),
+        format!("\"seed\":{}", metadata.seed),
+        format!("\"commit\":{}", json_string(&metadata.git_rev)),
+        format!(
+            "\"dirty\":{}",
+            metadata
+                .git_dirty
+                .map_or("null".to_string(), |d| d.to_string())
+        ),
+        format!("\"clang\":{}", json_string(&metadata.clang)),
+        format!("\"flags\":{}", json_string(&metadata.flags)),
+        format!("\"machine\":{}", json_string(&metadata.hw_model)),
+        format!("\"cpu\":{}", json_string(&metadata.cpu_brand)),
+        format!("\"os\":{}", json_string(&metadata.os_version)),
+        format!("\"date\":{}", json_string(&metadata.date_utc)),
+    ];
+    format!("{{{}}}", fields.join(","))
 }
 
 /// Builds the naive kernel and every variant, checks each variant's output against the naive
@@ -221,6 +344,12 @@ pub fn make_record(variant: &str, rates: &[f64], quick: bool) -> Option<Record> 
 pub fn run(config: &Config) -> Result<Vec<Record>, BenchError> {
     let n = config.n;
     let naive_kernel = build_kernel(config.kernel, n)?;
+    let info = RunInfo {
+        kernel: config.kernel.name(),
+        n,
+        graph_hash: fnv1a_64(naive_kernel.to_string().as_bytes()),
+        quick: config.quick,
+    };
     let inputs = Inputs::new(n, config.seed);
     let with_bias = config.kernel == KernelKind::ReluMatmulBias;
     let scales = inputs.bound_scales(n, with_bias);
@@ -256,8 +385,14 @@ pub fn run(config: &Config) -> Result<Vec<Record>, BenchError> {
         .iter()
         .zip(&rates)
         .map(|(variant, rates)| {
-            make_record(&variant.text, rates, config.quick)
-                .ok_or_else(|| BenchError::Setup("no samples".to_string()))
+            make_record(
+                &info,
+                &variant.text,
+                &variant.schedule,
+                variant.order_class,
+                rates,
+            )
+            .ok_or_else(|| BenchError::Setup("no samples".to_string()))
         })
         .collect()
 }
@@ -328,14 +463,95 @@ mod tests {
 
     #[test]
     fn record_is_assembled_from_rates_in_round_order() {
+        let info = RunInfo {
+            kernel: "matmul",
+            n: 8,
+            graph_hash: 0,
+            quick: true,
+        };
+        let schedule = Schedule::parse("vectorize(1,j)").unwrap();
         let rates: Vec<f64> = (1..=10).map(f64::from).collect();
-        let record = make_record("v", &rates, true).unwrap();
-        assert_eq!(record.n, 10);
+        let record = make_record(
+            &info,
+            "vectorize(1,j)",
+            &schedule,
+            OrderClass::Reordering,
+            &rates,
+        )
+        .unwrap();
+        assert_eq!(record.samples, 10);
         assert_eq!(record.stats.median, 5.0);
         assert!(record.quick);
+        assert!(record.verified);
+        // The canonical text is written to the log, not the text as typed.
+        assert_eq!(record.schedule, "vectorize(1, j)");
+        assert_eq!(record.variant, "vectorize(1,j)");
         // First 5 rounds have median 3, the last 5 have median 8.
         assert!(record.drift);
-        assert_eq!(make_record("v", &[], false), None);
+        assert_eq!(
+            make_record(&info, "", &schedule, OrderClass::Preserving, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn json_string_escapes_quote_backslash_and_control_characters() {
+        assert_eq!(json_string("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(json_string("a\nb"), r#""a\nb""#);
+        assert_eq!(json_string("a\tb"), r#""a\tb""#);
+        assert_eq!(json_string("a\u{1}b"), r#""a\u0001b""#);
+        // 0x1f is the last control character; the space after it is printed as is.
+        assert_eq!(json_string("\u{1f} "), r#""\u001f ""#);
+    }
+
+    #[test]
+    fn non_finite_numbers_become_null() {
+        assert_eq!(json_number(f64::NAN), "null");
+        assert_eq!(json_number(f64::INFINITY), "null");
+        assert_eq!(json_number(f64::NEG_INFINITY), "null");
+    }
+
+    #[test]
+    fn fnv1a_of_known_inputs() {
+        assert_eq!(format!("{:016x}", fnv1a_64(b"")), "cbf29ce484222325");
+        assert_eq!(format!("{:016x}", fnv1a_64(b"a")), "af63dc4c8601ec8c");
+    }
+
+    #[test]
+    fn record_json_is_one_line_with_the_log_keys_in_order() {
+        let record = Record {
+            kernel: "matmul",
+            n: 256,
+            graph_hash: 0x0123_4567_89ab_cdef,
+            variant: "split(1, j, jo, ji, 8)".to_string(),
+            schedule: "split(1, j, jo, ji, 8)".to_string(),
+            order_class: OrderClass::Preserving,
+            verified: true,
+            stats: Stats {
+                median: 12.5,
+                p25: 12.0,
+                p75: 13.0,
+                min: 11.25,
+            },
+            samples: 30,
+            drift: false,
+            quick: false,
+        };
+        let metadata = Metadata {
+            hw_model: "Mac16,1".to_string(),
+            cpu_brand: "Apple M4".to_string(),
+            os_version: "27.0".to_string(),
+            clang: "Apple clang 17".to_string(),
+            flags: "-std=c99 -O2".to_string(),
+            git_rev: "abc1234".to_string(),
+            git_dirty: Some(false),
+            date_utc: "2026-10-11T00:00:00Z".to_string(),
+            seed: 1,
+        };
+        assert_eq!(
+            record_json(&record, &metadata),
+            r#"{"kernel":"matmul","n":256,"graph_hash":"0123456789abcdef","schedule":"split(1, j, jo, ji, 8)","order_class":"preserving","verified":true,"quick":false,"samples":30,"median":12.5,"p25":12,"p75":13,"min":11.25,"drift":false,"unit":"GFLOP/s","seed":1,"commit":"abc1234","dirty":false,"clang":"Apple clang 17","flags":"-std=c99 -O2","machine":"Mac16,1","cpu":"Apple M4","os":"27.0","date":"2026-10-11T00:00:00Z"}"#
+        );
     }
 
     #[test]

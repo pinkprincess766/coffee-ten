@@ -14,6 +14,9 @@ pub struct Metadata {
     pub clang: String,
     pub flags: String,
     pub git_rev: String,
+    /// Tracked files differ from `git_rev`; None if git is unavailable. A number measured
+    /// on a dirty tree cannot be reproduced from the commit alone.
+    pub git_dirty: Option<bool>,
     pub date_utc: String,
     pub seed: u64,
 }
@@ -27,6 +30,7 @@ pub fn collect(seed: u64) -> Metadata {
         clang: first_line(&command_stdout("clang", &["--version"])),
         flags: BENCH_FLAGS.join(" "),
         git_rev: command_stdout("git", &["rev-parse", "--short", "HEAD"]),
+        git_dirty: git_dirty(),
         date_utc: command_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         seed,
     }
@@ -46,6 +50,15 @@ pub fn command_stdout(program: &str, args: &[&str]) -> String {
     } else {
         text
     }
+}
+
+/// Whether `git status --porcelain --untracked-files=no` prints anything; None if git fails.
+fn git_dirty() -> Option<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
 }
 
 fn first_line(text: &str) -> String {
