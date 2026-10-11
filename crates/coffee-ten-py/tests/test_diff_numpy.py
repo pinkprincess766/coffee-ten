@@ -2,17 +2,33 @@
 
 Two generators: elementwise expression trees (compared exactly) and matmul with a
 bias and relu epilogue (compared to a float64 reference within a derived bound).
+The same generators also check the compiled path against `ct.run`, bit for bit, with
+fewer examples because every example runs clang.
 Settings are derandomized, so CI runs the same examples every time.
 """
 
 import hypothesis.extra.numpy as hnp
 import numpy as np
+import pytest
 from hypothesis import Phase, example, given, settings
 from hypothesis import strategies as st
 
 import coffee_ten as ct
 
 SETTINGS = settings(derandomize=True, max_examples=200, deadline=None, database=None)
+COMPILED_SETTINGS = settings(SETTINGS, max_examples=40)
+
+
+@pytest.fixture(scope="module")
+def cache_dir(tmp_path_factory):
+    # Module scoped, so Hypothesis may use it (a function-scoped fixture is refused).
+    return tmp_path_factory.mktemp("kernel-cache")
+
+
+def assert_same_bits(actual, expected):
+    assert actual.dtype == np.float32
+    assert actual.shape == expected.shape
+    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
 def f32_values(limit):
@@ -132,6 +148,17 @@ def test_elementwise_tree_matches_numpy_exactly(case):
     np.testing.assert_array_equal(ours, expected)
 
 
+@COMPILED_SETTINGS
+@given(case=elementwise_cases())
+def test_compiled_elementwise_tree_equals_the_interpreter_bit_for_bit(case, cache_dir):
+    # Both do the same f32 operations in the same order, so even the sign of a zero agrees.
+    tree, arrays = case
+    inputs = [ct.input(f"x{i}", array.shape) for i, array in enumerate(arrays)]
+    y = build_ct(tree, inputs)
+    values = {f"x{i}": a for i, a in enumerate(arrays)}
+    assert_same_bits(ct.compile(y, cache_dir=cache_dir)(**values), ct.run(y, **values))
+
+
 # --- Matmul with epilogue --------------------------------------------------------
 #
 # Tolerance: Higham, Accuracy and Stability of Numerical Algorithms, inner products.
@@ -169,23 +196,30 @@ def matmul_cases(draw):
     return a, b, bias, draw(st.booleans())
 
 
+def build_matmul_case(case):
+    """Returns (expression, input values) of a matmul case."""
+    a, b, bias, apply_relu = case
+    out = ct.input("a", a.shape) @ ct.input("b", b.shape)
+    values = {"a": a, "b": b}
+    if bias is not None:
+        out = out + ct.input("bias", bias.shape)
+        values["bias"] = bias
+    if apply_relu:
+        out = ct.relu(out)
+    return out, values
+
+
 def evaluate_matmul_case(case):
     """Returns (ours, reference, tolerance), all with the shape (M, N)."""
     a, b, bias, apply_relu = case
     k = a.shape[1]
-    A = ct.input("a", a.shape)
-    B = ct.input("b", b.shape)
-    values = {"a": a, "b": b}
-    out = A @ B
+    out, values = build_matmul_case(case)
     ref = a.astype(np.float64) @ b.astype(np.float64)
     bound_scale = np.abs(a).astype(np.float64) @ np.abs(b).astype(np.float64)
     if bias is not None:
-        out = out + ct.input("bias", bias.shape)
-        values["bias"] = bias
         ref = ref + bias.astype(np.float64)
         bound_scale = bound_scale + np.abs(bias).astype(np.float64)
     if apply_relu:
-        out = ct.relu(out)
         ref = np.maximum(ref, 0.0)
     tol = 2 * (gamma(k + 1) * bound_scale + k * 2.0**-149)
     return ct.run(out, **values), ref, tol
@@ -202,6 +236,14 @@ def assert_matmul_case(case):
 @given(case=matmul_cases())
 def test_matmul_with_epilogue_matches_float64_within_bound(case):
     assert_matmul_case(case)
+
+
+@COMPILED_SETTINGS
+@given(case=matmul_cases())
+def test_compiled_matmul_with_epilogue_equals_the_interpreter_bit_for_bit(case, cache_dir):
+    # Same canonical order of the K sum in both: acc = 0; acc += a[i, k] * b[k, j].
+    out, values = build_matmul_case(case)
+    assert_same_bits(ct.compile(out, cache_dir=cache_dir)(**values), ct.run(out, **values))
 
 
 # K = 1 (a single product, no accumulation) and a bias of shape (); hand values.
