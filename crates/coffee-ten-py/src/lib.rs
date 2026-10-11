@@ -2,15 +2,18 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use coffee_ten_codegen_c::{CompiledKernel, compile, emit_c};
 use coffee_ten_interp::{Tensor as DenseTensor, run_f32};
-use coffee_ten_ir::{BinaryOp, Graph, GraphError, NodeId, Shape, UnaryOp};
+use coffee_ten_ir::{BinaryOp, Graph, GraphError, NodeId, Op, Shape, UnaryOp};
+use coffee_ten_loop::{Buffer, OrderClass, Schedule, apply_classified};
 use numpy::{
     PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyUntypedArray,
     PyUntypedArrayMethods, ndarray,
 };
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -96,6 +99,10 @@ fn check_depth(depth: usize) -> PyResult<usize> {
 
 fn value_error(err: impl Display) -> PyErr {
     PyValueError::new_err(err.to_string())
+}
+
+fn runtime_error(err: impl Display) -> PyErr {
+    PyRuntimeError::new_err(err.to_string())
 }
 
 /// Either side of an operator: a Tensor or a Python number (an f32 constant).
@@ -224,14 +231,7 @@ fn run<'py>(
     let mut graph = Graph::new();
     let output_id = lower(&output.expr, &mut graph, &mut HashMap::new()).map_err(value_error)?;
 
-    let mut arrays: Vec<(String, DenseTensor<f32>)> = Vec::new();
-    if let Some(inputs) = inputs {
-        for (key, value) in inputs.iter() {
-            let name: String = key.extract()?;
-            let array = read_input(&name, &value)?;
-            arrays.push((name, array));
-        }
-    }
+    let arrays = read_inputs(inputs)?;
     let named_arrays: Vec<(&str, &DenseTensor<f32>)> = arrays
         .iter()
         .map(|(name, array)| (name.as_str(), array))
@@ -239,6 +239,19 @@ fn run<'py>(
 
     let result = run_f32(&graph, output_id, &named_arrays).map_err(value_error)?;
     PyArray1::from_slice(py, result.data()).reshape(result.shape().dims().to_vec())
+}
+
+/// Reads the keyword arguments of `run` or `Kernel.__call__`: name and float32 array.
+fn read_inputs(inputs: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, DenseTensor<f32>)>> {
+    let mut arrays = Vec::new();
+    if let Some(inputs) = inputs {
+        for (key, value) in inputs.iter() {
+            let name: String = key.extract()?;
+            let array = read_input(&name, &value)?;
+            arrays.push((name, array));
+        }
+    }
+    Ok(arrays)
 }
 
 /// Builds the graph node of `expr`; a subtree shared by `Arc` becomes one node.
@@ -293,9 +306,121 @@ fn read_input(name: &str, value: &Bound<'_, PyAny>) -> PyResult<DenseTensor<f32>
     DenseTensor::new(Shape::new(view.shape().to_vec()), data).map_err(value_error)
 }
 
-/// coffee-ten: declare inputs, write an expression, run it with NumPy arrays.
+/// A kernel compiled by clang and loaded into this process; call it with the inputs.
+#[pyclass(name = "Kernel", module = "coffee_ten", frozen, skip_from_py_object)]
+struct PyKernel {
+    compiled: CompiledKernel,
+    /// In `Kernel::buffers` order: the first `input_count` are the inputs, then the
+    /// temporaries, and `out` is last.
+    buffers: Vec<Buffer>,
+    input_count: usize,
+    /// The emitted C source.
+    #[pyo3(get)]
+    c_source: String,
+    /// The canonical text of the schedule that was applied.
+    #[pyo3(get)]
+    schedule: String,
+    /// "preserving" or "reordering": whether the schedule keeps the order of float sums.
+    #[pyo3(get)]
+    order_class: &'static str,
+}
+
+#[pymethods]
+impl PyKernel {
+    /// Runs the kernel. Every input is a keyword argument, as in `run`; returns a new
+    /// float32 `numpy.ndarray`.
+    #[pyo3(signature = (**inputs))]
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+        let (input_buffers, other_buffers) = self.buffers.split_at(self.input_count);
+        let mut arrays = read_inputs(inputs)?;
+        if let Some((name, _)) = arrays
+            .iter()
+            .find(|(name, _)| !input_buffers.iter().any(|buffer| &buffer.name == name))
+        {
+            return Err(value_error(format!("unknown input {name}")));
+        }
+
+        let mut storage: Vec<Vec<f32>> = Vec::with_capacity(self.buffers.len());
+        for buffer in input_buffers {
+            let position = arrays.iter().position(|(name, _)| name == &buffer.name);
+            let Some(position) = position else {
+                return Err(value_error(format!("missing input {}", buffer.name)));
+            };
+            let (_, array) = arrays.swap_remove(position);
+            let expected = Shape::new(buffer.shape.clone());
+            if *array.shape() != expected {
+                return Err(value_error(format!(
+                    "input {} has shape {}, expected {expected}",
+                    buffer.name,
+                    array.shape()
+                )));
+            }
+            storage.push(array.data().to_vec());
+        }
+        // Temporaries and out are written by the init nests; NaN makes a missed write show.
+        for buffer in other_buffers {
+            storage.push(vec![f32::NAN; buffer.shape.iter().product()]);
+        }
+
+        let mut slices: Vec<&mut [f32]> = storage.iter_mut().map(Vec::as_mut_slice).collect();
+        py.detach(|| self.compiled.run(&mut slices))
+            .map_err(runtime_error)?;
+
+        let out = storage.pop().expect("invariant: out is the last buffer");
+        let out_buffer = other_buffers.last().expect("invariant: out is a buffer");
+        PyArray1::from_vec(py, out).reshape(out_buffer.shape.clone())
+    }
+}
+
+/// Compiles `output` to a native kernel: lowers it, applies the schedule text (see
+/// `Schedule::parse`, empty by default) and builds the C code with clang. The built
+/// library is cached in `cache_dir` (default: the system temp dir / coffee-ten-cache).
+#[pyfunction(name = "compile")]
+#[pyo3(signature = (output, schedule = "", cache_dir = None))]
+fn compile_kernel(
+    py: Python<'_>,
+    output: &PyTensor,
+    schedule: &str,
+    cache_dir: Option<PathBuf>,
+) -> PyResult<PyKernel> {
+    let mut graph = Graph::new();
+    let output_id = lower(&output.expr, &mut graph, &mut HashMap::new()).map_err(value_error)?;
+    let input_count = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.op, Op::Input { .. }))
+        .count();
+
+    let kernel = coffee_ten_loop::lower(&graph, output_id, "kernel").map_err(value_error)?;
+    let schedule = Schedule::parse(schedule).map_err(value_error)?;
+    let (kernel, order_class) = apply_classified(&kernel, &schedule).map_err(value_error)?;
+
+    let cache_dir = cache_dir.unwrap_or_else(|| std::env::temp_dir().join("coffee-ten-cache"));
+    let compiled = py
+        .detach(|| compile(&kernel, &cache_dir))
+        .map_err(runtime_error)?;
+    let c_source = emit_c(&kernel).map_err(runtime_error)?;
+    Ok(PyKernel {
+        compiled,
+        buffers: kernel.buffers,
+        input_count,
+        c_source,
+        schedule: schedule.to_string(),
+        order_class: match order_class {
+            OrderClass::Preserving => "preserving",
+            OrderClass::Reordering => "reordering",
+        },
+    })
+}
+
+/// coffee-ten: declare inputs, write an expression, run it with NumPy arrays or
+/// compile it.
 #[pymodule]
 mod coffee_ten {
     #[pymodule_export]
-    use super::{PyTensor, input, matmul, maximum, relu, run};
+    use super::{PyKernel, PyTensor, compile_kernel, input, matmul, maximum, relu, run};
 }

@@ -18,5 +18,7 @@ doctest = false
 [dependencies]
 coffee-ten-ir = { path = "../coffee-ten-ir" }
 coffee-ten-interp = { path = "../coffee-ten-interp" }
+coffee-ten-loop = { path = "../coffee-ten-loop" }
+coffee-ten-codegen-c = { path = "../coffee-ten-codegen-c" }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
