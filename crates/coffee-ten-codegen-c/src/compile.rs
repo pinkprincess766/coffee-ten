@@ -18,6 +18,17 @@ pub const TEST_FLAGS: &[&str] = &[
     "-fno-slp-vectorize",
 ];
 
+/// Flags of benchmark builds. FMA contraction is allowed, as on the peak measurement
+/// (spec §3.5), so results differ from the reference by rounding and reports must say so;
+/// auto-vectorization stays off, so only the schedule's `vectorize` step vectorizes.
+pub const BENCH_FLAGS: &[&str] = &[
+    "-std=c99",
+    "-O2",
+    "-ffp-contract=fast",
+    "-fno-vectorize",
+    "-fno-slp-vectorize",
+];
+
 const CLANG: &str = "clang";
 const ENTRY_SYMBOL: &[u8] = b"ct_entry\0";
 
@@ -139,7 +150,9 @@ pub fn compile(kernel: &Kernel, cache_dir: &Path) -> Result<CompiledKernel, Comp
     compile_with_flags(kernel, cache_dir, TEST_FLAGS)
 }
 
-fn compile_with_flags(
+/// Like `compile`, with the given clang `flags` (besides `-shared -fPIC -o <out> <src>`).
+/// The flags are part of the cache key, so different flags give different library files.
+pub fn compile_with_flags(
     kernel: &Kernel,
     cache_dir: &Path,
     flags: &[&str],
@@ -510,6 +523,15 @@ mod tests {
             .unwrap();
         assert_eq!(first.library_path(), second.library_path());
         assert_eq!(modified, modified_again);
+    }
+
+    #[test]
+    fn different_flags_get_different_libraries() {
+        let dir = TempDir::new("flags");
+        let test = compile_with_flags(&matmul(), &dir.0, TEST_FLAGS).unwrap();
+        let bench = compile_with_flags(&matmul(), &dir.0, BENCH_FLAGS).unwrap();
+        assert_ne!(test.library_path(), bench.library_path());
+        assert!(test.library_path().exists() && bench.library_path().exists());
     }
 
     #[test]
