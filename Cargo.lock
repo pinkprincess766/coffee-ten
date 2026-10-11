@@ -56,8 +56,10 @@ dependencies = [
 name = "coffee-ten-py"
 version = "0.0.0"
 dependencies = [
+ "coffee-ten-codegen-c",
  "coffee-ten-interp",
  "coffee-ten-ir",
+ "coffee-ten-loop",
  "numpy",
  "pyo3",
 ]
