@@ -21,7 +21,7 @@ pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Ke
     if out_dims.contains(&0) {
         return Err(LowerError::ZeroSizedOutput);
     }
-    check_tree_size(graph, output)?;
+    check_tree_size(graph, output, &|_| false)?;
     let mut reserved = vec!["out".to_string()];
     reserved.extend((0..out_dims.len()).map(loop_name));
 
@@ -43,25 +43,41 @@ pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Ke
 /// Lowers the graph ending at `output`: every reachable matmul gets an init nest and an
 /// update nest; the elementwise part, if any, becomes one more nest.
 ///
-/// Buffers are the reachable inputs in node order, then one temporary `t0`, `t1`, ... per
-/// matmul that is not the output (a kernel parameter: the caller provides the scratch
-/// memory), then `out`. The update nest of a matmul runs `i, k, j` with `k` ascending for
-/// every element of the result, which is exactly the order of the interpreter's `run_f32`
-/// (`acc = 0; acc += a[i, k] * b[k, j]`), so the two agree bit for bit.
+/// A matmul operand that is neither an input nor a matmul (say `A + 1` in `(A + 1) @ B`) is
+/// materialized: it gets its own elementwise nest, written to a temporary, right before the
+/// nests of the first matmul that reads it.
+///
+/// Buffers are the reachable inputs in node order, then the temporaries `t0`, `t1`, ... in
+/// the order they are created (a kernel parameter: the caller provides the scratch memory),
+/// then `out`. A matmul that is the output writes `out` and has no temporary. The update
+/// nest of a matmul runs `i, k, j` with `k` ascending for every element of the result, which
+/// is exactly the order of the interpreter's `run_f32` (`acc = 0; acc += a[i, k] * b[k, j]`),
+/// so the two agree bit for bit.
 pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerError> {
     let out_dims = node(graph, output)?.shape.dims().to_vec();
     if out_dims.contains(&0) {
         return Err(LowerError::ZeroSizedOutput);
     }
     let matmuls = reachable_matmuls(graph, output)?;
-    check_tree_size(graph, output)?;
+    let mut operands = Vec::new();
+    for matmul in &matmuls {
+        for operand in [matmul.a, matmul.b] {
+            if !matches!(node(graph, operand)?.op, Op::Input { .. } | Op::MatMul(..)) {
+                operands.push(operand);
+            }
+        }
+    }
+    operands.sort();
+    operands.dedup();
 
     let output_is_matmul = matches!(node(graph, output)?.op, Op::MatMul(..));
-    let temp_count = matmuls.len() - usize::from(output_is_matmul);
-    let mut reserved = vec!["out".to_string()];
-    if !output_is_matmul {
-        reserved.extend((0..out_dims.len()).map(loop_name));
+    let temp_count = operands.len() + matmuls.len() - usize::from(output_is_matmul);
+    let mut loop_rank = if output_is_matmul { 0 } else { out_dims.len() };
+    for &operand in &operands {
+        loop_rank = loop_rank.max(node_dims(graph, operand)?.len());
     }
+    let mut reserved = vec!["out".to_string()];
+    reserved.extend((0..loop_rank).map(loop_name));
     if !matmuls.is_empty() {
         reserved.extend(["i", "j", "k"].map(String::from));
     }
@@ -69,34 +85,42 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
 
     let is_reachable = reachable_nodes(graph, output);
     let (mut buffers, mut buffer_of) = input_buffers(graph, &is_reachable, &reserved)?;
-    let mut next_temp = 0;
+    let input_count = buffers.len();
+    let out_buffer = input_count + temp_count;
+
+    let mut nests = Vec::new();
     for matmul in &matmuls {
-        if matmul.id == output {
-            continue;
+        for operand in [matmul.a, matmul.b] {
+            // Inputs and earlier matmuls have a buffer; so has an operand shared with an
+            // earlier matmul.
+            if buffer_of[operand.index()].is_some() {
+                continue;
+            }
+            let temp = push_temp(graph, &mut buffers, input_count, operand)?;
+            nests.push(checked_elementwise_nest(graph, operand, &buffer_of, temp)?);
+            buffer_of[operand.index()] = Some(temp);
         }
-        buffer_of[matmul.id.index()] = Some(buffers.len());
-        buffers.push(Buffer {
-            name: temp_name(next_temp),
-            shape: node(graph, matmul.id)?.shape.dims().to_vec(),
-        });
-        next_temp += 1;
+        let target = if matmul.id == output {
+            out_buffer
+        } else {
+            let temp = push_temp(graph, &mut buffers, input_count, matmul.id)?;
+            buffer_of[matmul.id.index()] = Some(temp);
+            temp
+        };
+        let buffer_a = buffer_of[matmul.a.index()].expect("invariant: operands have buffers");
+        let buffer_b = buffer_of[matmul.b.index()].expect("invariant: operands have buffers");
+        nests.extend(matmul_nests(matmul.dims, buffer_a, buffer_b, target));
     }
-    let out_buffer = buffers.len();
+    if !output_is_matmul {
+        nests.push(checked_elementwise_nest(
+            graph, output, &buffer_of, out_buffer,
+        )?);
+    }
     buffers.push(Buffer {
         name: "out".to_string(),
         shape: out_dims,
     });
-
-    let mut nests = Vec::new();
-    for matmul in &matmuls {
-        let target = buffer_of[matmul.id.index()].unwrap_or(out_buffer);
-        let buffer_a = buffer_of[matmul.a.index()].expect("invariant: operands are inputs");
-        let buffer_b = buffer_of[matmul.b.index()].expect("invariant: operands are inputs");
-        nests.extend(matmul_nests(matmul.dims, buffer_a, buffer_b, target));
-    }
-    if !output_is_matmul {
-        nests.push(elementwise_nest(graph, output, &buffer_of, out_buffer)?);
-    }
+    debug_assert_eq!(buffers.len(), out_buffer + 1);
     Ok(Kernel {
         name: name.to_string(),
         buffers,
@@ -117,7 +141,7 @@ pub enum LowerError {
     },
     /// A matmul is reachable from the output; only elementwise graphs lower to one nest.
     NotElementwise(NodeId),
-    /// `lower` cannot handle this node yet.
+    /// `lower` cannot handle this node.
     Unsupported {
         node: NodeId,
         reason: &'static str,
@@ -181,8 +205,7 @@ struct MatMulNode {
     dims: (usize, usize, usize),
 }
 
-/// The matmuls reachable from `output` in node order. Their operands must be inputs and
-/// none of their dims may be 0.
+/// The matmuls reachable from `output` in node order; none of their dims may be 0.
 fn reachable_matmuls(graph: &Graph, output: NodeId) -> Result<Vec<MatMulNode>, LowerError> {
     let mut seen = vec![false; graph.nodes().len()];
     let mut stack = vec![output];
@@ -195,14 +218,6 @@ fn reachable_matmuls(graph: &Graph, output: NodeId) -> Result<Vec<MatMulNode>, L
         match &node.op {
             Op::MatMul(a, b) => {
                 let (a_dims, b_dims) = (node_dims(graph, *a)?, node_dims(graph, *b)?);
-                let is_input =
-                    |x: NodeId| matches!(graph.get(x), Some(n) if matches!(n.op, Op::Input { .. }));
-                if !is_input(*a) || !is_input(*b) {
-                    return Err(LowerError::Unsupported {
-                        node: id,
-                        reason: "matmul operand must be an input",
-                    });
-                }
                 let dims = (a_dims[0], a_dims[1], b_dims[1]);
                 if dims.0 == 0 || dims.1 == 0 || dims.2 == 0 {
                     return Err(LowerError::Unsupported {
@@ -216,6 +231,7 @@ fn reachable_matmuls(graph: &Graph, output: NodeId) -> Result<Vec<MatMulNode>, L
                     b: *b,
                     dims,
                 });
+                stack.extend([*a, *b]);
             }
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => stack.push(*x),
@@ -226,8 +242,12 @@ fn reachable_matmuls(graph: &Graph, output: NodeId) -> Result<Vec<MatMulNode>, L
     Ok(matmuls)
 }
 
-fn check_tree_size(graph: &Graph, output: NodeId) -> Result<(), LowerError> {
-    let nodes = tree_size(graph, output);
+fn check_tree_size(
+    graph: &Graph,
+    output: NodeId,
+    is_leaf: &dyn Fn(usize) -> bool,
+) -> Result<(), LowerError> {
+    let nodes = tree_size(graph, output, is_leaf);
     if nodes > MAX_EXPR_NODES {
         return Err(LowerError::ExpressionTooLarge { nodes });
     }
@@ -260,6 +280,32 @@ fn input_buffers(
         });
     }
     Ok((buffers, buffer_of))
+}
+
+/// Appends the temporary for node `id` to `buffers`, which start with `input_count` input
+/// buffers. Returns its buffer index.
+fn push_temp(
+    graph: &Graph,
+    buffers: &mut Vec<Buffer>,
+    input_count: usize,
+    id: NodeId,
+) -> Result<usize, LowerError> {
+    buffers.push(Buffer {
+        name: temp_name(buffers.len() - input_count),
+        shape: node_dims(graph, id)?.to_vec(),
+    });
+    Ok(buffers.len() - 1)
+}
+
+/// `elementwise_nest` after the size check; a node that has a buffer counts as one leaf.
+fn checked_elementwise_nest(
+    graph: &Graph,
+    output: NodeId,
+    buffer_of: &[Option<usize>],
+    out_buffer: usize,
+) -> Result<LoopNest, LowerError> {
+    check_tree_size(graph, output, &|index| buffer_of[index].is_some())?;
+    elementwise_nest(graph, output, buffer_of, out_buffer)
 }
 
 /// The nest that stores the elementwise expression of `output` into buffer `out_buffer`.
@@ -365,12 +411,14 @@ fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
 }
 
 /// Number of nodes in the expression tree of `output`, with shared nodes counted once per
-/// use; a matmul counts as one leaf. Saturates instead of overflowing.
-fn tree_size(graph: &Graph, output: NodeId) -> usize {
+/// use; a matmul and a node for which `is_leaf(index)` holds count as one leaf. Saturates
+/// instead of overflowing.
+fn tree_size(graph: &Graph, output: NodeId, is_leaf: &dyn Fn(usize) -> bool) -> usize {
     let nodes = graph.nodes();
     let mut size = vec![0usize; output.index() + 1];
     for index in 0..=output.index() {
         size[index] = match &nodes[index].op {
+            _ if is_leaf(index) => 1,
             Op::Input { .. } | Op::Const(_) | Op::MatMul(..) => 1,
             Op::Unary(_, x) => size[x.index()].saturating_add(1),
             Op::Binary(_, a, b) => size[a.index()]
@@ -389,10 +437,11 @@ fn lower_value(
     id: NodeId,
 ) -> Result<Expr, LowerError> {
     let node = node(graph, id)?;
-    let expr = match &node.op {
-        Op::Input { .. } | Op::MatMul(..) => {
-            let buffer = buffer_of[id.index()]
-                .expect("invariant: reachable inputs and matmuls have buffers");
+    let buffer = buffer_of[id.index()];
+    let expr = match (&node.op, buffer) {
+        // A node with a buffer (input, matmul, materialized temporary) is read, not expanded.
+        (Op::Input { .. } | Op::MatMul(..), _) | (_, Some(_)) => {
+            let buffer = buffer.expect("invariant: reachable inputs and matmuls have buffers");
             // Right-aligned broadcasting: input dim `dim` follows output loop `dim + offset`.
             let offset = out_rank
                 .checked_sub(node.shape.rank())
@@ -415,12 +464,12 @@ fn lower_value(
                 .collect();
             Expr::Load(Access { buffer, index })
         }
-        Op::Const(value) => Expr::Const(*value),
-        Op::Unary(op, x) => Expr::Unary(
+        (Op::Const(value), None) => Expr::Const(*value),
+        (Op::Unary(op, x), None) => Expr::Unary(
             unary_op(*op),
             Box::new(lower_value(graph, buffer_of, out_rank, *x)?),
         ),
-        Op::Binary(op, a, b) => Expr::Binary(
+        (Op::Binary(op, a, b), None) => Expr::Binary(
             binary_op(*op),
             Box::new(lower_value(graph, buffer_of, out_rank, *a)?),
             Box::new(lower_value(graph, buffer_of, out_rank, *b)?),
@@ -820,38 +869,209 @@ mod tests {
     }
 
     #[test]
-    fn matmul_operand_that_is_not_an_input_is_unsupported() {
-        // (A + 1) @ B: the matmul is node %4.
+    fn elementwise_matmul_operand_is_materialized_before_the_matmul() {
+        // (A + 1) @ B: the matmul is the output, so it writes `out`.
         let mut g = Graph::new();
-        let a = g.input("A", shape(&[4, 3])).unwrap();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
         let b = g.input("B", shape(&[3, 2])).unwrap();
         let one = g.constant(1.0);
         let shifted = g.binary(coffee_ten_ir::BinaryOp::Add, a, one).unwrap();
         let prod = g.matmul(shifted, b).unwrap();
-        let err = lower(&g, prod, "k").unwrap_err();
         assert_eq!(
-            err,
-            LowerError::Unsupported {
-                node: prod,
-                reason: "matmul operand must be an input"
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            "node %4 is not supported: matmul operand must be an input"
+            full_text(&g, prod),
+            concat!(
+                "kernel k(A: f32[2, 3], B: f32[3, 2], t0: f32[2, 3], out: f32[2, 2])\n",
+                "for i0 in 0..2:\n",
+                "  for i1 in 0..3:\n",
+                "    t0[i0, i1] = A[i0, i1] + 1.0\n",
+                "for i in 0..2:\n",
+                "  for j in 0..2:\n",
+                "    out[i, j] = 0.0\n",
+                "for i in 0..2:\n",
+                "  for k in 0..3:\n",
+                "    for j in 0..2:\n",
+                "      out[i, j] = out[i, j] + (t0[i, k] * B[k, j])\n",
+            )
         );
     }
 
     #[test]
-    fn matmul_of_a_matmul_is_unsupported() {
-        let (mut g, _, _, prod) = matmul_graph();
-        let c = g.input("C", shape(&[2, 5])).unwrap();
-        let chained = g.matmul(prod, c).unwrap();
+    fn matmul_of_a_matmul_reads_the_inner_temporary() {
+        // (A @ B) @ C
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let c = g.input("C", shape(&[2, 2])).unwrap();
+        let inner = g.matmul(a, b).unwrap();
+        let outer = g.matmul(inner, c).unwrap();
         assert_eq!(
-            lower(&g, chained, "k"),
-            Err(LowerError::Unsupported {
-                node: chained,
-                reason: "matmul operand must be an input"
+            full_text(&g, outer),
+            concat!(
+                "kernel k(A: f32[2, 3], B: f32[3, 2], C: f32[2, 2], t0: f32[2, 2], out: f32[2, 2])\n",
+                "for i in 0..2:\n",
+                "  for j in 0..2:\n",
+                "    t0[i, j] = 0.0\n",
+                "for i in 0..2:\n",
+                "  for k in 0..3:\n",
+                "    for j in 0..2:\n",
+                "      t0[i, j] = t0[i, j] + (A[i, k] * B[k, j])\n",
+                "for i in 0..2:\n",
+                "  for j in 0..2:\n",
+                "    out[i, j] = 0.0\n",
+                "for i in 0..2:\n",
+                "  for k in 0..2:\n",
+                "    for j in 0..2:\n",
+                "      out[i, j] = out[i, j] + (t0[i, k] * C[k, j])\n",
+            )
+        );
+    }
+
+    #[test]
+    fn materialized_operand_can_read_a_matmul_temporary() {
+        // relu(A @ B) @ C: t0 = A @ B, t1 = relu(t0), out = t1 @ C.
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3, 2])).unwrap();
+        let c = g.input("C", shape(&[2, 2])).unwrap();
+        let inner = g.matmul(a, b).unwrap();
+        let activated = g.unary(coffee_ten_ir::UnaryOp::Relu, inner).unwrap();
+        let outer = g.matmul(activated, c).unwrap();
+        let text = full_text(&g, outer);
+        assert!(text.starts_with(
+            "kernel k(A: f32[2, 3], B: f32[3, 2], C: f32[2, 2], \
+             t0: f32[2, 2], t1: f32[2, 2], out: f32[2, 2])\n"
+        ));
+        let relu_nest = "for i0 in 0..2:\n  for i1 in 0..2:\n    t1[i0, i1] = relu(t0[i0, i1])\n";
+        let update_of_t0 = "      t0[i, j] = t0[i, j] + (A[i, k] * B[k, j])\n";
+        let (relu_at, update_at) = (text.find(relu_nest), text.find(update_of_t0));
+        assert!(update_at < relu_at && relu_at.is_some(), "{text}");
+        assert!(text.ends_with("      out[i, j] = out[i, j] + (t1[i, k] * C[k, j])\n"));
+    }
+
+    #[test]
+    fn relu_of_input_times_weights_plus_bias_uses_two_temporaries() {
+        // relu(X) @ W + bias: t0 = relu(X), t1 = t0 @ W, out = t1 + bias.
+        let mut g = Graph::new();
+        let x = g.input("X", shape(&[4, 3])).unwrap();
+        let w = g.input("W", shape(&[3, 2])).unwrap();
+        let bias = g.input("bias", shape(&[2])).unwrap();
+        let activated = g.unary(coffee_ten_ir::UnaryOp::Relu, x).unwrap();
+        let prod = g.matmul(activated, w).unwrap();
+        let out = g.binary(coffee_ten_ir::BinaryOp::Add, prod, bias).unwrap();
+        assert_eq!(
+            full_text(&g, out),
+            concat!(
+                "kernel k(X: f32[4, 3], W: f32[3, 2], bias: f32[2], t0: f32[4, 3], t1: f32[4, 2], out: f32[4, 2])\n",
+                "for i0 in 0..4:\n",
+                "  for i1 in 0..3:\n",
+                "    t0[i0, i1] = relu(X[i0, i1])\n",
+                "for i in 0..4:\n",
+                "  for j in 0..2:\n",
+                "    t1[i, j] = 0.0\n",
+                "for i in 0..4:\n",
+                "  for k in 0..3:\n",
+                "    for j in 0..2:\n",
+                "      t1[i, j] = t1[i, j] + (t0[i, k] * W[k, j])\n",
+                "for i0 in 0..4:\n",
+                "  for i1 in 0..2:\n",
+                "    out[i0, i1] = t1[i0, i1] + bias[i1]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn operand_used_by_two_matmuls_is_materialized_once() {
+        // relu(X) @ W + relu(X) @ V with one relu node.
+        let mut g = Graph::new();
+        let x = g.input("X", shape(&[2, 2])).unwrap();
+        let w = g.input("W", shape(&[2, 2])).unwrap();
+        let v = g.input("V", shape(&[2, 2])).unwrap();
+        let activated = g.unary(coffee_ten_ir::UnaryOp::Relu, x).unwrap();
+        let left = g.matmul(activated, w).unwrap();
+        let right = g.matmul(activated, v).unwrap();
+        let sum = g.binary(coffee_ten_ir::BinaryOp::Add, left, right).unwrap();
+        let text = full_text(&g, sum);
+        assert!(text.starts_with(
+            "kernel k(X: f32[2, 2], W: f32[2, 2], V: f32[2, 2], \
+             t0: f32[2, 2], t1: f32[2, 2], t2: f32[2, 2], out: f32[2, 2])\n"
+        ));
+        assert_eq!(text.matches("t0[i0, i1] = relu(X[i0, i1])\n").count(), 1);
+        assert!(text.contains("      t1[i, j] = t1[i, j] + (t0[i, k] * W[k, j])\n"));
+        assert!(text.contains("      t2[i, j] = t2[i, j] + (t0[i, k] * V[k, j])\n"));
+        assert!(text.ends_with("    out[i0, i1] = t1[i0, i1] + t2[i0, i1]\n"));
+    }
+
+    #[test]
+    fn square_of_one_operand_node_is_materialized_once() {
+        // relu(X) @ relu(X): both operands are the same node.
+        let mut g = Graph::new();
+        let x = g.input("X", shape(&[2, 2])).unwrap();
+        let activated = g.unary(coffee_ten_ir::UnaryOp::Relu, x).unwrap();
+        let prod = g.matmul(activated, activated).unwrap();
+        let text = full_text(&g, prod);
+        assert!(text.starts_with("kernel k(X: f32[2, 2], t0: f32[2, 2], out: f32[2, 2])\n"));
+        assert!(text.ends_with("      out[i, j] = out[i, j] + (t0[i, k] * t0[k, j])\n"));
+    }
+
+    #[test]
+    fn input_named_like_a_materialized_temporary_is_a_name_clash() {
+        // (A + 1) @ B has t0 only because of the operand.
+        let mut g = Graph::new();
+        let a = g.input("t0", shape(&[2, 2])).unwrap();
+        let b = g.input("B", shape(&[2, 2])).unwrap();
+        let one = g.constant(1.0);
+        let shifted = g.binary(coffee_ten_ir::BinaryOp::Add, a, one).unwrap();
+        let prod = g.matmul(shifted, b).unwrap();
+        assert_eq!(
+            lower(&g, prod, "k"),
+            Err(LowerError::NameClash("t0".to_string()))
+        );
+    }
+
+    /// `X = neg^x_negs(A)` with `A` of shape `(2, 2)`, `M = X @ B`, and
+    /// `neg^out_negs(X) + M`. `X` is materialized and read as one leaf by the final nest.
+    fn operand_chain_graph(x_negs: usize, out_negs: usize) -> (Graph, NodeId) {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 2])).unwrap();
+        let b = g.input("B", shape(&[2, 2])).unwrap();
+        let mut x = a;
+        for _ in 0..x_negs {
+            x = g.unary(coffee_ten_ir::UnaryOp::Neg, x).unwrap();
+        }
+        let prod = g.matmul(x, b).unwrap();
+        let mut y = x;
+        for _ in 0..out_negs {
+            y = g.unary(coffee_ten_ir::UnaryOp::Neg, y).unwrap();
+        }
+        let out = g.binary(coffee_ten_ir::BinaryOp::Add, y, prod).unwrap();
+        (g, out)
+    }
+
+    #[test]
+    fn materialized_operand_counts_as_one_leaf_at_the_node_limit() {
+        // Operand nest: MAX_EXPR_NODES nodes. Final nest: (MAX - 3) negs + X + M + add.
+        let (g, out) = operand_chain_graph(MAX_EXPR_NODES - 1, MAX_EXPR_NODES - 3);
+        assert_eq!(lower(&g, out, "k").unwrap().validate(), Ok(()));
+    }
+
+    #[test]
+    fn final_nest_over_the_node_limit_is_an_error_with_a_materialized_operand() {
+        let (g, out) = operand_chain_graph(MAX_EXPR_NODES - 1, MAX_EXPR_NODES - 2);
+        assert_eq!(
+            lower(&g, out, "k"),
+            Err(LowerError::ExpressionTooLarge {
+                nodes: MAX_EXPR_NODES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn operand_nest_over_the_node_limit_is_an_error() {
+        let (g, out) = operand_chain_graph(MAX_EXPR_NODES, 0);
+        assert_eq!(
+            lower(&g, out, "k"),
+            Err(LowerError::ExpressionTooLarge {
+                nodes: MAX_EXPR_NODES + 1
             })
         );
     }
