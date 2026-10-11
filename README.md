@@ -7,9 +7,10 @@ random search.
 
 ## Status
 
-Pre-MVP. Python builder and reference interpreter (f32 and f64); graph → loop IR →
-C → clang end to end, bit for bit against the interpreter; schedules split, reorder
-and vectorize. Not yet: `ct.compile`, benchmarks, the autotuner. Numbers in this
+Pre-MVP. Python builder and reference interpreter (f32 and f64); `ct.compile` takes a
+graph through loop IR, a schedule (split, reorder, vectorize), C and clang to a kernel
+that matches the interpreter bit for bit when the schedule keeps the order of sums
+and within a derived bound otherwise. Not yet: benchmarks, the autotuner. Numbers in this
 README are a baseline, not results.
 
 ## Basis
@@ -83,10 +84,10 @@ idle-machine run).
 ### Tracing frontend — [L15], [L18]
 
 A Python `Tensor` computes nothing; it records a graph that is run by the reference
-interpreter. Compiling from Python is not implemented yet (see Status). Code:
+interpreter (`ct.run`) or compiled with a schedule (`ct.compile`). Code:
 `crates/coffee-ten-py` (`ct.input`, operators, `@`, `ct.relu`, `ct.maximum`,
-`ct.run`). Checked by: `crates/coffee-ten-py/tests/test_api.py`,
-`crates/coffee-ten-py/tests/test_diff_numpy.py`.
+`ct.run`, `ct.compile`). Checked by: `crates/coffee-ten-py/tests/test_api.py`,
+`crates/coffee-ten-py/tests/test_diff_numpy.py`, `crates/coffee-ten-py/tests/test_compile.py`.
 
 ### Cost-model autotuning (research, after the MVP) — [L21], [L22]
 
