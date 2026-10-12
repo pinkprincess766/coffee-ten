@@ -46,6 +46,22 @@ impl BinaryOp {
     }
 }
 
+/// Row reduction over the last axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOp {
+    Sum,
+    Max,
+}
+
+impl ReduceOp {
+    fn name(self) -> &'static str {
+        match self {
+            ReduceOp::Sum => "sum",
+            ReduceOp::Max => "max",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     Input {
@@ -57,6 +73,8 @@ pub enum Op {
     Binary(BinaryOp, NodeId, NodeId),
     /// `(M, K) @ (K, N) -> (M, N)`, both operands rank 2.
     MatMul(NodeId, NodeId),
+    /// Reduces the last axis and keeps it with size 1: `(2, 3) -> (2, 1)`, `(4,) -> (1,)`.
+    Reduce(ReduceOp, NodeId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -123,6 +141,18 @@ impl Graph {
         Ok(self.push(Op::MatMul(a, b), shape))
     }
 
+    /// Reduces the last axis of `x`, keeping it with size 1, so `x - reduce(max, x)`
+    /// broadcasts. A rank-0 operand or an empty last axis is an error.
+    pub fn reduce(&mut self, op: ReduceOp, x: NodeId) -> Result<NodeId, GraphError> {
+        let x_shape = self.node(x)?.shape.clone();
+        let mut dims = x_shape.dims().to_vec();
+        match dims.last_mut() {
+            Some(last) if *last > 0 => *last = 1,
+            _ => return Err(GraphError::BadReduce { shape: x_shape }),
+        }
+        Ok(self.push(Op::Reduce(op, x), Shape::new(dims)))
+    }
+
     pub fn get(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(id.index())
     }
@@ -153,6 +183,7 @@ impl fmt::Display for Graph {
                     format!("{} %{}, %{}", op.name(), a.index(), b.index())
                 }
                 Op::MatMul(a, b) => format!("matmul %{}, %{}", a.index(), b.index()),
+                Op::Reduce(op, x) => format!("{} %{}", op.name(), x.index()),
             };
             writeln!(f, "%{index} = {text} : {}", node.shape)?;
         }
@@ -165,7 +196,14 @@ pub enum GraphError {
     UnknownNode(NodeId),
     DuplicateInput(String),
     Broadcast(BroadcastError),
-    MatMulShape { left: Shape, right: Shape },
+    MatMulShape {
+        left: Shape,
+        right: Shape,
+    },
+    /// Reduction over the last axis of a rank-0 shape or of a shape whose last dim is 0.
+    BadReduce {
+        shape: Shape,
+    },
 }
 
 impl fmt::Display for GraphError {
@@ -176,6 +214,9 @@ impl fmt::Display for GraphError {
             GraphError::Broadcast(err) => write!(f, "{err}"),
             GraphError::MatMulShape { left, right } => {
                 write!(f, "cannot matmul shapes {left} and {right}")
+            }
+            GraphError::BadReduce { shape } => {
+                write!(f, "cannot reduce shape {shape} over its last axis")
             }
         }
     }
@@ -307,7 +348,7 @@ mod tests {
         let g = sample_graph();
         for (index, node) in g.nodes().iter().enumerate() {
             match &node.op {
-                Op::Unary(_, x) => assert!(x.index() < index),
+                Op::Unary(_, x) | Op::Reduce(_, x) => assert!(x.index() < index),
                 Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                     assert!(a.index() < index && b.index() < index)
                 }
@@ -386,6 +427,77 @@ mod tests {
             Err(GraphError::UnknownNode(foreign_a))
         );
         assert_eq!(g.nodes().len(), 1);
+    }
+
+    #[test]
+    fn reduce_keeps_the_last_axis_with_size_one() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let v = g.input("v", shape(&[4])).unwrap();
+        let row_sum = g.reduce(ReduceOp::Sum, a).unwrap();
+        let vec_max = g.reduce(ReduceOp::Max, v).unwrap();
+        assert_eq!(g.get(row_sum).unwrap().shape, shape(&[2, 1]));
+        assert_eq!(g.get(vec_max).unwrap().shape, shape(&[1]));
+    }
+
+    #[test]
+    fn reduce_of_rank_zero_or_empty_last_axis_is_an_error_and_adds_no_node() {
+        let mut g = Graph::new();
+        let c = g.constant(1.0);
+        let empty = g.input("E", shape(&[3, 0])).unwrap();
+        let err = g.reduce(ReduceOp::Sum, c).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::BadReduce {
+                shape: Shape::scalar()
+            }
+        );
+        assert_eq!(err.to_string(), "cannot reduce shape () over its last axis");
+        let err = g.reduce(ReduceOp::Max, empty).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::BadReduce {
+                shape: shape(&[3, 0])
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "cannot reduce shape (3, 0) over its last axis"
+        );
+        assert_eq!(g.nodes().len(), 2);
+    }
+
+    #[test]
+    fn reduce_with_an_empty_leading_axis_is_allowed() {
+        let mut g = Graph::new();
+        let no_rows = g.input("N", shape(&[0, 3])).unwrap();
+        let reduced = g.reduce(ReduceOp::Sum, no_rows).unwrap();
+        assert_eq!(g.get(reduced).unwrap().shape, shape(&[0, 1]));
+    }
+
+    #[test]
+    fn reduce_unknown_operand_is_an_error() {
+        let mut big = Graph::new();
+        let ids: Vec<NodeId> = (0..3).map(|_| big.constant(0.0)).collect();
+        let mut g = Graph::new();
+        assert_eq!(
+            g.reduce(ReduceOp::Sum, ids[2]),
+            Err(GraphError::UnknownNode(ids[2]))
+        );
+    }
+
+    #[test]
+    fn reduce_prints_with_its_operand_and_shape() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        g.reduce(ReduceOp::Sum, a).unwrap();
+        g.reduce(ReduceOp::Max, a).unwrap();
+        assert_eq!(
+            g.to_string(),
+            "%0 = input A : (2, 3)\n\
+             %1 = sum %0 : (2, 1)\n\
+             %2 = max %0 : (2, 1)\n"
+        );
     }
 
     #[test]

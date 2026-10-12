@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use coffee_ten_ir::{BinaryOp, Graph, NodeId, Op, Shape, UnaryOp};
+use coffee_ten_ir::{BinaryOp, Graph, NodeId, Op, ReduceOp, Shape, UnaryOp};
 
 /// Row-major tensor; data.len() is the product of the dims (1 for a scalar).
 #[derive(Clone, Debug, PartialEq)]
@@ -229,6 +229,10 @@ fn evaluate<T: Scalar>(
                 shape: node.shape.clone(),
                 data: matmul(operand(&values, *a), operand(&values, *b)),
             },
+            Op::Reduce(op, x) => Tensor {
+                shape: node.shape.clone(),
+                data: reduce(*op, operand(&values, *x)),
+            },
         };
         values[index] = Some(value);
     }
@@ -275,7 +279,7 @@ fn needed_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         }
         match &graph.nodes()[index].op {
             Op::Input { .. } | Op::Const(_) => {}
-            Op::Unary(_, x) => needed[x.index()] = true,
+            Op::Unary(_, x) | Op::Reduce(_, x) => needed[x.index()] = true,
             Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 needed[a.index()] = true;
                 needed[b.index()] = true;
@@ -340,6 +344,43 @@ fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
         }
     }
     data
+}
+
+/// Reduction over the last axis of `x`, one value per row, in this exact order (the order of
+/// the C kernel, so f32 results agree bit for bit). With `n` the last dim, `n > 0`:
+///
+/// - sum: `acc = 0; for k in 0..n ascending: acc = acc + x[.., k]`
+/// - max: `acc = x[.., 0]; for k in 1..n ascending: acc = max(acc, x[.., k])`, where
+///   `max(a, b) = a > b ? a : b` and `acc` is `a`, as in `BinaryOp::Max`.
+fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>) -> Vec<T> {
+    let n = *x
+        .shape()
+        .dims()
+        .last()
+        .expect("invariant: a reduced operand has rank >= 1");
+    assert!(
+        n > 0,
+        "invariant: a reduced operand has a non-empty last axis"
+    );
+    x.data
+        .chunks_exact(n)
+        .map(|row| match op {
+            ReduceOp::Sum => {
+                let mut acc = T::zero();
+                for &v in row {
+                    acc = acc.add(v);
+                }
+                acc
+            }
+            ReduceOp::Max => {
+                let mut acc = row[0];
+                for &v in &row[1..] {
+                    acc = binary(BinaryOp::Max, acc, v);
+                }
+                acc
+            }
+        })
+        .collect()
 }
 
 fn broadcast_binary<T: Scalar>(
@@ -747,6 +788,170 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `op` over the last axis of a single input `x`, in f32 and f64.
+    fn reduce_both(op: ReduceOp, dims: &[usize], data: &[f32]) -> (Tensor<f32>, Tensor<f64>) {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(dims)).unwrap();
+        let r = g.reduce(op, x).unwrap();
+        let x_t = tensor(dims, data);
+        let inputs = [("x", &x_t)];
+        (
+            run_f32(&g, r, &inputs).unwrap(),
+            run_f64(&g, r, &inputs).unwrap(),
+        )
+    }
+
+    /// Bit patterns of the single-row max of `row`, in f32 and f64.
+    fn row_max_bits(row: &[f32]) -> (u32, u64) {
+        let (out32, out64) = reduce_both(ReduceOp::Max, &[row.len()], row);
+        (out32.data()[0].to_bits(), out64.data()[0].to_bits())
+    }
+
+    #[test]
+    fn row_sum_hand_values_in_both_modes() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2, 3])).unwrap();
+        let s = g.reduce(ReduceOp::Sum, x).unwrap();
+        let x_t = tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // [[1+2+3],[4+5+6]] = [[6],[15]]
+        check_both(&g, s, &[("x", &x_t)], &[2, 1], &[6.0, 15.0]);
+    }
+
+    #[test]
+    fn row_max_hand_values_in_both_modes() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2, 3])).unwrap();
+        let m = g.reduce(ReduceOp::Max, x).unwrap();
+        let x_t = tensor(&[2, 3], &[1.0, 5.0, 3.0, -1.0, -7.0, -2.0]);
+        // The second row is all negative: its max is -1, not 0.
+        check_both(&g, m, &[("x", &x_t)], &[2, 1], &[5.0, -1.0]);
+    }
+
+    #[test]
+    fn reduce_of_a_vector_gives_one_element() {
+        let (sum, _) = reduce_both(ReduceOp::Sum, &[4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(sum, tensor(&[1], &[10.0]));
+        let (max, _) = reduce_both(ReduceOp::Max, &[4], &[1.0, 9.0, 3.0, 4.0]);
+        assert_eq!(max, tensor(&[1], &[9.0]));
+    }
+
+    #[test]
+    fn reduce_with_no_rows_is_empty() {
+        let (sum, sum64) = reduce_both(ReduceOp::Sum, &[0, 3], &[]);
+        assert_eq!(sum, tensor(&[0, 1], &[]));
+        assert_eq!(sum64.shape(), &shape(&[0, 1]));
+    }
+
+    #[test]
+    fn row_sum_f32_matches_canonical_order_bit_for_bit() {
+        const ROWS: usize = 3;
+        const N: usize = 1000;
+        // Magnitudes from 1e-3 to 1e3 with both signs, so every addition rounds.
+        let data: Vec<f32> = (0..ROWS * N)
+            .map(|i| {
+                let sign = if i % 3 == 0 { -1.0 } else { 1.0 };
+                sign * (i as f32 * 0.37).sin() * 10f32.powi((i % 7) as i32 - 3)
+            })
+            .collect();
+        let (out, _) = reduce_both(ReduceOp::Sum, &[ROWS, N], &data);
+        assert_eq!(out.shape(), &shape(&[ROWS, 1]));
+        let mut descending_differs = false;
+        for (row_index, row) in data.chunks(N).enumerate() {
+            let mut ascending = 0.0f32;
+            for &v in row {
+                ascending += v;
+            }
+            let mut descending = 0.0f32;
+            for &v in row.iter().rev() {
+                descending += v;
+            }
+            descending_differs |= ascending.to_bits() != descending.to_bits();
+            assert_eq!(
+                out.data()[row_index].to_bits(),
+                ascending.to_bits(),
+                "row {row_index}"
+            );
+        }
+        // The data is sensitive to the order, so the assert above can tell orders apart.
+        assert!(descending_differs);
+    }
+
+    #[test]
+    fn row_sum_starts_from_positive_zero() {
+        // acc = 0; 0 + (-0) = +0.
+        let (sum32, sum64) = reduce_both(ReduceOp::Sum, &[1], &[-0.0]);
+        assert_eq!(sum32.data()[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(sum64.data()[0].to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn f64_mode_sums_in_f64() {
+        // 2^24 + 1 is not an f32: each +1 ties to even and is lost, but f64 keeps both.
+        let (sum32, sum64) = reduce_both(ReduceOp::Sum, &[3], &[16777216.0, 1.0, 1.0]);
+        assert_eq!(sum32.data()[0], 16777216.0f32);
+        assert_eq!(sum64.data()[0], 16777218.0f64);
+    }
+
+    #[test]
+    fn row_max_of_signed_zeros_follows_a_gt_b_else_b() {
+        // acc is `a`: +0 > -0 is false, so the later element wins every tie.
+        assert_eq!(
+            row_max_bits(&[0.0, -0.0]),
+            ((-0.0f32).to_bits(), (-0.0f64).to_bits())
+        );
+        assert_eq!(
+            row_max_bits(&[-0.0, 0.0]),
+            (0.0f32.to_bits(), 0.0f64.to_bits())
+        );
+        // +0 -> -0 -> +0
+        assert_eq!(
+            row_max_bits(&[0.0, -0.0, 0.0]),
+            (0.0f32.to_bits(), 0.0f64.to_bits())
+        );
+        // A single element is returned as is, with its sign.
+        assert_eq!(
+            row_max_bits(&[-0.0]),
+            ((-0.0f32).to_bits(), (-0.0f64).to_bits())
+        );
+    }
+
+    #[test]
+    fn row_max_with_nan_follows_a_gt_b_else_b() {
+        // acc = NaN: NaN > b is false, so the next element replaces it.
+        assert_eq!(
+            row_max_bits(&[f32::NAN, 1.0]),
+            (1.0f32.to_bits(), 1.0f64.to_bits())
+        );
+        // 1 > NaN is false, so NaN becomes acc ...
+        let (out32, out64) = reduce_both(ReduceOp::Max, &[2], &[1.0, f32::NAN]);
+        assert!(out32.data()[0].is_nan() && out64.data()[0].is_nan());
+        // ... and is dropped again by the next element: 1 -> NaN -> 2.
+        assert_eq!(
+            row_max_bits(&[1.0, f32::NAN, 2.0]),
+            (2.0f32.to_bits(), 2.0f64.to_bits())
+        );
+        // One element: no comparison, NaN stays.
+        let (out32, out64) = reduce_both(ReduceOp::Max, &[1], &[f32::NAN]);
+        assert!(out32.data()[0].is_nan() && out64.data()[0].is_nan());
+    }
+
+    #[test]
+    fn x_minus_row_max_broadcasts_like_softmax() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2, 3])).unwrap();
+        let m = g.reduce(ReduceOp::Max, x).unwrap();
+        let shifted = g.binary(BinaryOp::Sub, x, m).unwrap();
+        let x_t = tensor(&[2, 3], &[1.0, 2.0, 3.0, -4.0, -6.0, -5.0]);
+        // max = [[3],[-4]]; x - max = [[-2,-1,0],[0,-2,-1]]
+        check_both(
+            &g,
+            shifted,
+            &[("x", &x_t)],
+            &[2, 3],
+            &[-2.0, -1.0, 0.0, 0.0, -2.0, -1.0],
+        );
     }
 
     #[test]
