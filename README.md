@@ -92,10 +92,11 @@ measured; none exist yet.
 - Static shapes: `ct.input` takes a fixed shape; nothing is dynamic.
 - Single thread: the generated C has no threads.
 - CPU only: the C backend is built with clang; there is no GPU path.
-- Python operators: `+ - *`, unary `-`, `ct.relu`, `ct.maximum`, and `@` or `ct.matmul`
-  on 2-D tensors. Not yet: division, `exp`, reductions.
-- Reductions are last-axis `sum` and `max` only (the graph, the interpreter and the
-  compiler have them; Python does not expose them yet).
+- Python operators: `+ - * /`, unary `-`, `ct.relu`, `ct.maximum`, `ct.exp`, and `@` or
+  `ct.matmul` on 2-D tensors; `ct.softmax` is built from them.
+- Reductions are last-axis `ct.sum` and `ct.max` only, keeping the axis with size 1.
+- `exp` calls the platform libm (within 1 ulp, not correctly rounded), so graphs with
+  `exp` are checked against float64 within a derived bound, not bit for bit.
 - clang must be on `PATH` when `ct.compile` runs; without it, `ct.compile` raises
   `RuntimeError`.
 - Tested on Linux (`ubuntu-latest`) and macOS (`macos-latest`, on pushes to `main` and
@@ -178,7 +179,8 @@ idle-machine run).
 A Python `Tensor` computes nothing; it records a graph that is run by the reference
 interpreter (`ct.run`) or compiled with a schedule (`ct.compile`). Code:
 `crates/coffee-ten-py` (`ct.input`, operators, `@`, `ct.relu`, `ct.maximum`,
-`ct.run`, `ct.compile`, `ct.loop_ir`). Checked by: `crates/coffee-ten-py/tests/test_api.py`,
+`ct.run`, `ct.compile`, `ct.loop_ir`, `ct.exp`, `ct.sum`, `ct.max`, `ct.softmax`). Checked by:
+`crates/coffee-ten-py/tests/test_api.py`, `crates/coffee-ten-py/tests/test_softmax.py`,
 `crates/coffee-ten-py/tests/test_diff_numpy.py`, `crates/coffee-ten-py/tests/test_compile.py`,
 `crates/coffee-ten-py/tests/test_loop_ir.py`.
 
