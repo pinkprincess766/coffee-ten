@@ -4,6 +4,7 @@ use coffee_ten_bench::cli::Config;
 use coffee_ten_bench::log::append_lines;
 use coffee_ten_bench::meta::{self, Metadata};
 use coffee_ten_bench::run::record_json;
+use coffee_ten_bench::space::{enumerate_matmul, parse_space_args, summary};
 use coffee_ten_bench::stats::{DRIFT_LIMIT, DRIFT_ROUNDS, MIN_ROUNDS_FOR_DRIFT};
 use coffee_ten_bench::{Record, parse_args, run};
 use std::process::ExitCode;
@@ -30,8 +31,27 @@ fn raise_qos() {
 #[cfg(not(target_os = "macos"))]
 fn raise_qos() {}
 
+/// `coffee-ten-bench space --n <N>`: lists the schedule space, measures nothing.
+fn space_main(args: impl Iterator<Item = String>) -> ExitCode {
+    match parse_space_args(args) {
+        Ok(n) => {
+            print!("{}", summary(n, &enumerate_matmul(n, n, n)));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn main() -> ExitCode {
-    let config = match parse_args(std::env::args().skip(1)) {
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("space") {
+        args.next();
+        return space_main(args);
+    }
+    let config = match parse_args(args) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("error: {e}");
