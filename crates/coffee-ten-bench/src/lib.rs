@@ -7,6 +7,7 @@ pub mod cli;
 pub mod log;
 pub mod meta;
 pub mod run;
+pub mod space;
 pub mod stats;
 
 pub use cli::{Config, KernelKind, parse_args};
