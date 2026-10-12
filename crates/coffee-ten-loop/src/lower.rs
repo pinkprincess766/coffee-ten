@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use coffee_ten_ir::{Graph, Node, NodeId, Op};
+use coffee_ten_ir::{Graph, Node, NodeId, Op, ReduceOp};
 
 use crate::{Access, AffineExpr, BinaryOp, Buffer, Expr, Kernel, Loop, LoopNest, Store, UnaryOp};
 
@@ -14,8 +14,8 @@ pub const MAX_EXPR_NODES: usize = 1000;
 
 /// Lowers the elementwise graph ending at `output` into a kernel with one loop nest.
 pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerError> {
-    if let Some(matmul) = find_matmul(graph, output)? {
-        return Err(LowerError::NotElementwise(matmul));
+    if let Some(non_elementwise) = find_non_elementwise(graph, output)? {
+        return Err(LowerError::NotElementwise(non_elementwise));
     }
     let out_dims = node(graph, output)?.shape.dims().to_vec();
     if out_dims.contains(&0) {
@@ -40,12 +40,13 @@ pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Ke
     })
 }
 
-/// Lowers the graph ending at `output`: every reachable matmul gets an init nest and an
-/// update nest; the elementwise part, if any, becomes one more nest.
+/// Lowers the graph ending at `output`: every reachable matmul and reduction gets an init
+/// nest and an update nest; the elementwise part, if any, becomes one more nest.
 ///
-/// A matmul operand that is neither an input nor a matmul (say `A + 1` in `(A + 1) @ B`) is
-/// materialized: it gets its own elementwise nest, written to a temporary, right before the
-/// nests of the first matmul that reads it.
+/// A matmul or reduce operand that is neither an input nor a matmul nor a reduce (say `A + 1`
+/// in `(A + 1) @ B`) is materialized: it gets its own elementwise nest, written to a
+/// temporary, right before the nests of the first matmul or reduce that reads it. Matmuls and
+/// reductions are processed in node order, so one can feed the other.
 ///
 /// Buffers are the reachable inputs in node order, then the temporaries `t0`, `t1`, ... in
 /// the order they are created (a kernel parameter: the caller provides the scratch memory),
@@ -53,16 +54,23 @@ pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Ke
 /// nest of a matmul runs `i, k, j` with `k` ascending for every element of the result, which
 /// is exactly the order of the interpreter's `run_f32` (`acc = 0; acc += a[i, k] * b[k, j]`),
 /// so the two agree bit for bit.
+///
+/// A reduction over the last axis of `x` (`n` elements per row) writes a temporary of shape
+/// `(..., 1)`, or `out` if it is the output. See `reduce_nests` for its nests; they follow
+/// the interpreter's order too, so the results agree bit for bit.
 pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerError> {
     let out_dims = node(graph, output)?.shape.dims().to_vec();
     if out_dims.contains(&0) {
         return Err(LowerError::ZeroSizedOutput);
     }
-    let matmuls = reachable_matmuls(graph, output)?;
+    let stages = reachable_stages(graph, output)?;
     let mut operands = Vec::new();
-    for matmul in &matmuls {
-        for operand in [matmul.a, matmul.b] {
-            if !matches!(node(graph, operand)?.op, Op::Input { .. } | Op::MatMul(..)) {
+    for stage in &stages {
+        for &operand in stage.operands() {
+            if !matches!(
+                node(graph, operand)?.op,
+                Op::Input { .. } | Op::MatMul(..) | Op::Reduce(..)
+            ) {
                 operands.push(operand);
             }
         }
@@ -70,16 +78,24 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
     operands.sort();
     operands.dedup();
 
-    let output_is_matmul = matches!(node(graph, output)?.op, Op::MatMul(..));
-    let temp_count = operands.len() + matmuls.len() - usize::from(output_is_matmul);
-    let mut loop_rank = if output_is_matmul { 0 } else { out_dims.len() };
+    let output_is_stage = matches!(node(graph, output)?.op, Op::MatMul(..) | Op::Reduce(..));
+    let temp_count = operands.len() + stages.len() - usize::from(output_is_stage);
+    let mut loop_rank = if output_is_stage { 0 } else { out_dims.len() };
     for &operand in &operands {
         loop_rank = loop_rank.max(node_dims(graph, operand)?.len());
     }
+    for stage in &stages {
+        if let Stage::Reduce(reduce) = stage {
+            loop_rank = loop_rank.max(node_dims(graph, reduce.x)?.len() - 1);
+        }
+    }
     let mut reserved = vec!["out".to_string()];
     reserved.extend((0..loop_rank).map(loop_name));
-    if !matmuls.is_empty() {
+    if stages.iter().any(|stage| matches!(stage, Stage::MatMul(_))) {
         reserved.extend(["i", "j", "k"].map(String::from));
+    }
+    if stages.iter().any(|stage| matches!(stage, Stage::Reduce(_))) {
+        reserved.push("r".to_string());
     }
     reserved.extend((0..temp_count).map(temp_name));
 
@@ -89,10 +105,10 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
     let out_buffer = input_count + temp_count;
 
     let mut nests = Vec::new();
-    for matmul in &matmuls {
-        for operand in [matmul.a, matmul.b] {
-            // Inputs and earlier matmuls have a buffer; so has an operand shared with an
-            // earlier matmul.
+    for stage in &stages {
+        for &operand in stage.operands() {
+            // Inputs and earlier matmuls and reductions have a buffer; so has an operand
+            // shared with an earlier stage.
             if buffer_of[operand.index()].is_some() {
                 continue;
             }
@@ -100,18 +116,31 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
             nests.push(checked_elementwise_nest(graph, operand, &buffer_of, temp)?);
             buffer_of[operand.index()] = Some(temp);
         }
-        let target = if matmul.id == output {
+        let target = if stage.id() == output {
             out_buffer
         } else {
-            let temp = push_temp(graph, &mut buffers, input_count, matmul.id)?;
-            buffer_of[matmul.id.index()] = Some(temp);
+            let temp = push_temp(graph, &mut buffers, input_count, stage.id())?;
+            buffer_of[stage.id().index()] = Some(temp);
             temp
         };
-        let buffer_a = buffer_of[matmul.a.index()].expect("invariant: operands have buffers");
-        let buffer_b = buffer_of[matmul.b.index()].expect("invariant: operands have buffers");
-        nests.extend(matmul_nests(matmul.dims, buffer_a, buffer_b, target));
+        let buffer_in =
+            |operand: NodeId| buffer_of[operand.index()].expect("invariant: operands have buffers");
+        match stage {
+            Stage::MatMul(matmul) => nests.extend(matmul_nests(
+                matmul.dims,
+                buffer_in(matmul.operands[0]),
+                buffer_in(matmul.operands[1]),
+                target,
+            )),
+            Stage::Reduce(reduce) => nests.extend(reduce_nests(
+                reduce.op,
+                node_dims(graph, reduce.x)?,
+                buffer_in(reduce.x),
+                target,
+            )),
+        }
     }
-    if !output_is_matmul {
+    if !output_is_stage {
         nests.push(checked_elementwise_nest(
             graph, output, &buffer_of, out_buffer,
         )?);
@@ -139,7 +168,8 @@ pub enum LowerError {
     ExpressionTooLarge {
         nodes: usize,
     },
-    /// A matmul is reachable from the output; only elementwise graphs lower to one nest.
+    /// A matmul or reduce is reachable from the output; only elementwise graphs lower to one
+    /// nest.
     NotElementwise(NodeId),
     /// `lower` cannot handle this node.
     Unsupported {
@@ -173,20 +203,13 @@ fn node(graph: &Graph, id: NodeId) -> Result<&Node, LowerError> {
     graph.get(id).ok_or(LowerError::UnknownNode(id))
 }
 
-fn reduce_unsupported(id: NodeId) -> LowerError {
-    LowerError::Unsupported {
-        node: id,
-        reason: "reduction lowering is not implemented yet",
-    }
-}
-
 fn node_dims(graph: &Graph, id: NodeId) -> Result<&[usize], LowerError> {
     Ok(node(graph, id)?.shape.dims())
 }
 
-/// The first MatMul reachable from `output`. Each node is expanded once, so a shared
-/// subgraph is not walked once per use.
-fn find_matmul(graph: &Graph, output: NodeId) -> Result<Option<NodeId>, LowerError> {
+/// The first MatMul or Reduce reachable from `output`. Each node is expanded once, so a
+/// shared subgraph is not walked once per use.
+fn find_non_elementwise(graph: &Graph, output: NodeId) -> Result<Option<NodeId>, LowerError> {
     let mut seen = vec![false; graph.nodes().len()];
     let mut stack = vec![output];
     while let Some(id) = stack.pop() {
@@ -195,8 +218,7 @@ fn find_matmul(graph: &Graph, output: NodeId) -> Result<Option<NodeId>, LowerErr
             continue;
         }
         match &node.op {
-            Op::MatMul(..) => return Ok(Some(id)),
-            Op::Reduce(..) => return Err(reduce_unsupported(id)),
+            Op::MatMul(..) | Op::Reduce(..) => return Ok(Some(id)),
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => stack.push(*x),
             Op::Binary(_, a, b) => stack.extend([*a, *b]),
@@ -205,19 +227,49 @@ fn find_matmul(graph: &Graph, output: NodeId) -> Result<Option<NodeId>, LowerErr
     Ok(None)
 }
 
-/// A matmul reachable from the output: `a` is `(m, k)`, `b` is `(k, n)`, `dims = (m, k, n)`.
+/// A matmul reachable from the output: `operands` are `a` `(m, k)` and `b` `(k, n)`,
+/// `dims = (m, k, n)`.
 struct MatMulNode {
     id: NodeId,
-    a: NodeId,
-    b: NodeId,
+    operands: [NodeId; 2],
     dims: (usize, usize, usize),
 }
 
-/// The matmuls reachable from `output` in node order; none of their dims may be 0.
-fn reachable_matmuls(graph: &Graph, output: NodeId) -> Result<Vec<MatMulNode>, LowerError> {
+/// A reduction reachable from the output: `x` is `(..., n)` and the result is `(..., 1)`.
+struct ReduceNode {
+    id: NodeId,
+    op: ReduceOp,
+    x: NodeId,
+}
+
+/// A node that gets its own nests: a matmul or a reduction.
+enum Stage {
+    MatMul(MatMulNode),
+    Reduce(ReduceNode),
+}
+
+impl Stage {
+    fn id(&self) -> NodeId {
+        match self {
+            Stage::MatMul(matmul) => matmul.id,
+            Stage::Reduce(reduce) => reduce.id,
+        }
+    }
+
+    fn operands(&self) -> &[NodeId] {
+        match self {
+            Stage::MatMul(matmul) => &matmul.operands,
+            Stage::Reduce(reduce) => std::slice::from_ref(&reduce.x),
+        }
+    }
+}
+
+/// The matmuls and reductions reachable from `output` in node order; none of their dims may
+/// be 0.
+fn reachable_stages(graph: &Graph, output: NodeId) -> Result<Vec<Stage>, LowerError> {
     let mut seen = vec![false; graph.nodes().len()];
     let mut stack = vec![output];
-    let mut matmuls = Vec::new();
+    let mut stages = Vec::new();
     while let Some(id) = stack.pop() {
         let node = node(graph, id)?;
         if std::mem::replace(&mut seen[id.index()], true) {
@@ -233,22 +285,24 @@ fn reachable_matmuls(graph: &Graph, output: NodeId) -> Result<Vec<MatMulNode>, L
                         reason: "matmul has a zero-sized dimension",
                     });
                 }
-                matmuls.push(MatMulNode {
+                stages.push(Stage::MatMul(MatMulNode {
                     id,
-                    a: *a,
-                    b: *b,
+                    operands: [*a, *b],
                     dims,
-                });
+                }));
                 stack.extend([*a, *b]);
             }
-            Op::Reduce(..) => return Err(reduce_unsupported(id)),
+            Op::Reduce(op, x) => {
+                stages.push(Stage::Reduce(ReduceNode { id, op: *op, x: *x }));
+                stack.push(*x);
+            }
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => stack.push(*x),
             Op::Binary(_, a, b) => stack.extend([*a, *b]),
         }
     }
-    matmuls.sort_by_key(|matmul| matmul.id);
-    Ok(matmuls)
+    stages.sort_by_key(Stage::id);
+    Ok(stages)
 }
 
 fn check_tree_size(
@@ -397,6 +451,84 @@ fn matmul_nests(
     [init, update]
 }
 
+/// Init and update nests of `target = reduce(op, X)` over the last axis of `X`, whose dims
+/// are `x_dims = (d0, .., n)`; `target` has shape `(d0, .., 1)`. Rank 1 has no `i` loops.
+///
+/// The order is the interpreter's (`reduce` in `coffee-ten-interp`), so results agree bit
+/// for bit:
+///
+/// - sum: `T[i0, .., 0] = 0.0`, then `T = T + X[i0, .., r]` for `r` ascending;
+/// - max: `T[i0, .., 0] = X[i0, .., 0]`, then `T = max(T, X[i0, .., r + 1])` for `r` in
+///   `0..n - 1`, so the accumulator is the first argument. For `n == 1` there is no update.
+fn reduce_nests(op: ReduceOp, x_dims: &[usize], buffer_x: usize, target: usize) -> Vec<LoopNest> {
+    let (&n, leading) = x_dims
+        .split_last()
+        .expect("invariant: a reduced operand has rank >= 1");
+    let lp = |name: String, extent| Loop {
+        name,
+        extent,
+        vectorize: false,
+    };
+    let leading_loops: Vec<Loop> = leading
+        .iter()
+        .enumerate()
+        .map(|(axis, &extent)| lp(loop_name(axis), extent))
+        .collect();
+    let leading_index: Vec<AffineExpr> = (0..leading.len())
+        .map(|axis| var(&loop_name(axis)))
+        .collect();
+    let at = |buffer, last: AffineExpr| {
+        let mut index = leading_index.clone();
+        index.push(last);
+        Access { buffer, index }
+    };
+    let constant = |constant| AffineExpr {
+        constant,
+        terms: Vec::new(),
+    };
+    let r_plus = |constant| AffineExpr {
+        constant,
+        terms: vec![("r".to_string(), 1)],
+    };
+    let load = |access| Box::new(Expr::Load(access));
+    let nest = |loops: Vec<Loop>, value| LoopNest {
+        loops,
+        guards: Vec::new(),
+        body: Store {
+            target: at(target, constant(0)),
+            value,
+        },
+    };
+    let with_r = |extent| {
+        let mut loops = leading_loops.clone();
+        loops.push(lp("r".to_string(), extent));
+        loops
+    };
+    match op {
+        ReduceOp::Sum => {
+            let init = nest(leading_loops.clone(), Expr::Const(0.0));
+            let sum = Expr::Binary(
+                BinaryOp::Add,
+                load(at(target, constant(0))),
+                load(at(buffer_x, r_plus(0))),
+            );
+            vec![init, nest(with_r(n), sum)]
+        }
+        ReduceOp::Max => {
+            let init = nest(leading_loops.clone(), Expr::Load(at(buffer_x, constant(0))));
+            if n == 1 {
+                return vec![init];
+            }
+            let max = Expr::Binary(
+                BinaryOp::Max,
+                load(at(target, constant(0))),
+                load(at(buffer_x, r_plus(1))),
+            );
+            vec![init, nest(with_r(n - 1), max)]
+        }
+    }
+}
+
 /// Marks the nodes that `output` depends on. Operands are added before their users,
 /// so one backward pass from `output` finds them all.
 fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
@@ -420,7 +552,7 @@ fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
 }
 
 /// Number of nodes in the expression tree of `output`, with shared nodes counted once per
-/// use; a matmul and a node for which `is_leaf(index)` holds count as one leaf. Saturates
+/// use; a matmul, a reduce and a node for which `is_leaf(index)` holds count as one leaf. Saturates
 /// instead of overflowing.
 fn tree_size(graph: &Graph, output: NodeId, is_leaf: &dyn Fn(usize) -> bool) -> usize {
     let nodes = graph.nodes();
@@ -428,8 +560,8 @@ fn tree_size(graph: &Graph, output: NodeId, is_leaf: &dyn Fn(usize) -> bool) -> 
     for index in 0..=output.index() {
         size[index] = match &nodes[index].op {
             _ if is_leaf(index) => 1,
-            Op::Input { .. } | Op::Const(_) | Op::MatMul(..) => 1,
-            Op::Unary(_, x) | Op::Reduce(_, x) => size[x.index()].saturating_add(1),
+            Op::Input { .. } | Op::Const(_) | Op::MatMul(..) | Op::Reduce(..) => 1,
+            Op::Unary(_, x) => size[x.index()].saturating_add(1),
             Op::Binary(_, a, b) => size[a.index()]
                 .saturating_add(size[b.index()])
                 .saturating_add(1),
@@ -448,9 +580,11 @@ fn lower_value(
     let node = node(graph, id)?;
     let buffer = buffer_of[id.index()];
     let expr = match (&node.op, buffer) {
-        // A node with a buffer (input, matmul, materialized temporary) is read, not expanded.
-        (Op::Input { .. } | Op::MatMul(..), _) | (_, Some(_)) => {
-            let buffer = buffer.expect("invariant: reachable inputs and matmuls have buffers");
+        // A node with a buffer (input, matmul, reduce, materialized temporary) is read, not
+        // expanded.
+        (Op::Input { .. } | Op::MatMul(..) | Op::Reduce(..), _) | (_, Some(_)) => {
+            let buffer =
+                buffer.expect("invariant: reachable inputs, matmuls and reduces have buffers");
             // Right-aligned broadcasting: input dim `dim` follows output loop `dim + offset`.
             let offset = out_rank
                 .checked_sub(node.shape.rank())
@@ -473,7 +607,6 @@ fn lower_value(
                 .collect();
             Expr::Load(Access { buffer, index })
         }
-        (Op::Reduce(..), None) => return Err(reduce_unsupported(id)),
         (Op::Const(value), None) => Expr::Const(*value),
         (Op::Unary(op, x), None) => Expr::Unary(
             unary_op(*op),
@@ -1122,28 +1255,237 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reduce_is_unsupported_wherever_it_is_reachable() {
-        let unsupported = |node| {
-            Err(LowerError::Unsupported {
-                node,
-                reason: "reduction lowering is not implemented yet",
-            })
-        };
+    fn reduce_of_input(op: coffee_ten_ir::ReduceOp, dims: &[usize]) -> (Graph, NodeId, NodeId) {
         let mut g = Graph::new();
-        let x = g.input("x", shape(&[2, 3])).unwrap();
-        let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, x).unwrap();
-        assert_eq!(lower(&g, sum, "k"), unsupported(sum));
-        assert_eq!(lower_elementwise(&g, sum, "k"), unsupported(sum));
-        // Softmax-shaped: x - max(x) reaches the reduce through an elementwise node.
-        let max = g.reduce(coffee_ten_ir::ReduceOp::Max, x).unwrap();
+        let x = g.input("x", shape(dims)).unwrap();
+        let reduced = g.reduce(op, x).unwrap();
+        (g, x, reduced)
+    }
+
+    #[test]
+    fn sum_over_the_last_axis_gets_init_and_update_nests() {
+        let (g, _, sum) = reduce_of_input(coffee_ten_ir::ReduceOp::Sum, &[2, 3]);
+        assert_eq!(
+            full_text(&g, sum),
+            concat!(
+                "kernel k(x: f32[2, 3], out: f32[2, 1])\n",
+                "for i0 in 0..2:\n",
+                "  out[i0, 0] = 0.0\n",
+                "for i0 in 0..2:\n",
+                "  for r in 0..3:\n",
+                "    out[i0, 0] = out[i0, 0] + x[i0, r]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn max_over_the_last_axis_starts_at_the_first_element() {
+        let (g, _, max) = reduce_of_input(coffee_ten_ir::ReduceOp::Max, &[2, 3]);
+        assert_eq!(
+            full_text(&g, max),
+            concat!(
+                "kernel k(x: f32[2, 3], out: f32[2, 1])\n",
+                "for i0 in 0..2:\n",
+                "  out[i0, 0] = x[i0, 0]\n",
+                "for i0 in 0..2:\n",
+                "  for r in 0..2:\n",
+                "    out[i0, 0] = max(out[i0, 0], x[i0, r + 1])\n",
+            )
+        );
+    }
+
+    #[test]
+    fn reduce_of_a_vector_has_no_leading_loops() {
+        let (g, _, max) = reduce_of_input(coffee_ten_ir::ReduceOp::Max, &[4]);
+        assert_eq!(
+            full_text(&g, max),
+            concat!(
+                "kernel k(x: f32[4], out: f32[1])\n",
+                "out[0] = x[0]\n",
+                "for r in 0..3:\n",
+                "  out[0] = max(out[0], x[r + 1])\n",
+            )
+        );
+        let (g, _, sum) = reduce_of_input(coffee_ten_ir::ReduceOp::Sum, &[4]);
+        assert_eq!(
+            full_text(&g, sum),
+            concat!(
+                "kernel k(x: f32[4], out: f32[1])\n",
+                "out[0] = 0.0\n",
+                "for r in 0..4:\n",
+                "  out[0] = out[0] + x[r]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn max_over_one_element_has_no_update_nest() {
+        let (g, _, max) = reduce_of_input(coffee_ten_ir::ReduceOp::Max, &[2, 1]);
+        assert_eq!(
+            full_text(&g, max),
+            concat!(
+                "kernel k(x: f32[2, 1], out: f32[2, 1])\n",
+                "for i0 in 0..2:\n",
+                "  out[i0, 0] = x[i0, 0]\n",
+            )
+        );
+        // Sum over one element still adds it to 0.0 (-0.0 + 0.0 is +0.0, as in the interpreter).
+        let (g, _, sum) = reduce_of_input(coffee_ten_ir::ReduceOp::Sum, &[2, 1]);
+        assert_eq!(full_text(&g, sum).matches("for r in 0..1:").count(), 1);
+    }
+
+    #[test]
+    fn x_minus_max_x_is_two_reduce_nests_and_an_elementwise_nest() {
+        let (mut g, x, max) = reduce_of_input(coffee_ten_ir::ReduceOp::Max, &[2, 3]);
         let shifted = g.binary(coffee_ten_ir::BinaryOp::Sub, x, max).unwrap();
-        assert_eq!(lower(&g, shifted, "k"), unsupported(max));
-        assert_eq!(lower_elementwise(&g, shifted, "k"), unsupported(max));
-        // A reduce that is a matmul operand.
-        let b = g.input("b", shape(&[1, 2])).unwrap();
-        let prod = g.matmul(sum, b).unwrap();
-        assert_eq!(lower(&g, prod, "k"), unsupported(sum));
+        assert_eq!(
+            full_text(&g, shifted),
+            concat!(
+                "kernel k(x: f32[2, 3], t0: f32[2, 1], out: f32[2, 3])\n",
+                "for i0 in 0..2:\n",
+                "  t0[i0, 0] = x[i0, 0]\n",
+                "for i0 in 0..2:\n",
+                "  for r in 0..2:\n",
+                "    t0[i0, 0] = max(t0[i0, 0], x[i0, r + 1])\n",
+                "for i0 in 0..2:\n",
+                "  for i1 in 0..3:\n",
+                "    out[i0, i1] = x[i0, i1] - t0[i0, 0]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn reduce_of_a_computed_operand_materializes_it_first() {
+        // sum(A * 2): t0 = A * 2, out = row sums of t0.
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let two = g.constant(2.0);
+        let doubled = g.binary(coffee_ten_ir::BinaryOp::Mul, a, two).unwrap();
+        let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, doubled).unwrap();
+        assert_eq!(
+            full_text(&g, sum),
+            concat!(
+                "kernel k(A: f32[2, 3], t0: f32[2, 3], out: f32[2, 1])\n",
+                "for i0 in 0..2:\n",
+                "  for i1 in 0..3:\n",
+                "    t0[i0, i1] = A[i0, i1] * 2.0\n",
+                "for i0 in 0..2:\n",
+                "  out[i0, 0] = 0.0\n",
+                "for i0 in 0..2:\n",
+                "  for r in 0..3:\n",
+                "    out[i0, 0] = out[i0, 0] + t0[i0, r]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn matmul_feeds_a_reduce_which_feeds_a_matmul() {
+        // sum(A @ B) is (4, 1); (that) @ C with C (1, 2) is (4, 2).
+        let (mut g, _, _, prod) = matmul_graph();
+        let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, prod).unwrap();
+        let c = g.input("C", shape(&[1, 2])).unwrap();
+        let out = g.matmul(sum, c).unwrap();
+        let text = full_text(&g, out);
+        assert!(text.starts_with(
+            "kernel k(A: f32[4, 3], B: f32[3, 2], C: f32[1, 2], \
+             t0: f32[4, 2], t1: f32[4, 1], out: f32[4, 2])\n"
+        ));
+        let positions = [
+            "      t0[i, j] = t0[i, j] + (A[i, k] * B[k, j])\n",
+            "    t1[i0, 0] = t1[i0, 0] + t0[i0, r]\n",
+            "      out[i, j] = out[i, j] + (t1[i, k] * C[k, j])\n",
+        ]
+        .map(|line| text.find(line).unwrap_or_else(|| panic!("{line}\n{text}")));
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn two_reduces_of_one_operand_share_it() {
+        // max(relu(X)) + sum(relu(X)) with one relu node: one materialized operand.
+        let mut g = Graph::new();
+        let x = g.input("X", shape(&[2, 3])).unwrap();
+        let activated = g.unary(coffee_ten_ir::UnaryOp::Relu, x).unwrap();
+        let max = g.reduce(coffee_ten_ir::ReduceOp::Max, activated).unwrap();
+        let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, activated).unwrap();
+        let out = g.binary(coffee_ten_ir::BinaryOp::Add, max, sum).unwrap();
+        let text = full_text(&g, out);
+        assert!(text.starts_with(
+            "kernel k(X: f32[2, 3], t0: f32[2, 3], t1: f32[2, 1], t2: f32[2, 1], \
+             out: f32[2, 1])\n"
+        ));
+        assert_eq!(text.matches("t0[i0, i1] = relu(X[i0, i1])\n").count(), 1);
+        assert!(
+            text.ends_with("    out[i0, i1] = t1[i0, 0] + t2[i0, 0]\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn reduce_is_not_elementwise() {
+        let (mut g, x, max) = reduce_of_input(coffee_ten_ir::ReduceOp::Max, &[2, 3]);
+        assert_eq!(
+            lower_elementwise(&g, max, "k"),
+            Err(LowerError::NotElementwise(max))
+        );
+        let shifted = g.binary(coffee_ten_ir::BinaryOp::Sub, x, max).unwrap();
+        assert_eq!(
+            lower_elementwise(&g, shifted, "k"),
+            Err(LowerError::NotElementwise(max))
+        );
+    }
+
+    #[test]
+    fn input_named_like_a_reduce_loop_variable_is_a_name_clash() {
+        for clash in ["r", "i0", "out", "t0"] {
+            let mut g = Graph::new();
+            let x = g.input(clash, shape(&[2, 3])).unwrap();
+            let neg = g.unary(coffee_ten_ir::UnaryOp::Neg, x).unwrap();
+            let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, neg).unwrap();
+            let out = g.unary(coffee_ten_ir::UnaryOp::Relu, sum).unwrap();
+            assert_eq!(
+                lower(&g, out, "k"),
+                Err(LowerError::NameClash(clash.to_string())),
+                "input {clash}"
+            );
+        }
+        // A reduce that reads the input directly still reserves its loop `i0`.
+        let mut g = Graph::new();
+        let x = g.input("i0", shape(&[2, 3])).unwrap();
+        let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, x).unwrap();
+        assert_eq!(
+            lower(&g, sum, "k"),
+            Err(LowerError::NameClash("i0".to_string()))
+        );
+    }
+
+    #[test]
+    fn r_is_free_without_a_reduce() {
+        let mut g = Graph::new();
+        let r = g.input("r", shape(&[2])).unwrap();
+        let out = g.unary(coffee_ten_ir::UnaryOp::Neg, r).unwrap();
+        assert_eq!(
+            lower(&g, out, "n").unwrap(),
+            lower_elementwise(&g, out, "n").unwrap()
+        );
+    }
+
+    #[test]
+    fn reduce_counts_as_one_leaf_at_the_node_limit() {
+        let (mut g, _, mut y) = reduce_of_input(coffee_ten_ir::ReduceOp::Sum, &[2, 3]);
+        for _ in 0..MAX_EXPR_NODES - 1 {
+            y = g.unary(coffee_ten_ir::UnaryOp::Neg, y).unwrap();
+        }
+        assert_eq!(lower(&g, y, "k").unwrap().validate(), Ok(()));
+        let over = g.unary(coffee_ten_ir::UnaryOp::Neg, y).unwrap();
+        assert_eq!(
+            lower(&g, over, "k"),
+            Err(LowerError::ExpressionTooLarge {
+                nodes: MAX_EXPR_NODES + 1
+            })
+        );
     }
 
     #[test]
