@@ -6,6 +6,8 @@ pub mod lower;
 pub use lower::{LowerError, MAX_EXPR_NODES, lower, lower_elementwise};
 pub mod apply;
 pub use apply::{OrderClass, ScheduleError, apply, apply_classified};
+pub mod parse;
+pub use parse::{KernelParseError, parse_kernel};
 
 use std::collections::BTreeMap;
 use std::fmt;
