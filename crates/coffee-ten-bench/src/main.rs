@@ -45,11 +45,41 @@ fn space_main(args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// `coffee-ten-bench search --n <N> --budget <M>`: random search, one candidate at a time.
+fn search_main(args: impl Iterator<Item = String>) -> ExitCode {
+    let config = match coffee_ten_bench::search::parse_search_args(args) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    raise_qos();
+    let metadata = meta::collect(config.seed);
+    match coffee_ten_bench::search::search(&config, &metadata) {
+        Ok(result) => {
+            print!(
+                "{}",
+                coffee_ten_bench::search::report(&config, &result, &metadata)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("space") {
         args.next();
         return space_main(args);
+    }
+    if args.peek().map(String::as_str) == Some("search") {
+        args.next();
+        return search_main(args);
     }
     let config = match parse_args(args) {
         Ok(config) => config,
