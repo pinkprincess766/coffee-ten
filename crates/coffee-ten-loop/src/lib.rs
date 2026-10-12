@@ -44,6 +44,7 @@ pub struct Access {
 pub enum UnaryOp {
     Neg,
     Relu,
+    Exp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +52,7 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    Div,
     Max,
 }
 
@@ -505,12 +507,14 @@ fn expr_str(buffers: &[Buffer], e: &Expr) -> String {
         Expr::Const(value) => format!("{value:?}"),
         Expr::Unary(UnaryOp::Neg, x) => format!("-({})", expr_str(buffers, x)),
         Expr::Unary(UnaryOp::Relu, x) => format!("relu({})", expr_str(buffers, x)),
+        Expr::Unary(UnaryOp::Exp, x) => format!("exp({})", expr_str(buffers, x)),
         Expr::Binary(BinaryOp::Max, a, b) => {
             format!("max({}, {})", expr_str(buffers, a), expr_str(buffers, b))
         }
         Expr::Binary(BinaryOp::Add, a, b) => infix_str(buffers, "+", a, b),
         Expr::Binary(BinaryOp::Sub, a, b) => infix_str(buffers, "-", a, b),
         Expr::Binary(BinaryOp::Mul, a, b) => infix_str(buffers, "*", a, b),
+        Expr::Binary(BinaryOp::Div, a, b) => infix_str(buffers, "/", a, b),
     }
 }
 
@@ -522,12 +526,16 @@ fn infix_str(buffers: &[Buffer], op: &str, a: &Expr, b: &Expr) -> String {
     )
 }
 
-/// An infix operand is parenthesized if it is itself an infix Add, Sub or Mul.
+/// An infix operand is parenthesized if it is itself an infix Add, Sub, Mul or Div.
 fn operand_str(buffers: &[Buffer], e: &Expr) -> String {
     let text = expr_str(buffers, e);
     if matches!(
         e,
-        Expr::Binary(BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul, _, _)
+        Expr::Binary(
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+            _,
+            _
+        )
     ) {
         format!("({text})")
     } else {
@@ -735,6 +743,20 @@ mod tests {
             Expr::Unary(UnaryOp::Neg, Box::new(Expr::Const(1.5))),
         );
         assert_eq!(expr_str(&[], &max), "max(0.0, -(1.5))");
+    }
+
+    #[test]
+    fn expr_prints_exp_and_div() {
+        let a = || load(0, vec![var("i")]);
+        let b = || load(1, vec![var("i")]);
+        let buffers = [buf("A", &[4]), buf("B", &[4])];
+        let quotient = bin(BinaryOp::Div, Expr::Unary(UnaryOp::Exp, Box::new(a())), b());
+        assert_eq!(expr_str(&buffers, &quotient), "exp(A[i]) / B[i]");
+        // an infix operand of Div is parenthesized, also on the right
+        let nested = bin(BinaryOp::Div, a(), bin(BinaryOp::Div, a(), b()));
+        assert_eq!(expr_str(&buffers, &nested), "A[i] / (A[i] / B[i])");
+        let mixed = bin(BinaryOp::Sub, bin(BinaryOp::Div, a(), b()), b());
+        assert_eq!(expr_str(&buffers, &mixed), "(A[i] / B[i]) - B[i]");
     }
 
     #[test]

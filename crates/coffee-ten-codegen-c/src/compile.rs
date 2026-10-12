@@ -254,6 +254,9 @@ fn run_clang(flags: &[&str], source: &Path, out: &Path) -> Result<(), CompileErr
         .args(["-shared", "-fPIC", "-o"])
         .arg(out)
         .arg(source)
+        // glibc keeps `expf` in libm, not libc, so a shared library using it must link
+        // it; after the source, since linkers resolve left to right. Harmless on macOS.
+        .arg("-lm")
         .output()
         .map_err(clang_spawn_error)?;
     if output.status.success() {
