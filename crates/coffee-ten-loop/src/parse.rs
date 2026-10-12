@@ -202,6 +202,8 @@ impl<'a> Cursor<'a> {
             BinaryOp::Sub
         } else if self.eat(" * ") {
             BinaryOp::Mul
+        } else if self.eat(" / ") {
+            BinaryOp::Div
         } else {
             return Ok(lhs);
         };
@@ -209,7 +211,7 @@ impl<'a> Cursor<'a> {
         Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
     }
 
-    /// A load, a constant, `relu(e)`, `max(e, e)`, `-(e)`, or `(e)` around an infix `e`.
+    /// A load, a constant, `relu(e)`, `exp(e)`, `max(e, e)`, `-(e)`, or `(e)` around an infix `e`.
     fn operand(&mut self, buffers: &[Buffer]) -> Result<Expr, String> {
         if self.eat("(") {
             let e = self.expr(buffers)?;
@@ -250,6 +252,7 @@ impl<'a> Cursor<'a> {
     fn call(&mut self, name: &str, buffers: &[Buffer]) -> Result<Expr, String> {
         let e = match name {
             "relu" => Expr::Unary(UnaryOp::Relu, Box::new(self.expr(buffers)?)),
+            "exp" => Expr::Unary(UnaryOp::Exp, Box::new(self.expr(buffers)?)),
             "max" => {
                 let a = self.expr(buffers)?;
                 self.expect(", ")?;
@@ -406,6 +409,19 @@ mod tests {
 
     /// The text parses back to `k`, and printing the parse gives the same text. `==` on f32
     /// cannot tell -0.0 from 0.0; the text can.
+    #[test]
+    fn exp_and_div_round_trip() {
+        // exp(A) / B with B broadcast over rows: both new ops in one store.
+        let mut g = coffee_ten_ir::Graph::new();
+        let a = g.input("A", coffee_ten_ir::Shape::new(vec![2, 3])).unwrap();
+        let b = g.input("B", coffee_ten_ir::Shape::new(vec![3])).unwrap();
+        let e = g.unary(coffee_ten_ir::UnaryOp::Exp, a).unwrap();
+        let y = g.binary(coffee_ten_ir::BinaryOp::Div, e, b).unwrap();
+        let k = crate::lower_elementwise(&g, y, "k").unwrap();
+        assert!(k.to_string().contains("exp(A[i0, i1]) / B[i1]"), "{k}");
+        assert_round_trip(&k);
+    }
+
     fn assert_round_trip(k: &Kernel) {
         let text = k.to_string();
         assert_eq!(parse_kernel(&text), Ok(k.clone()));
