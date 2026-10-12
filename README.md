@@ -94,8 +94,8 @@ measured; none exist yet.
 - CPU only: the C backend is built with clang; there is no GPU path.
 - Python operators: `+ - *`, unary `-`, `ct.relu`, `ct.maximum`, and `@` or `ct.matmul`
   on 2-D tensors. Not yet: division, `exp`, reductions.
-- The graph IR has `reduce` over the last axis; the interpreter runs it, but loop
-  lowering rejects it, so it cannot be compiled.
+- Reductions are last-axis `sum` and `max` only (the graph, the interpreter and the
+  compiler have them; Python does not expose them yet).
 - clang must be on `PATH` when `ct.compile` runs; without it, `ct.compile` raises
   `RuntimeError`.
 - Tested on Linux (`ubuntu-latest`) and macOS (`macos-latest`, on pushes to `main` and
