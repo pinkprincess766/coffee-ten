@@ -13,6 +13,96 @@ that matches the interpreter bit for bit when the schedule keeps the order of su
 and within a derived bound otherwise. Not yet: benchmarks, the autotuner. Numbers in this
 README are a baseline, not results.
 
+## Quickstart
+
+Needs Rust (the version in `rust-toolchain.toml`; `rustup` installs it), clang on
+`PATH`, and Python 3.9 or newer. pip pulls in NumPy.
+
+```sh
+cargo test --workspace
+pip install ./crates/coffee-ten-py
+```
+
+```python
+import numpy as np
+import coffee_ten as ct
+
+A = ct.input("A", (4, 3))
+B = ct.input("B", (3, 8))
+bias = ct.input("bias", (8,))
+y = ct.relu(A @ B + bias)
+
+rng = np.random.default_rng(0)
+inputs = {
+    "A": rng.standard_normal((4, 3), dtype=np.float32),
+    "B": rng.standard_normal((3, 8), dtype=np.float32),
+    "bias": rng.standard_normal(8, dtype=np.float32),
+}
+
+print(ct.loop_ir(y))
+k = ct.compile(y, schedule="split(1, j, jo, ji, 4); vectorize(1, ji)")
+out = k(**inputs)
+ref = ct.run(y, **inputs)
+assert np.array_equal(out.view(np.uint32), ref.view(np.uint32))
+print("match:", k.order_class)
+```
+
+Output, shortened:
+
+```text
+kernel kernel(A: f32[4, 3], B: f32[3, 8], bias: f32[8], t0: f32[4, 8], out: f32[4, 8])
+for i in 0..4:
+...
+match: preserving
+```
+
+## Schedules
+
+A schedule is text: steps separated by `;`. A step names a nest by number and loops by
+name.
+
+- `split(nest, loop, outer, inner, factor)`: `loop` becomes `outer` and `inner`, with
+  `inner` of extent `factor`; a guard covers a remainder.
+- `reorder(nest, loop, ...)`: the new loop order of the nest, outermost first; it must
+  list every loop once.
+- `vectorize(nest, loop)`: `loop` must be the innermost loop, not a reduction loop, and
+  have stride 1 in the output.
+
+Nests are numbered from 0 in `ct.loop_ir` order. In the example, nest 0 zero-fills the
+matmul result, nest 1 is the `i, k, j` update that `split` targets, and nest 2 is the
+relu. An illegal step raises `ValueError` with the step number.
+
+`Kernel.order_class` says what a schedule may change:
+
+- `preserving`: every output element gets its contributions in the same order, so the
+  result equals `ct.run` bit for bit.
+- `reordering`: the order of a float sum changes, so the result is equal only within the
+  bound in [L29] (see Basis).
+
+## Benchmarks
+
+`bench/run.sh` takes the numbers on an idle Mac, on AC power, from a clean commit; it
+runs `matmul` and `relu-matmul-bias` for N from 64 to 1024 and writes
+`bench/results/<date>-<commit>.jsonl`. Numbers go into BENCHMARKS.md once a run is
+measured; none exist yet.
+
+## Limitations
+
+- `f32` only in Python. The interpreter has an f64 mode that the binding does not expose.
+- Static shapes: `ct.input` takes a fixed shape; nothing is dynamic.
+- Single thread: the generated C has no threads.
+- CPU only: the C backend is built with clang; there is no GPU path.
+- Python operators: `+ - *`, unary `-`, `ct.relu`, `ct.maximum`, and `@` or `ct.matmul`
+  on 2-D tensors. Not yet: division, `exp`, reductions.
+- Reductions are last-axis `sum` and `max` only (the graph, the interpreter and the
+  compiler have them; Python does not expose them yet).
+- clang must be on `PATH` when `ct.compile` runs; without it, `ct.compile` raises
+  `RuntimeError`.
+- Tested on Linux (`ubuntu-latest`) and macOS (`macos-latest`, on pushes to `main` and
+  manual runs only); no Windows in CI.
+- Loop IR nests are perfect: one store under one loop chain. A relu or bias after a
+  matmul is its own nest; there is no epilogue fusion yet.
+
 ## Basis
 
 Each section names the idea the code rests on, where it lives and what checks it.
