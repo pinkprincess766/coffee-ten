@@ -101,7 +101,10 @@ trait Scalar: Copy {
     fn add(self, other: Self) -> Self;
     fn sub(self, other: Self) -> Self;
     fn mul(self, other: Self) -> Self;
+    fn div(self, other: Self) -> Self;
     fn neg(self) -> Self;
+    /// One call of the platform libm `exp`; not exactly rounded.
+    fn exp(self) -> Self;
     fn gt(self, other: Self) -> bool;
 }
 
@@ -121,8 +124,14 @@ impl Scalar for f32 {
     fn mul(self, other: f32) -> f32 {
         self * other
     }
+    fn div(self, other: f32) -> f32 {
+        self / other
+    }
     fn neg(self) -> f32 {
         -self
+    }
+    fn exp(self) -> f32 {
+        f32::exp(self)
     }
     fn gt(self, other: f32) -> bool {
         self > other
@@ -145,8 +154,14 @@ impl Scalar for f64 {
     fn mul(self, other: f64) -> f64 {
         self * other
     }
+    fn div(self, other: f64) -> f64 {
+        self / other
+    }
     fn neg(self) -> f64 {
         -self
+    }
+    fn exp(self) -> f64 {
+        f64::exp(self)
     }
     fn gt(self, other: f64) -> bool {
         self > other
@@ -163,6 +178,7 @@ fn unary<T: Scalar>(op: UnaryOp, x: T) -> T {
                 T::zero()
             }
         }
+        UnaryOp::Exp => x.exp(),
     }
 }
 
@@ -172,6 +188,7 @@ fn binary<T: Scalar>(op: BinaryOp, a: T, b: T) -> T {
         BinaryOp::Add => a.add(b),
         BinaryOp::Sub => a.sub(b),
         BinaryOp::Mul => a.mul(b),
+        BinaryOp::Div => a.div(b),
         BinaryOp::Max => {
             if a.gt(b) {
                 a
@@ -511,6 +528,63 @@ mod tests {
         let a_t = tensor(&[3], &[1.0, -2.0, 0.5]);
         // 2 * [1,-2,0.5] = [2,-4,1]
         check_both(&g, prod, &[("A", &a_t)], &[3], &[2.0, -4.0, 1.0]);
+    }
+
+    #[test]
+    fn div_is_elementwise_in_order() {
+        let mut g = Graph::new();
+        let a = g.input("a", shape(&[3])).unwrap();
+        let b = g.input("b", shape(&[3])).unwrap();
+        let q = g.binary(BinaryOp::Div, a, b).unwrap();
+        let a_t = tensor(&[3], &[1.0, 3.0, -7.0]);
+        let b_t = tensor(&[3], &[2.0, 4.0, 0.0]);
+        // [1,3,-7] / [2,4,0] = [0.5,0.75,-inf]
+        check_both(
+            &g,
+            q,
+            &[("a", &a_t), ("b", &b_t)],
+            &[3],
+            &[0.5, 0.75, f32::NEG_INFINITY],
+        );
+    }
+
+    #[test]
+    fn exp_of_zero_is_exactly_one() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[1])).unwrap();
+        let y = g.unary(UnaryOp::Exp, x).unwrap();
+        let x_t = tensor(&[1], &[0.0]);
+        // exp(0) = 1
+        check_both(&g, y, &[("x", &x_t)], &[1], &[1.0]);
+    }
+
+    /// Steps between two positive finite f32 values.
+    fn ulp_distance(a: f32, b: f32) -> u32 {
+        assert!(a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite());
+        a.to_bits().abs_diff(b.to_bits())
+    }
+
+    #[test]
+    fn exp_f32_is_within_one_ulp_of_rounded_f64() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[1000])).unwrap();
+        let y = g.unary(UnaryOp::Exp, x).unwrap();
+        // 1000 evenly spaced points from -80 to 80; exp stays normal in f32
+        // (exp(-80) ~ 1.8e-35 > 1.2e-38, exp(80) ~ 5.5e34 < 3.4e38).
+        let xs: Vec<f32> = (0..1000)
+            .map(|i| -80.0 + 160.0 * (i as f32) / 999.0)
+            .collect();
+        let x_t = tensor(&[1000], &xs);
+        let inputs = [("x", &x_t)];
+        let out32 = run_f32(&g, y, &inputs).unwrap();
+        let out64 = run_f64(&g, y, &inputs).unwrap();
+        for ((&x, &got), &reference) in xs.iter().zip(out32.data()).zip(out64.data()) {
+            let ulps = ulp_distance(got, reference as f32);
+            assert!(
+                ulps <= 1,
+                "exp({x}) = {got}, f64 gives {reference}: {ulps} ulp"
+            );
+        }
     }
 
     #[test]

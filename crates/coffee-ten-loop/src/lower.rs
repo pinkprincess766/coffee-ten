@@ -503,6 +503,7 @@ fn unary_op(op: coffee_ten_ir::UnaryOp) -> UnaryOp {
     match op {
         coffee_ten_ir::UnaryOp::Neg => UnaryOp::Neg,
         coffee_ten_ir::UnaryOp::Relu => UnaryOp::Relu,
+        coffee_ten_ir::UnaryOp::Exp => UnaryOp::Exp,
     }
 }
 
@@ -511,6 +512,7 @@ fn binary_op(op: coffee_ten_ir::BinaryOp) -> BinaryOp {
         coffee_ten_ir::BinaryOp::Add => BinaryOp::Add,
         coffee_ten_ir::BinaryOp::Sub => BinaryOp::Sub,
         coffee_ten_ir::BinaryOp::Mul => BinaryOp::Mul,
+        coffee_ten_ir::BinaryOp::Div => BinaryOp::Div,
         coffee_ten_ir::BinaryOp::Max => BinaryOp::Max,
     }
 }
@@ -545,6 +547,24 @@ mod tests {
                 "for i0 in 0..2:\n",
                 "  for i1 in 0..3:\n",
                 "    out[i0, i1] = relu(A[i0, i1] + bias[i1])\n",
+            )
+        );
+    }
+
+    #[test]
+    fn exp_divided_by_input_is_one_nest() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[2, 3])).unwrap();
+        let b = g.input("B", shape(&[3])).unwrap();
+        let e = g.unary(coffee_ten_ir::UnaryOp::Exp, a).unwrap();
+        let out = g.binary(coffee_ten_ir::BinaryOp::Div, e, b).unwrap();
+        assert_eq!(
+            lowered_text(&g, out),
+            concat!(
+                "kernel k(A: f32[2, 3], B: f32[3], out: f32[2, 3])\n",
+                "for i0 in 0..2:\n",
+                "  for i1 in 0..3:\n",
+                "    out[i0, i1] = exp(A[i0, i1]) / B[i1]\n",
             )
         );
     }
