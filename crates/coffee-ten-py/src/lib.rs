@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use coffee_ten_codegen_c::{CompiledKernel, compile, emit_c};
 use coffee_ten_interp::{Tensor as DenseTensor, run_f32};
-use coffee_ten_ir::{BinaryOp, Graph, GraphError, NodeId, Op, Shape, UnaryOp};
+use coffee_ten_ir::{BinaryOp, Graph, GraphError, NodeId, Op, ReduceOp, Shape, UnaryOp};
 use coffee_ten_loop::{Buffer, Kernel, OrderClass, Schedule, apply_classified};
 use numpy::{
     PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyUntypedArray,
@@ -27,6 +27,7 @@ enum Expr {
     Unary(UnaryOp, Arc<Expr>),
     Binary(BinaryOp, Arc<Expr>, Arc<Expr>),
     MatMul(Arc<Expr>, Arc<Expr>),
+    Reduce(ReduceOp, Arc<Expr>),
 }
 
 /// A lazily evaluated tensor expression; it computes nothing until `run`.
@@ -83,6 +84,25 @@ impl PyTensor {
         Ok(PyTensor {
             expr: Arc::new(expr),
             shape,
+            depth,
+        })
+    }
+
+    fn reduce(op: ReduceOp, x: &PyTensor) -> PyResult<PyTensor> {
+        // Same rule and message as `Graph::reduce`, so the error shows at op time.
+        let mut dims = x.shape.dims().to_vec();
+        match dims.last_mut() {
+            Some(last) if *last > 0 => *last = 1,
+            _ => {
+                return Err(value_error(GraphError::BadReduce {
+                    shape: x.shape.clone(),
+                }));
+            }
+        }
+        let depth = check_depth(x.depth + 1)?;
+        Ok(PyTensor {
+            expr: Arc::new(Expr::Reduce(op, Arc::clone(&x.expr))),
+            shape: Shape::new(dims),
             depth,
         })
     }
@@ -165,6 +185,14 @@ impl PyTensor {
         PyTensor::binary(BinaryOp::Mul, &other.into_tensor(), self)
     }
 
+    fn __truediv__(&self, other: Operand<'_>) -> PyResult<PyTensor> {
+        PyTensor::binary(BinaryOp::Div, self, &other.into_tensor())
+    }
+
+    fn __rtruediv__(&self, other: Operand<'_>) -> PyResult<PyTensor> {
+        PyTensor::binary(BinaryOp::Div, &other.into_tensor(), self)
+    }
+
     // Tensor @ Tensor only: any other operand makes pyo3 return NotImplemented.
     fn __matmul__(&self, other: PyRef<'_, PyTensor>) -> PyResult<PyTensor> {
         PyTensor::matmul(self, &other)
@@ -200,6 +228,48 @@ fn input(name: String, shape: &Bound<'_, PyTuple>) -> PyResult<PyTensor> {
 #[pyfunction]
 fn relu(x: &PyTensor) -> PyResult<PyTensor> {
     PyTensor::unary(UnaryOp::Relu, x)
+}
+
+/// exp(x) = e**x, elementwise, in float32.
+///
+/// The interpreter calls the platform libm and the compiled kernel calls `expf`; neither
+/// is exactly rounded, so the two may differ in the last bits.
+#[pyfunction]
+fn exp(x: &PyTensor) -> PyResult<PyTensor> {
+    PyTensor::unary(UnaryOp::Exp, x)
+}
+
+/// Sum over the last axis, keepdims: shape `(..., n)` becomes `(..., 1)`.
+///
+/// The sum runs left to right in float32. A rank 0 Tensor or an empty last axis is a
+/// ValueError.
+#[pyfunction]
+fn sum(x: &PyTensor) -> PyResult<PyTensor> {
+    PyTensor::reduce(ReduceOp::Sum, x)
+}
+
+/// Maximum over the last axis, keepdims: shape `(..., n)` becomes `(..., 1)`.
+///
+/// The running maximum `a` meets the next element `b` as `a > b ? a : b`, so NaN differs
+/// from NumPy: a nan survives only as the last element of the row, while `np.max` returns
+/// nan if there is one anywhere. A rank 0 Tensor or an empty last axis is a ValueError.
+#[pyfunction]
+fn max(x: &PyTensor) -> PyResult<PyTensor> {
+    PyTensor::reduce(ReduceOp::Max, x)
+}
+
+/// softmax(x) over the last axis, shape unchanged: `e / sum(e)` with `e = exp(x - max(x))`.
+///
+/// Three passes over each row (max, then exp and sum, then divide), no online softmax.
+/// Numerically stable: subtracting the row max keeps every exponent <= 0, so exp cannot
+/// overflow. Built from `max`, `-`, `exp`, `sum` and `/`; it is not a graph node.
+#[pyfunction]
+fn softmax(x: &PyTensor) -> PyResult<PyTensor> {
+    let row_max = PyTensor::reduce(ReduceOp::Max, x)?;
+    let shifted = PyTensor::binary(BinaryOp::Sub, x, &row_max)?;
+    let e = PyTensor::unary(UnaryOp::Exp, &shifted)?;
+    let row_sum = PyTensor::reduce(ReduceOp::Sum, &e)?;
+    PyTensor::binary(BinaryOp::Div, &e, &row_sum)
 }
 
 /// maximum(a, b) = a if a > b else b, elementwise, with broadcasting.
@@ -280,6 +350,10 @@ fn lower(
             let a = lower(a, graph, memo)?;
             let b = lower(b, graph, memo)?;
             graph.matmul(a, b)?
+        }
+        Expr::Reduce(op, x) => {
+            let x = lower(x, graph, memo)?;
+            graph.reduce(*op, x)?
         }
     };
     memo.insert(key, id);
@@ -451,5 +525,8 @@ fn compile_kernel(
 #[pymodule]
 mod coffee_ten {
     #[pymodule_export]
-    use super::{PyKernel, PyTensor, compile_kernel, input, loop_ir, matmul, maximum, relu, run};
+    use super::{
+        PyKernel, PyTensor, compile_kernel, exp, input, loop_ir, matmul, max, maximum, relu, run,
+        softmax, sum,
+    };
 }
