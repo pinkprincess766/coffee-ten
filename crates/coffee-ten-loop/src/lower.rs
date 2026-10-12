@@ -173,6 +173,13 @@ fn node(graph: &Graph, id: NodeId) -> Result<&Node, LowerError> {
     graph.get(id).ok_or(LowerError::UnknownNode(id))
 }
 
+fn reduce_unsupported(id: NodeId) -> LowerError {
+    LowerError::Unsupported {
+        node: id,
+        reason: "reduction lowering is not implemented yet",
+    }
+}
+
 fn node_dims(graph: &Graph, id: NodeId) -> Result<&[usize], LowerError> {
     Ok(node(graph, id)?.shape.dims())
 }
@@ -189,6 +196,7 @@ fn find_matmul(graph: &Graph, output: NodeId) -> Result<Option<NodeId>, LowerErr
         }
         match &node.op {
             Op::MatMul(..) => return Ok(Some(id)),
+            Op::Reduce(..) => return Err(reduce_unsupported(id)),
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => stack.push(*x),
             Op::Binary(_, a, b) => stack.extend([*a, *b]),
@@ -233,6 +241,7 @@ fn reachable_matmuls(graph: &Graph, output: NodeId) -> Result<Vec<MatMulNode>, L
                 });
                 stack.extend([*a, *b]);
             }
+            Op::Reduce(..) => return Err(reduce_unsupported(id)),
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => stack.push(*x),
             Op::Binary(_, a, b) => stack.extend([*a, *b]),
@@ -400,7 +409,7 @@ fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         }
         match &nodes[index].op {
             Op::Input { .. } | Op::Const(_) => {}
-            Op::Unary(_, x) => is_reachable[x.index()] = true,
+            Op::Unary(_, x) | Op::Reduce(_, x) => is_reachable[x.index()] = true,
             Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 is_reachable[a.index()] = true;
                 is_reachable[b.index()] = true;
@@ -420,7 +429,7 @@ fn tree_size(graph: &Graph, output: NodeId, is_leaf: &dyn Fn(usize) -> bool) -> 
         size[index] = match &nodes[index].op {
             _ if is_leaf(index) => 1,
             Op::Input { .. } | Op::Const(_) | Op::MatMul(..) => 1,
-            Op::Unary(_, x) => size[x.index()].saturating_add(1),
+            Op::Unary(_, x) | Op::Reduce(_, x) => size[x.index()].saturating_add(1),
             Op::Binary(_, a, b) => size[a.index()]
                 .saturating_add(size[b.index()])
                 .saturating_add(1),
@@ -464,6 +473,7 @@ fn lower_value(
                 .collect();
             Expr::Load(Access { buffer, index })
         }
+        (Op::Reduce(..), None) => return Err(reduce_unsupported(id)),
         (Op::Const(value), None) => Expr::Const(*value),
         (Op::Unary(op, x), None) => Expr::Unary(
             unary_op(*op),
@@ -1090,6 +1100,30 @@ mod tests {
                 reason: "matmul has a zero-sized dimension"
             })
         );
+    }
+
+    #[test]
+    fn reduce_is_unsupported_wherever_it_is_reachable() {
+        let unsupported = |node| {
+            Err(LowerError::Unsupported {
+                node,
+                reason: "reduction lowering is not implemented yet",
+            })
+        };
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2, 3])).unwrap();
+        let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, x).unwrap();
+        assert_eq!(lower(&g, sum, "k"), unsupported(sum));
+        assert_eq!(lower_elementwise(&g, sum, "k"), unsupported(sum));
+        // Softmax-shaped: x - max(x) reaches the reduce through an elementwise node.
+        let max = g.reduce(coffee_ten_ir::ReduceOp::Max, x).unwrap();
+        let shifted = g.binary(coffee_ten_ir::BinaryOp::Sub, x, max).unwrap();
+        assert_eq!(lower(&g, shifted, "k"), unsupported(max));
+        assert_eq!(lower_elementwise(&g, shifted, "k"), unsupported(max));
+        // A reduce that is a matmul operand.
+        let b = g.input("b", shape(&[1, 2])).unwrap();
+        let prod = g.matmul(sum, b).unwrap();
+        assert_eq!(lower(&g, prod, "k"), unsupported(sum));
     }
 
     #[test]
