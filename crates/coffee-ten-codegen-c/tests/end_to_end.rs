@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use coffee_ten_codegen_c::compile;
 use coffee_ten_interp::{Tensor, run_f32};
-use coffee_ten_ir::{BinaryOp, Graph, NodeId, Shape, UnaryOp};
+use coffee_ten_ir::{BinaryOp, Graph, NodeId, ReduceOp, Shape, UnaryOp};
 use coffee_ten_loop::lower;
 
 /// A fresh cache dir, removed when dropped (also if the test panics).
@@ -66,6 +66,29 @@ fn x_data() -> Vec<f32> {
         .collect()
 }
 
+/// `S (4, 1000)`: magnitudes from 1e-3 to 1e3 and both signs, so an f32 row sum rounds at
+/// almost every step and depends on the order of the additions.
+fn s_data() -> Vec<f32> {
+    (0..4000)
+        .map(|n| {
+            let magnitude = 10f32.powi((n * 7919 % 7) - 3);
+            let sign = if n % 3 == 0 { -1.0 } else { 1.0 };
+            sign * magnitude * (1.0 + (n % 13) as f32 * 0.071)
+        })
+        .collect()
+}
+
+/// `R (4, 5)`: an all-negative row, rows of `-0.0` and `+0.0` in both orders, and a row
+/// with a zero among negatives.
+fn r_data() -> Vec<f32> {
+    vec![
+        -3.5, -1.25, -7.0, -2.0, -9.5, //
+        -0.0, 0.0, -0.0, 0.0, -0.0, //
+        0.0, -0.0, 0.0, -0.0, 0.0, //
+        -0.0, -2.0, -0.0, -5.0, -1.0,
+    ]
+}
+
 /// Shape and values of the input called `name`.
 fn input_data(name: &str) -> (Vec<usize>, Vec<f32>) {
     match name {
@@ -75,6 +98,8 @@ fn input_data(name: &str) -> (Vec<usize>, Vec<f32>) {
         "bias" => (vec![2], BIAS.to_vec()),
         "D" => (vec![3], DIVISOR.to_vec()),
         "X" => (vec![1000], x_data()),
+        "S" => (vec![4, 1000], s_data()),
+        "R" => (vec![4, 5], r_data()),
         _ => panic!("no data for input {name}"),
     }
 }
@@ -235,6 +260,48 @@ fn div_matches_the_interpreter_bit_for_bit() {
 }
 
 #[test]
+fn row_sum_matches_the_interpreter_bit_for_bit() {
+    let mut g = Graph::new();
+    let s = g.input("S", shape(&[4, 1000])).unwrap();
+    let sum = g.reduce(ReduceOp::Sum, s).unwrap();
+    let result = check_against_reference("row_sum", &g, sum, &["S"]);
+    // The test is only sharp if the order of the additions changes the rounded sum.
+    let data = s_data();
+    let descending: Vec<u32> = data
+        .chunks(1000)
+        .map(|row| row.iter().rev().fold(0.0f32, |acc, &v| acc + v).to_bits())
+        .collect();
+    let got: Vec<u32> = result.iter().map(|v| v.to_bits()).collect();
+    assert_ne!(got, descending, "{result:?}");
+}
+
+#[test]
+fn row_max_matches_the_interpreter_bit_for_bit() {
+    let mut g = Graph::new();
+    let r = g.input("R", shape(&[4, 5])).unwrap();
+    let max = g.reduce(ReduceOp::Max, r).unwrap();
+    let result = check_against_reference("row_max", &g, max, &["R"]);
+    // The all-negative row would come out as 0.0 if the maximum started at 0.0.
+    assert_eq!(result[0], -1.25);
+    // Which zero wins depends on the argument order of max (`a > b ? a : b`, accumulator
+    // first): the five alternating zeros end on -0.0 in row 1 and on +0.0 in row 2.
+    assert_eq!(result[1].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(result[2].to_bits(), 0.0f32.to_bits());
+}
+
+#[test]
+fn x_minus_row_max_matches_the_interpreter_bit_for_bit() {
+    let mut g = Graph::new();
+    let r = g.input("R", shape(&[4, 5])).unwrap();
+    let max = g.reduce(ReduceOp::Max, r).unwrap();
+    let shifted = g.binary(BinaryOp::Sub, r, max).unwrap();
+    let result = check_against_reference("x_minus_max", &g, shifted, &["R"]);
+    // Nothing exceeds the row maximum, and the rows are not all zero.
+    assert!(result.iter().all(|&x| x <= 0.0), "{result:?}");
+    assert!(result.iter().any(|&x| x < 0.0), "{result:?}");
+}
+
+#[test]
 fn exp_matches_float64_within_one_ulp() {
     let mut g = Graph::new();
     let x = g.input("X", shape(&[1000])).unwrap();
@@ -256,4 +323,16 @@ fn exp_matches_float64_within_one_ulp() {
             xs[n]
         );
     }
+}
+
+#[test]
+fn sum_of_relu_of_matmul_matches_the_interpreter_bit_for_bit() {
+    let mut g = Graph::new();
+    let a = g.input("A", shape(&[4, 3])).unwrap();
+    let b = g.input("B", shape(&[3, 2])).unwrap();
+    let prod = g.matmul(a, b).unwrap();
+    let activated = g.unary(UnaryOp::Relu, prod).unwrap();
+    let sum = g.reduce(ReduceOp::Sum, activated).unwrap();
+    let result = check_against_reference("sum_relu_matmul", &g, sum, &["A", "B"]);
+    assert!(result.iter().any(|&x| x > 0.0), "{result:?}");
 }
