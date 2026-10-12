@@ -1,6 +1,6 @@
 /*
- * peak: single-thread f32 peak FLOP/s (FMA loop) and single-thread memory
- * bandwidth (STREAM triad). See README.md.
+ * peak: single-thread f32 peak FLOP/s (FMA loop), single-thread memory
+ * bandwidth and L2 bandwidth (STREAM triad). See README.md.
  *
  * Build (from the repo root):
  *   clang -std=c99 -O2 -ffp-contract=fast -o peak bench/peak/peak.c
@@ -33,6 +33,12 @@ typedef float v4f __attribute__((vector_size(16)));
 /* STREAM triad: floats per array, 128 MiB each, far beyond caches. */
 #define TRIAD_N (1 << 25)
 #define TRIAD_S 0.5f
+
+/*
+ * STREAM triad sized for L2: 3 arrays x 1 MiB. Assumed, not measured: L1D is
+ * 128 KiB and L2 is 16 MiB per P-cluster on Apple M-series.
+ */
+#define TRIAD_L2_N (1 << 18)
 
 #define SAMPLES 30
 #define QUICK_SAMPLES 3
@@ -98,8 +104,8 @@ static double fma_flop_per_call(void) {
     return 2.0 * 4 * FMA_CHAINS * (double)FMA_ITERS;
 }
 
-static double triad_bytes_per_call(void) {
-    return 3.0 * 4 * TRIAD_N;
+static double triad_bytes_per_call(long n) {
+    return 3.0 * 4 * n;
 }
 
 /* Returns GFLOP/s (FLOP per ns). */
@@ -120,16 +126,16 @@ static double fma_sample(float a, float b) {
 }
 
 /* Returns GB/s (1e9 bytes per second, i.e. bytes per ns). */
-static double triad_sample(float *x, const float *y, const float *z) {
+static double triad_sample(float *x, const float *y, const float *z, long n) {
     long long t0 = now_ns();
     long long t1;
     long calls = 0;
     do {
-        triad(x, y, z, TRIAD_S, TRIAD_N);
+        triad(x, y, z, TRIAD_S, n);
         calls++;
         t1 = now_ns();
     } while (t1 - t0 < MIN_SAMPLE_NS);
-    return (double)calls * triad_bytes_per_call() / (double)(t1 - t0);
+    return (double)calls * triad_bytes_per_call(n) / (double)(t1 - t0);
 }
 
 typedef struct {
@@ -180,6 +186,7 @@ static int run_check(float a, float b) {
         }
     }
 
+    /* triad_l2 runs the same triad() at n = TRIAD_L2_N; this n = 1024 check covers it. */
     long n = 1024;
     float *x = malloc(n * sizeof *x);
     float *y = malloc(n * sizeof *y);
@@ -211,6 +218,33 @@ static int run_check(float a, float b) {
 
 static double g_fma_rate[SAMPLES];
 static double g_triad_rate[SAMPLES];
+static double g_triad_l2_rate[SAMPLES];
+
+/* Fills rate[0..samples-1] with triad GB/s over n floats. Returns 1 on malloc failure. */
+static int run_triad(long n, int samples, int warmup, double *rate) {
+    float *x = malloc(n * sizeof *x);
+    float *y = malloc(n * sizeof *y);
+    float *z = malloc(n * sizeof *z);
+    if (!x || !y || !z) {
+        fprintf(stderr, "malloc failed\n");
+        return 1;
+    }
+    for (long i = 0; i < n; i++) {
+        x[i] = 0.0f;
+        y[i] = 1.0f;
+        z[i] = 2.0f;
+    }
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = triad_sample(x, y, z, n);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+    free(x);
+    free(y);
+    free(z);
+    return 0;
+}
 
 int main(int argc, char **argv) {
 #ifdef __APPLE__
@@ -250,41 +284,30 @@ int main(int argc, char **argv) {
         }
     }
 
-    long n = TRIAD_N;
-    float *x = malloc(n * sizeof *x);
-    float *y = malloc(n * sizeof *y);
-    float *z = malloc(n * sizeof *z);
-    if (!x || !y || !z) {
-        fprintf(stderr, "malloc failed\n");
+    if (run_triad(TRIAD_N, samples, warmup, g_triad_rate) != 0) {
         return 1;
     }
-    for (long i = 0; i < n; i++) {
-        x[i] = 0.0f;
-        y[i] = 1.0f;
-        z[i] = 2.0f;
-    }
-    for (int s = 0; s < warmup + samples; s++) {
-        double rate = triad_sample(x, y, z);
-        if (s >= warmup) {
-            g_triad_rate[s - warmup] = rate;
-        }
+    if (run_triad(TRIAD_L2_N, samples, warmup, g_triad_l2_rate) != 0) {
+        return 1;
     }
 
     stats_t fma = summarize(g_fma_rate, samples);
     stats_t triad_st = summarize(g_triad_rate, samples);
+    stats_t triad_l2_st = summarize(g_triad_l2_rate, samples);
 
     print_stats("fma", "GFLOP/s", fma, samples);
     print_stats("triad", "GB/s", triad_st, samples);
+    print_stats("triad_l2", "GB/s", triad_l2_st, samples);
     printf("checksum %g\n", g_sink);
     printf("{\"fma_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"triad_gbs\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
-           "\"fma_chains\":%d,\"triad_n\":%d}\n",
+           "\"fma_chains\":%d,\"triad_n\":%d,"
+           "\"triad_l2_gbs\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
+           "\"triad_l2_n\":%d}\n",
            fma.median, fma.p25, fma.p75, fma.min, samples,
            triad_st.median, triad_st.p25, triad_st.p75, triad_st.min, samples,
-           FMA_CHAINS, TRIAD_N);
-
-    free(x);
-    free(y);
-    free(z);
+           FMA_CHAINS, TRIAD_N,
+           triad_l2_st.median, triad_l2_st.p25, triad_l2_st.p75, triad_l2_st.min, samples,
+           TRIAD_L2_N);
     return 0;
 }
