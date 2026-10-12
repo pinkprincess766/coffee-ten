@@ -81,6 +81,10 @@ fn main() -> ExitCode {
         args.next();
         return search_main(args);
     }
+    if args.peek().map(String::as_str) == Some("model") {
+        args.next();
+        return coffee_ten_bench::model::cli_main(args);
+    }
     let config = match parse_args(args) {
         Ok(config) => config,
         Err(e) => {
