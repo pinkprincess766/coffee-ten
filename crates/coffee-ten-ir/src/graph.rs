@@ -16,6 +16,9 @@ impl NodeId {
 pub enum UnaryOp {
     Neg,
     Relu,
+    /// `e^x`. Evaluated by the platform libm, so the result is not exactly rounded and
+    /// differs between libms; the one op whose f32 results are compared with a tolerance.
+    Exp,
 }
 
 impl UnaryOp {
@@ -23,6 +26,7 @@ impl UnaryOp {
         match self {
             UnaryOp::Neg => "neg",
             UnaryOp::Relu => "relu",
+            UnaryOp::Exp => "exp",
         }
     }
 }
@@ -32,6 +36,7 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    Div,
     Max,
 }
 
@@ -41,6 +46,7 @@ impl BinaryOp {
             BinaryOp::Add => "add",
             BinaryOp::Sub => "sub",
             BinaryOp::Mul => "mul",
+            BinaryOp::Div => "div",
             BinaryOp::Max => "max",
         }
     }
@@ -355,6 +361,25 @@ mod tests {
                 Op::Input { .. } | Op::Const(_) => {}
             }
         }
+    }
+
+    #[test]
+    fn exp_and_div_shapes_and_display() {
+        let mut g = Graph::new();
+        let a = g.input("A", shape(&[3])).unwrap();
+        let b = g.input("B", shape(&[2, 1])).unwrap();
+        let e = g.unary(UnaryOp::Exp, a).unwrap();
+        let q = g.binary(BinaryOp::Div, a, b).unwrap();
+        // exp keeps (3,); (3,) / (2, 1) broadcasts to (2, 3)
+        assert_eq!(g.get(e).unwrap().shape, shape(&[3]));
+        assert_eq!(g.get(q).unwrap().shape, shape(&[2, 3]));
+        assert_eq!(
+            g.to_string(),
+            "%0 = input A : (3,)\n\
+             %1 = input B : (2, 1)\n\
+             %2 = exp %0 : (3,)\n\
+             %3 = div %0, %1 : (2, 3)\n"
+        );
     }
 
     #[test]

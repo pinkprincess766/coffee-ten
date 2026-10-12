@@ -40,13 +40,14 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
+const MATH_INCLUDE: &str = "#include <math.h>\n\n";
 const RELU_HELPER: &str =
     "static inline float ct_relu(float x) { return x > 0.0f ? x : 0.0f; }\n\n";
 const MAX_HELPER: &str =
     "static inline float ct_max(float a, float b) { return a > b ? a : b; }\n\n";
 
-/// Names a kernel, buffer or loop must not take: C99 keywords and our helpers.
-const RESERVED: [&str; 40] = [
+/// Names a kernel, buffer or loop must not take: C99 keywords, our helpers and `expf`.
+const RESERVED: [&str; 41] = [
     "auto",
     "break",
     "case",
@@ -87,6 +88,7 @@ const RESERVED: [&str; 40] = [
     "ct_relu",
     "ct_max",
     "ct_entry",
+    "expf",
 ];
 
 /// Emits `kernel` as one C99 function. Buffers that are stored to are `restrict` outputs.
@@ -138,6 +140,9 @@ pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
     };
 
     let mut out = String::new();
+    if used.exp {
+        out.push_str(MATH_INCLUDE);
+    }
     if used.relu {
         out.push_str(RELU_HELPER);
     }
@@ -156,6 +161,8 @@ pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
 struct Helpers {
     relu: bool,
     max: bool,
+    /// The kernel calls `expf`, which needs `<math.h>`.
+    exp: bool,
 }
 
 /// Rejects non-finite constants and records which helper functions the expression calls.
@@ -171,6 +178,7 @@ fn scan_expr(e: &Expr, used: &mut Helpers) -> Result<(), CodegenError> {
         }
         Expr::Unary(op, x) => {
             used.relu |= *op == UnaryOp::Relu;
+            used.exp |= *op == UnaryOp::Exp;
             scan_expr(x, used)
         }
         Expr::Binary(op, a, b) => {
@@ -263,12 +271,14 @@ fn expr_c(buffers: &[Buffer], e: &Expr) -> String {
         Expr::Const(value) => format!("{value:?}f"),
         Expr::Unary(UnaryOp::Neg, x) => format!("-({})", expr_c(buffers, x)),
         Expr::Unary(UnaryOp::Relu, x) => format!("ct_relu({})", expr_c(buffers, x)),
+        Expr::Unary(UnaryOp::Exp, x) => format!("expf({})", expr_c(buffers, x)),
         Expr::Binary(BinaryOp::Max, a, b) => {
             format!("ct_max({}, {})", expr_c(buffers, a), expr_c(buffers, b))
         }
         Expr::Binary(BinaryOp::Add, a, b) => infix_c(buffers, "+", a, b),
         Expr::Binary(BinaryOp::Sub, a, b) => infix_c(buffers, "-", a, b),
         Expr::Binary(BinaryOp::Mul, a, b) => infix_c(buffers, "*", a, b),
+        Expr::Binary(BinaryOp::Div, a, b) => infix_c(buffers, "/", a, b),
     }
 }
 
@@ -276,12 +286,16 @@ fn infix_c(buffers: &[Buffer], op: &str, a: &Expr, b: &Expr) -> String {
     format!("{} {op} {}", operand_c(buffers, a), operand_c(buffers, b))
 }
 
-/// An infix operand is parenthesized if it is itself an infix Add, Sub or Mul.
+/// An infix operand is parenthesized if it is itself an infix Add, Sub, Mul or Div.
 fn operand_c(buffers: &[Buffer], e: &Expr) -> String {
     let text = expr_c(buffers, e);
     if matches!(
         e,
-        Expr::Binary(BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul, _, _)
+        Expr::Binary(
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+            _,
+            _
+        )
     ) {
         format!("({text})")
     } else {
@@ -563,6 +577,68 @@ mod tests {
         );
     }
 
+    /// `Y[i] = exp(A[i]) / B[i]` over 4 elements.
+    fn exp_div() -> Kernel {
+        kernel(
+            vec![buf("A", &[4]), buf("B", &[4]), buf("Y", &[4])],
+            vec![loop_nest(
+                vec![lp("i", 4)],
+                2,
+                vec![var("i")],
+                bin(
+                    BinaryOp::Div,
+                    un(UnaryOp::Exp, load(0, vec![var("i")])),
+                    load(1, vec![var("i")]),
+                ),
+            )],
+        )
+    }
+
+    #[test]
+    fn exp_div_text_includes_math_h() {
+        assert_eq!(
+            emit_c(&exp_div()).unwrap(),
+            concat!(
+                "#include <math.h>\n",
+                "\n",
+                "void k(const float *A, const float *B, float *restrict Y) {\n",
+                "    for (long i = 0; i < 4; i++) {\n",
+                "        Y[(i)] = expf(A[(i)]) / B[(i)];\n",
+                "    }\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn math_h_only_when_expf_is_used() {
+        assert!(!emit_c(&bias_relu()).unwrap().contains("math.h"));
+        let k = kernel(
+            vec![buf("A", &[4]), buf("Y", &[4])],
+            vec![loop_nest(
+                vec![lp("i", 4)],
+                1,
+                vec![var("i")],
+                bin(
+                    BinaryOp::Div,
+                    load(0, vec![var("i")]),
+                    bin(BinaryOp::Div, load(0, vec![var("i")]), Expr::Const(2.0)),
+                ),
+            )],
+        );
+        let c = emit_c(&k).unwrap();
+        // div alone needs no header; the right operand keeps its parentheses
+        assert!(!c.contains("math.h"));
+        assert!(c.contains("Y[(i)] = A[(i)] / (A[(i)] / 2.0f);\n"), "{c}");
+    }
+
+    #[test]
+    fn expf_is_a_reserved_name() {
+        let mut k = exp_div();
+        k.buffers[1].name = "expf".to_string();
+        assert_eq!(emit_c(&k), Err(CodegenError::NameClash("expf".to_string())));
+    }
+
     #[test]
     fn constants_print_as_c_float_literals() {
         assert_eq!(expr_c(&[], &Expr::Const(0.0)), "0.0f");
@@ -700,6 +776,11 @@ mod tests {
     #[test]
     fn guarded_matmul_compiles_with_clang() {
         assert_clang_accepts("matmul_split_k", &emit_c(&matmul_split_k()).unwrap());
+    }
+
+    #[test]
+    fn exp_div_compiles_with_clang() {
+        assert_clang_accepts("exp_div", &emit_c(&exp_div()).unwrap());
     }
 
     #[test]
