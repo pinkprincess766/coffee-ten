@@ -10,8 +10,9 @@ random search.
 Pre-MVP. Python builder and reference interpreter (f32 and f64); `ct.compile` takes a
 graph through loop IR, a schedule (split, reorder, vectorize), C and clang to a kernel
 that matches the interpreter bit for bit when the schedule keeps the order of sums
-and within a derived bound otherwise. Not yet: benchmarks, the autotuner. Numbers in this
-README are a baseline, not results.
+and within a derived bound otherwise. Measured on one Apple M5 core (BENCHMARKS.md):
+vectorizing the tiled matmul takes it from about 7 to 57–60 GFLOP/s, 47–50% of the
+measured FMA peak, for N up to 256. Not yet: the autotuner.
 
 ## Quickstart
 
@@ -83,8 +84,7 @@ relu. An illegal step raises `ValueError` with the step number.
 
 `bench/run.sh` takes the numbers on an idle Mac, on AC power, from a clean commit; it
 runs `matmul` and `relu-matmul-bias` for N from 64 to 1024 and writes
-`bench/results/<date>-<commit>.jsonl`. Numbers go into BENCHMARKS.md once a run is
-measured; none exist yet.
+`bench/results/<date>-<commit>.jsonl`. The numbers so far are in BENCHMARKS.md.
 
 ## Limitations
 
@@ -142,7 +142,7 @@ and the `j` loop is vectorized (`crates/coffee-ten-loop/src/apply.rs`). Checked 
 remarks) and `crates/coffee-ten-codegen-c/tests/reorder.rs`. Speed: measured by
 `crates/coffee-ten-bench` (variants interleaved over rounds, median and IQR), one run of
 all sizes with `bench/run.sh`;
-numbers planned (an idle-machine run).
+numbers in BENCHMARKS.md.
 
 ### Legality of loop reordering — [L24]
 
@@ -171,8 +171,8 @@ the bias as the (K+1)-th term); `crates/coffee-ten-codegen-c/tests/reorder.rs`.
 
 Speed is reported as a fraction of `min(peak, AI · BW)`, with peak FLOP/s and
 memory bandwidth measured on the same machine. Code: `bench/peak/peak.c` (single-thread
-FMA peak and STREAM triad). Checked by: its `--check` mode. Numbers: planned (an
-idle-machine run).
+FMA peak and STREAM triads from memory and from L2). Checked by: its `--check` mode.
+Numbers: 122 GFLOP/s, 106 GB/s memory, 120 GB/s L2 (BENCHMARKS.md).
 
 ### Tracing frontend — [L15], [L18]
 
@@ -191,7 +191,9 @@ found by random search with 1000 measurements. Code: planned. Checked by: planne
 
 ## Baseline / Results
 
-No baseline yet.
+Pre-MVP baseline, two sessions on one Apple M5 core: see BENCHMARKS.md. Tiled +
+vectorized matmul runs at 47–50% of the measured FMA peak for N ≤ 256 and falls to
+37% at N = 512 and 20% at N = 1024; tiling alone gains at most 8%.
 
 ## Non-goals
 
