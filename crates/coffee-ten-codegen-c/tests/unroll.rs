@@ -208,8 +208,11 @@ fn clang_vectorizes_the_unrolled_tile_loop() {
         "-Rpass=loop-vectorize",
         "vectorized loop",
     );
+    // One remark per copy of `ji`: `ii` is unrolled, so there are 4 copies of the loop.
     let tile_loop = line_of(&source, "for (long ji");
-    let lines: Vec<usize> = remarks.iter().map(|(line, _)| *line).collect();
-    assert_eq!(lines, [tile_loop], "{remarks:?}\n{source}");
+    assert!(!remarks.is_empty(), "no vectorized loop:\n{source}");
+    for (line, text) in &remarks {
+        assert_eq!(*line, tile_loop, "{text}\n{source}");
+    }
     println!("clang: {}", remarks[0].1);
 }
