@@ -306,19 +306,22 @@ fn parse_header(text: &str) -> Result<(String, Vec<Buffer>), String> {
     Ok((name.to_string(), buffers))
 }
 
-/// `NAME in 0..EXTENT[ (vectorize)]:`, with `for ` already read.
+/// `NAME in 0..EXTENT[ (vectorize)| (unroll)| (vectorize, unroll)]:`, with `for ` already read.
 fn parse_loop(text: &str) -> Result<Loop, String> {
     let mut c = Cursor { rest: text };
     let name = c.ident()?;
     c.expect(" in 0..")?;
     let extent = c.unsigned()?;
-    let vectorize = c.eat(" (vectorize)");
+    let both = c.eat(" (vectorize, unroll)");
+    let vectorize = both || c.eat(" (vectorize)");
+    let unroll = both || c.eat(" (unroll)");
     c.expect(":")?;
     c.end()?;
     Ok(Loop {
         name: name.to_string(),
         extent,
         vectorize,
+        unroll,
     })
 }
 
@@ -357,6 +360,7 @@ mod tests {
             name: name.to_string(),
             extent,
             vectorize: false,
+            unroll: false,
         }
     }
 
@@ -480,6 +484,26 @@ mod tests {
         .expect("test schedule applies");
         assert!(k.to_string().contains("(vectorize)"));
         assert_round_trip(&k);
+    }
+
+    #[test]
+    fn unrolled_matmul_round_trips() {
+        let k = apply(
+            &matmul(),
+            &schedule("vectorize(1, j); unroll(1, j); unroll(1, i)"),
+        )
+        .expect("test schedule applies");
+        let text = k.to_string();
+        assert!(text.contains("for i in 0..4 (unroll):\n"));
+        assert!(text.contains("for j in 0..2 (vectorize, unroll):\n"));
+        assert_round_trip(&k);
+        let unroll_only = apply(&matmul(), &schedule("unroll(1, k)")).expect("test schedule");
+        assert!(
+            unroll_only
+                .to_string()
+                .contains("for k in 0..3 (unroll):\n")
+        );
+        assert_round_trip(&unroll_only);
     }
 
     #[test]
