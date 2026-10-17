@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use coffee_ten_codegen_c::compile;
+use coffee_ten_codegen_c::{compile, emit_c};
 use coffee_ten_interp::{Tensor, run_f32};
 use coffee_ten_ir::{BinaryOp, Graph, NodeId, ReduceOp, Shape, UnaryOp};
 use coffee_ten_loop::lower;
@@ -335,4 +335,33 @@ fn sum_of_relu_of_matmul_matches_the_interpreter_bit_for_bit() {
     let sum = g.reduce(ReduceOp::Sum, activated).unwrap();
     let result = check_against_reference("sum_relu_matmul", &g, sum, &["A", "B"]);
     assert!(result.iter().any(|&x| x > 0.0), "{result:?}");
+}
+
+#[test]
+fn rank_three_buffer_is_a_row_pointer_and_matches_the_interpreter_bit_for_bit() {
+    let mut g = Graph::new();
+    let x = g.input("X", shape(&[2, 3, 4])).unwrap();
+    let out = g.unary(UnaryOp::Relu, x).unwrap();
+    let kernel = lower(&g, out, "k").unwrap();
+    let c = emit_c(&kernel).unwrap();
+    assert!(c.contains("const float (*X)[3][4]"), "{c}");
+    assert!(c.contains("X[i0][i1][i2]"), "{c}");
+
+    // Both signs and a -0.0, so relu clips some elements and changes the sign of zero.
+    let mut x_data: Vec<f32> = (0..24).map(|n| (n as f32 - 9.0) * 0.37).collect();
+    x_data[5] = -0.0;
+    let expected = run_f32(&g, out, &[("X", &tensor(&[2, 3, 4], &x_data))]).unwrap();
+    assert!(x_data.iter().any(|&v| v < 0.0) && x_data.iter().any(|&v| v > 0.0));
+
+    let dir = TempDir::new("rank3");
+    let compiled = compile(&kernel, &dir.0).unwrap();
+    let mut got = vec![f32::NAN; 24];
+    compiled.run(&mut [&mut x_data, &mut got]).unwrap();
+    for (n, (got, want)) in got.iter().zip(expected.data()).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "out[{n}]: got {got:?}, expected {want:?}"
+        );
+    }
 }
