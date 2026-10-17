@@ -96,6 +96,9 @@ fi
 
 tiled="split(1, i, io, ii, 32); split(1, j, jo, ji, 64); reorder(1, io, jo, k, ii, ji)"
 tiled_vec="$tiled; vectorize(1, ji)"
+# 4x16 register tile of C kept in vector registers across k; nest 1 is the matmul update
+# nest in both kernels.
+regtile="split(1, i, io, ii, 4); split(1, j, jo, ji, 16); reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)"
 first=1
 for kernel in matmul relu-matmul-bias; do
   for n in $sizes; do
@@ -104,7 +107,7 @@ for kernel in matmul relu-matmul-bias; do
     fi
     first=0
     run "$bench_bin" --kernel "$kernel" --n "$n" \
-      --variant "" --variant "$tiled" --variant "$tiled_vec" \
+      --variant "" --variant "$tiled" --variant "$tiled_vec" --variant "$regtile" \
       --log "$results" ${mode[@]+"${mode[@]}"}
   done
 done
