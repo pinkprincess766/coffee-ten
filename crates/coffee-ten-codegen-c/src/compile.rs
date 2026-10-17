@@ -200,10 +200,13 @@ pub fn compile_with_flags(
     })
 }
 
-/// `void ct_entry(float *const *bufs) { name(bufs[0], bufs[1], ...); }`
+/// `void ct_entry(float *const *bufs) { name((void *)bufs[0], (void *)bufs[1], ...); }`
+///
+/// The kernel takes row pointers (`float (*Y)[d1]`) for rank >= 2 buffers; a `void *`
+/// converts to any object pointer type in C99 without a warning, so one cast serves all ranks.
 fn entry_wrapper(kernel: &Kernel) -> String {
     let args: Vec<String> = (0..kernel.buffers.len())
-        .map(|id| format!("bufs[{id}]"))
+        .map(|id| format!("(void *)bufs[{id}]"))
         .collect();
     let unused = if args.is_empty() { " (void)bufs;" } else { "" };
     format!(
@@ -632,6 +635,22 @@ mod tests {
         let dir = TempDir::new("strict");
         let flags = ["-std=c99", "-Wall", "-Wextra", "-Werror"];
         assert!(compile_with_flags(&matmul(), &dir.0, &flags).is_ok());
+    }
+
+    #[test]
+    fn row_pointer_wrapper_is_clean_under_test_flags_and_werror() {
+        // matmul has rank 2 buffers: `float (*)[3]` parameters get `void *` arguments.
+        let dir = TempDir::new("strict-test-flags");
+        let flags: Vec<&str> = TEST_FLAGS
+            .iter()
+            .copied()
+            .chain(["-Wall", "-Wextra", "-Werror"])
+            .collect();
+        let compiled = compile_with_flags(&matmul(), &dir.0, &flags).unwrap();
+        let (mut a, mut b) = matmul_inputs();
+        let mut c = vec![f32::NAN; 8];
+        compiled.run(&mut [&mut a, &mut b, &mut c]).unwrap();
+        assert!(c.iter().all(|x| x.is_finite()), "{c:?}");
     }
 
     #[test]
