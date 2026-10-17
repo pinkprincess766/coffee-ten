@@ -207,11 +207,19 @@ fn indent(level: usize) -> String {
 
 fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
     for (depth, l) in nest.loops.iter().enumerate() {
+        // A vectorized loop is unrolled by vectorizing it at a width equal to its extent (a
+        // power of two, see `apply`), so the whole loop is one vector iteration. `unroll(full)`
+        // on it would let clang unroll it completely before the loop vectorizer runs, and with
+        // `-fno-slp-vectorize` that leaves scalar code (by hand, N = 256 register tile: 19
+        // GFLOP/s, against 121 vectorized); `unroll(disable)` keeps the early unroll away.
         let hints = match (l.vectorize, l.unroll) {
             (false, false) => None,
-            (true, false) => Some("vectorize(enable)"),
-            (false, true) => Some("unroll(full)"),
-            (true, true) => Some("vectorize(enable) unroll(full)"),
+            (true, false) => Some("vectorize(enable)".to_string()),
+            (false, true) => Some("unroll(full)".to_string()),
+            (true, true) => Some(format!(
+                "vectorize(enable) vectorize_width({}) unroll(disable)",
+                l.extent
+            )),
         };
         if let Some(hints) = hints {
             out.push_str(&format!(
@@ -551,7 +559,8 @@ mod tests {
         assert_eq!(
             pragma_lines("vectorize(1, j); unroll(1, j)"),
             [(
-                "            #pragma clang loop vectorize(enable) unroll(full)".to_string(),
+                "            #pragma clang loop vectorize(enable) vectorize_width(2) unroll(disable)"
+                    .to_string(),
                 "            for (long j = 0; j < 2; j++) {".to_string()
             )]
         );

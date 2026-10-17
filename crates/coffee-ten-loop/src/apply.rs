@@ -171,7 +171,8 @@ pub fn apply_classified(
 /// - it is not a reduction loop: its name appears with a non-zero coefficient in the store
 ///   target index (vectorized reductions are out of scope);
 /// - in the target index it appears only in the last dimension, with coefficient exactly 1,
-///   so adjacent lanes write adjacent elements.
+///   so adjacent lanes write adjacent elements;
+/// - if the loop is already unrolled, its extent is a power of two (see `unroll`).
 ///
 /// Class: `Preserving`. Each lane computes and writes its own element, and the backend
 /// keeps every operation a separate rounding (`-ffp-contract=off`), so every float result is
@@ -227,6 +228,9 @@ fn vectorize(
     if coeff_in(last) != 1 || others.iter().any(|e| coeff_in(e) != 0) {
         return Err(illegal("target stride is not 1"));
     }
+    if nest.loops[pos].unroll && !nest.loops[pos].extent.is_power_of_two() {
+        return Err(illegal("unrolled and extent is not a power of two"));
+    }
     nest.loops[pos].vectorize = true;
     Ok(())
 }
@@ -237,7 +241,9 @@ pub const MAX_UNROLL_EXTENT: usize = 64;
 
 /// Marks loop `loop_name` of nest `nest_no` for the backend to unroll fully. Legal iff the
 /// loop is not unrolled yet and its extent is at most `MAX_UNROLL_EXTENT`. Any position in
-/// the nest is allowed, including the vectorized loop.
+/// the nest is allowed, including the vectorized loop if its extent is a power of two: the
+/// backend unrolls that loop by vectorizing it at a width equal to its extent, and clang
+/// ignores a width that is not a power of two.
 ///
 /// Class: `Preserving`. Unrolling does not change which operations run or their order per
 /// element, and the backend keeps every operation a separate rounding (`-ffp-contract=off`),
@@ -274,6 +280,9 @@ fn unroll(
     }
     if l.extent > MAX_UNROLL_EXTENT {
         return Err(illegal("extent is larger than 64"));
+    }
+    if l.vectorize && !l.extent.is_power_of_two() {
+        return Err(illegal("vectorized and extent is not a power of two"));
     }
     l.unroll = true;
     Ok(())
@@ -1037,6 +1046,26 @@ mod tests {
             illegal_unroll(0, 1, reason).to_string(),
             "step 0: cannot unroll in nest 1: extent is larger than 64"
         );
+    }
+
+    #[test]
+    fn an_unrolled_vectorized_loop_needs_a_power_of_two_extent() {
+        // j has extent 24 here: vectorize_width(24) would be ignored by clang.
+        let k = matmul_sized(4, 3, 24);
+        assert_refused(
+            &k,
+            &schedule("vectorize(1, j); unroll(1, j)"),
+            illegal_unroll(1, 1, "vectorized and extent is not a power of two"),
+        );
+        assert_refused(
+            &k,
+            &schedule("unroll(1, j); vectorize(1, j)"),
+            illegal_vectorize(1, 1, "unrolled and extent is not a power of two"),
+        );
+        // Each step alone is legal, and so is both at extent 32.
+        classified(&k, "vectorize(1, j)");
+        classified(&k, "unroll(1, j)");
+        classified(&matmul_sized(4, 3, 32), "vectorize(1, j); unroll(1, j)");
     }
 
     #[test]
