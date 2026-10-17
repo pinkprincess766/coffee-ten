@@ -159,6 +159,33 @@ fn promotion_remarks(name: &str, kernel: &Kernel) -> (String, Vec<(usize, String
     remarks(name, kernel, BENCH_FLAGS, "-Rpass=licm", "out of the loop")
 }
 
+/// For a failure message: `clang --version` and every LICM remark (done and missed) for the
+/// C of `kernel` under `BENCH_FLAGS`, to tell a different wording from a missed promotion.
+fn licm_diagnostics(kernel: &Kernel) -> String {
+    let version = Command::new("clang")
+        .arg("--version")
+        .output()
+        .expect("clang");
+    let (_, done) = remarks("licm-done", kernel, BENCH_FLAGS, "-Rpass=licm", "remark:");
+    let (_, missed) = remarks(
+        "licm-missed",
+        kernel,
+        BENCH_FLAGS,
+        "-Rpass-missed=licm",
+        "remark:",
+    );
+    let lines: Vec<&str> = done
+        .iter()
+        .chain(&missed)
+        .map(|(_, l)| l.as_str())
+        .collect();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&version.stdout),
+        lines.join("\n")
+    )
+}
+
 /// The 1-based line number of the only line of `source` that contains `needle`.
 fn line_of(source: &str, needle: &str) -> usize {
     let found: Vec<usize> = source
@@ -179,7 +206,11 @@ fn clang_keeps_the_c_tile_in_registers_across_k_when_the_tile_is_unrolled() {
     // the update nest is the one with `* B[`; with `ii` and `ji` unrolled its `C` index
     // depends on `io` and `jo` only, so `k` is the loop it can be promoted out of.
     let update = line_of(&source, "* B[");
-    assert!(!remarks.is_empty(), "no LICM promotion remark:\n{source}");
+    assert!(
+        !remarks.is_empty(),
+        "no LICM promotion remark:\n{source}\n{}",
+        licm_diagnostics(&kernel)
+    );
     for (line, text) in &remarks {
         assert_eq!(*line, update, "{text}\n{source}");
     }
