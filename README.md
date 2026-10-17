@@ -86,7 +86,9 @@ relu. An illegal step raises `ValueError` with the step number.
 
 `bench/run.sh` takes the numbers on an idle Mac, on AC power, from a clean commit; it
 runs `matmul` and `relu-matmul-bias` for N from 64 to 1024 and writes
-`bench/results/<date>-<commit>.jsonl`. The numbers so far are in BENCHMARKS.md.
+`bench/results/<date>-<commit>.jsonl`. Besides the naive kernel it measures the tiled
+schedule, the same vectorized, and a 4x16 register tile (`unroll` on `ii` and `ji`).
+The numbers so far are in BENCHMARKS.md.
 
 ## Limitations
 

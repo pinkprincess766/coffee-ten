@@ -873,6 +873,10 @@ mod tests {
             let Some((base, _)) = text.rsplit_once("; vectorize(") else {
                 continue;
             };
+            // Register tiles have no unvectorized twin: factors 2 and 4 are not tile factors.
+            if text.contains("unroll(") {
+                continue;
+            }
             let plain = by_text
                 .get(base)
                 .expect("the unvectorized twin is in the space");

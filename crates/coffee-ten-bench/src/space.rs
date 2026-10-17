@@ -4,6 +4,11 @@
 //! an order of the loops (all outer loops before all inner loops) and optionally
 //! `vectorize` on the innermost `j` loop. Only factors that divide the extent are used,
 //! so no candidate has a guard.
+//!
+//! After those, a few register tiles are added (`add_register_tiles`): `i` and `j` split
+//! by `ri` and `rj`, order `io, jo, k, ii, ji`, `ji` vectorized, `ii` and `ji` unrolled,
+//! so the `ri x rj` tile of C stays in vector registers across `k`. Only this one shape:
+//! no `k` split, no other orders, no other unroll choices.
 
 use crate::cli::MAX_N;
 use coffee_ten_ir::{Graph, Shape};
@@ -12,6 +17,15 @@ use std::fmt::Write as _;
 
 /// Tile factors tried per loop; a loop can also stay unsplit.
 pub const TILE_FACTORS: [usize; 5] = [8, 16, 32, 64, 128];
+/// Register tile heights (`ii`) and widths (`ji`) tried, see `add_register_tiles`.
+const REG_TILE_I: [usize; 3] = [2, 4, 8];
+const REG_TILE_J: [usize; 3] = [8, 16, 32];
+/// f32 lanes of one NEON vector register; a register tile row is `rj / LANES` vectors.
+const LANES: usize = 4;
+/// Most vector accumulators (`ri * rj / LANES`) a register tile may need. ASSUMED, not
+/// measured: NEON has 32 vector registers; 8 are left for the B vectors and the A
+/// broadcast of the current `k`.
+const MAX_ACCUMULATORS: usize = 24;
 /// The matmul update nest; nest 0 is the init nest.
 const UPDATE_NEST: usize = 1;
 /// How many schedule texts `summary` lists.
@@ -107,7 +121,56 @@ pub fn enumerate_matmul(m: usize, k: usize, n: usize) -> Space {
             }
         }
     }
+    add_register_tiles(&naive, m, n, &mut space);
     space
+}
+
+/// Adds, for each `ri` of `REG_TILE_I` and `rj` of `REG_TILE_J` that divide `m` and `n`
+/// (`rj` a multiple of `LANES`) and need at most `MAX_ACCUMULATORS` accumulators, the
+/// schedule `split i by ri; split j by rj; reorder io, jo, k, ii, ji; vectorize ji;
+/// unroll ii; unroll ji`. The text has `unroll`, which the tile enumeration never writes,
+/// so none of these is also listed there.
+fn add_register_tiles(naive: &Kernel, m: usize, n: usize, space: &mut Space) {
+    let step_split = |axis: &Axis, factor| Step::Split {
+        nest: UPDATE_NEST,
+        loop_name: axis.name.to_string(),
+        outer: axis.outer.to_string(),
+        inner: axis.inner.to_string(),
+        factor,
+    };
+    for ri in REG_TILE_I {
+        for rj in REG_TILE_J {
+            let fits = m.is_multiple_of(ri)
+                && n.is_multiple_of(rj)
+                && rj.is_multiple_of(LANES)
+                && ri * rj / LANES <= MAX_ACCUMULATORS;
+            if !fits {
+                continue;
+            }
+            let order = ["io", "jo", "k", "ii", "ji"];
+            let steps = [
+                step_split(&AXES[0], ri),
+                step_split(&AXES[1], rj),
+                Step::Reorder {
+                    nest: UPDATE_NEST,
+                    order: order.iter().map(|name| name.to_string()).collect(),
+                },
+                Step::Vectorize {
+                    nest: UPDATE_NEST,
+                    loop_name: "ji".to_string(),
+                },
+                Step::Unroll {
+                    nest: UPDATE_NEST,
+                    loop_name: "ii".to_string(),
+                },
+                Step::Unroll {
+                    nest: UPDATE_NEST,
+                    loop_name: "ji".to_string(),
+                },
+            ];
+            try_add(naive, &steps, space);
+        }
+    }
 }
 
 /// Adds the candidates whose loops are split by `tiles` (in `AXES` order).
@@ -321,17 +384,22 @@ mod tests {
     ///   6 * 2 = 12: 36 + 12 = 48.
     ///
     /// Sum: 8 + 24 + 48 + 48 = 128.
+    ///
+    /// Register tiles: `ri` in {2, 4, 8} all divide 16, `rj` in {8, 16, 32} gives 8 and 16
+    /// (32 does not divide 16). Accumulators `ri * rj / 4`: (2,8) 4, (2,16) 8, (4,8) 8,
+    /// (4,16) 16, (8,8) 16, (8,16) 32 > 24. So 5 register tiles: 128 + 5 = 133.
     #[test]
-    fn size_16_has_128_candidates() {
+    fn size_16_has_133_candidates() {
         let space = enumerate_matmul(16, 16, 16);
-        assert_eq!(space.candidates.len(), 128);
+        assert_eq!(space.candidates.len(), 133);
         assert_eq!(space.dropped, 0);
     }
 
     #[test]
     fn a_size_without_tile_factors_has_only_orders_and_vectorize() {
-        // 6 orders of i, j, k, plus vectorize for the 2 with `j` last.
-        assert_eq!(matmul_space(8, 8, 8).len(), 8);
+        // 6 orders of i, j, k, plus vectorize for the 2 with `j` last: 8. Register tiles:
+        // ri in {2, 4, 8} divide 8, rj = 8 only; accumulators 4, 8, 16 <= 24: 3 more.
+        assert_eq!(matmul_space(8, 8, 8).len(), 8 + 3);
         assert!(matmul_space(0, 8, 8).is_empty());
     }
 
@@ -347,6 +415,70 @@ mod tests {
             assert_eq!(found.len(), 1, "{text}");
             assert_eq!(found[0].class, OrderClass::Preserving, "{text}");
         }
+    }
+
+    #[test]
+    fn the_4x16_register_tile_of_bench_run_sh_is_in_the_size_256_space() {
+        let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); reorder(1, io, jo, k, ii, ji)";
+        let text = format!("{tile}; vectorize(1, ji); unroll(1, ii); unroll(1, ji)");
+        assert_eq!(Schedule::parse(&text).expect("parses").to_string(), text);
+        let space = matmul_space(256, 256, 256);
+        let found: Vec<&Candidate> = space.iter().filter(|c| c.schedule == text).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].class, OrderClass::Preserving);
+    }
+
+    /// The register tiles of a space are its candidates with an `unroll`. Per shape, the
+    /// pairs (ri, rj) with ri | m, rj | n and ri * rj / 4 <= 24:
+    /// - 256 and 64: every ri, rj divides. Accumulators: (2,8) 4, (2,16) 8, (2,32) 16,
+    ///   (4,8) 8, (4,16) 16, (4,32) 32, (8,8) 16, (8,16) 32, (8,32) 64: 6 are <= 24.
+    /// - 16x16x16: 5 (see `size_16_has_133_candidates`). 8x8x8: 3.
+    /// - m = 48, n = 24: ri in {2, 4, 8} divide 48; rj = 8 only (24 % 16 != 0): 3.
+    /// - m = 8, n = 130: 130 % 8 != 0, so no rj: 0.
+    #[test]
+    fn register_tiles_are_counted_by_hand() {
+        let count = |m, k, n| {
+            matmul_space(m, k, n)
+                .iter()
+                .filter(|c| c.schedule.contains("unroll("))
+                .count()
+        };
+        assert_eq!(count(256, 256, 256), 6);
+        assert_eq!(count(64, 64, 64), 6);
+        assert_eq!(count(16, 16, 16), 5);
+        assert_eq!(count(8, 8, 8), 3);
+        assert_eq!(count(48, 40, 24), 3);
+        assert_eq!(count(8, 9, 130), 0);
+    }
+
+    #[test]
+    fn no_candidate_has_more_than_24_accumulators() {
+        let mut tiles = 0;
+        for (m, k, n) in SHAPES {
+            for candidate in matmul_space(m, k, n) {
+                let steps = steps_of(&candidate.schedule);
+                if !steps.iter().any(|s| matches!(s, Step::Unroll { .. })) {
+                    continue;
+                }
+                let factor_of = |axis: &str| {
+                    steps.iter().find_map(|step| match step {
+                        Step::Split {
+                            loop_name, factor, ..
+                        } if loop_name == axis => Some(*factor),
+                        _ => None,
+                    })
+                };
+                let (ri, rj) = (
+                    factor_of("i").expect("split i"),
+                    factor_of("j").expect("split j"),
+                );
+                assert!(rj % 4 == 0, "{}", candidate.schedule);
+                assert!(ri * rj / 4 <= 24, "{}: {ri}x{rj}", candidate.schedule);
+                tiles += 1;
+            }
+        }
+        // 5 + 6 + 6 + 3 + 0 tiles over SHAPES, so the loop above did run.
+        assert_eq!(tiles, 20);
     }
 
     #[test]
@@ -406,10 +538,10 @@ mod tests {
         let space = enumerate_matmul(16, 16, 16);
         let text = summary(16, &space);
         assert!(
-            text.contains("candidates 128  (dropped as illegal: 0)"),
+            text.contains("candidates 133  (dropped as illegal: 0)"),
             "{text}"
         );
-        assert!(text.contains("preserving 128"), "{text}");
+        assert!(text.contains("preserving 133"), "{text}");
         assert!(text.contains("reordering 0"), "{text}");
         assert_eq!(text.matches("reorder(1,").count(), SHOWN, "{text}");
     }

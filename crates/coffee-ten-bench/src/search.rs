@@ -275,7 +275,7 @@ mod tests {
         let space = matmul_space(16, 16, 16);
         let all: HashSet<String> = texts(&space).into_iter().collect();
         for seed in 1..=5 {
-            // 100 of 128: sampling with replacement repeats a candidate almost surely.
+            // 100 of 133: sampling with replacement repeats a candidate almost surely.
             let picked = texts(&sample(space.clone(), 100, seed));
             let distinct: HashSet<String> = picked.iter().cloned().collect();
             assert_eq!(picked.len(), 100);
@@ -296,7 +296,7 @@ mod tests {
     fn a_budget_of_the_space_size_or_more_is_the_whole_space_shuffled() {
         let space = matmul_space(16, 16, 16);
         let size = space.len();
-        assert_eq!(size, 128);
+        assert_eq!(size, 133);
         let mut sorted_space = texts(&space);
         sorted_space.sort();
         for budget in [size, size + 1] {
@@ -422,7 +422,7 @@ mod tests {
         let log_text = fs::read_to_string(&path).unwrap();
         fs::remove_file(&path).unwrap();
 
-        assert_eq!(result.space_size, 128);
+        assert_eq!(result.space_size, 133);
         assert_eq!(result.naive.schedule, "");
         assert_eq!(result.records.len(), 3);
         for record in std::iter::once(&result.naive).chain(&result.records) {
