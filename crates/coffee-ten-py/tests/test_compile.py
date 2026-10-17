@@ -87,6 +87,7 @@ def test_split_of_an_elementwise_kernel_is_bit_exact(tmp_path):
         ("split(1, k, ko, ki, 2)", (4, 3, 2)),  # 3 is not a multiple of 2
         ("reorder(1, i, j, k)", (4, 3, 2)),
         ("vectorize(1, j)", (4, 5, 32)),
+        ("split(1, j, jo, ji, 4); vectorize(1, ji); unroll(1, ji)", (4, 5, 32)),
     ],
 )
 def test_order_preserving_schedules_are_bit_exact(tmp_path, schedule, shape):

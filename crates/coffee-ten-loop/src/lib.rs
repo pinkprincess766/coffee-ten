@@ -14,11 +14,13 @@ use std::fmt;
 
 /// `for name in 0..extent`, step 1. A `vectorize` loop asks the backend to vectorize it;
 /// per nest at most one loop has it and it is the innermost (see `Kernel::validate`).
+/// An `unroll` loop asks the backend to unroll it fully; any loop may have it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loop {
     pub name: String,
     pub extent: usize,
     pub vectorize: bool,
+    pub unroll: bool,
 }
 
 /// Row-major f32 buffer.
@@ -465,7 +467,12 @@ impl fmt::Display for Kernel {
 
 fn write_nest(f: &mut fmt::Formatter<'_>, buffers: &[Buffer], nest: &LoopNest) -> fmt::Result {
     for (depth, l) in nest.loops.iter().enumerate() {
-        let mark = if l.vectorize { " (vectorize)" } else { "" };
+        let mark = match (l.vectorize, l.unroll) {
+            (false, false) => "",
+            (true, false) => " (vectorize)",
+            (false, true) => " (unroll)",
+            (true, true) => " (vectorize, unroll)",
+        };
         writeln!(
             f,
             "{}for {} in 0..{}{mark}:",
@@ -555,6 +562,7 @@ mod tests {
             name: name.to_string(),
             extent,
             vectorize: false,
+            unroll: false,
         }
     }
 
@@ -662,6 +670,18 @@ mod tests {
         k.nests[1].loops[2].vectorize = true;
         assert!(k.to_string().contains("    for j in 0..2 (vectorize):\n"));
         assert_eq!(k.to_string().matches("(vectorize)").count(), 1);
+        assert_eq!(k.validate(), Ok(()));
+    }
+
+    #[test]
+    fn unrolled_loops_print_and_validate_at_any_position() {
+        let mut k = matmul();
+        k.nests[1].loops[0].unroll = true;
+        k.nests[1].loops[2].unroll = true;
+        k.nests[1].loops[2].vectorize = true;
+        let text = k.to_string();
+        assert!(text.contains("\nfor i in 0..4 (unroll):\n"));
+        assert!(text.contains("    for j in 0..2 (vectorize, unroll):\n"));
         assert_eq!(k.validate(), Ok(()));
     }
 

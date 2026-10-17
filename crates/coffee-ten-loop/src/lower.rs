@@ -389,6 +389,7 @@ fn elementwise_nest(
             name: loop_name.clone(),
             extent,
             vectorize: false,
+            unroll: false,
         })
         .collect();
     let target = Access {
@@ -417,6 +418,7 @@ fn matmul_nests(
         name: name.to_string(),
         extent,
         vectorize: false,
+        unroll: false,
     };
     let at = |buffer, names: [&str; 2]| Access {
         buffer,
@@ -468,6 +470,7 @@ fn reduce_nests(op: ReduceOp, x_dims: &[usize], buffer_x: usize, target: usize) 
         name,
         extent,
         vectorize: false,
+        unroll: false,
     };
     let leading_loops: Vec<Loop> = leading
         .iter()
