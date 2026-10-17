@@ -1,6 +1,7 @@
 /*
- * peak: single-thread f32 peak FLOP/s (FMA loop), single-thread memory
- * bandwidth and L2 bandwidth (STREAM triad). See README.md.
+ * peak: single-thread f32 peak FLOP/s (FMA loop), FMA rate with the accumulator
+ * in memory, single-thread memory bandwidth and L2 bandwidth (STREAM triad).
+ * See README.md.
  *
  * Build (from the repo root):
  *   clang -std=c99 -O2 -ffp-contract=fast -o peak bench/peak/peak.c
@@ -39,6 +40,15 @@ typedef float v4f __attribute__((vector_size(16)));
  * 128 KiB and L2 is 16 MiB per P-cluster on Apple M-series.
  */
 #define TRIAD_L2_N (1 << 18)
+
+/*
+ * Accumulator in memory: c[j] = fma(a, b[j], c[j]) on two 4 KiB arrays, assumed
+ * L1-resident (L1D 128 KiB, assumed). 1024 floats is 256 float32x4 vectors, more
+ * than the 32 vector registers, so c cannot stay in registers across passes.
+ */
+#define MEM_ACC_N 1024
+/* Passes between clock reads; a sample repeats batches until it has run MIN_SAMPLE_NS. */
+#define MEM_ACC_BATCH 1024
 
 #define SAMPLES 30
 #define QUICK_SAMPLES 3
@@ -100,8 +110,25 @@ __attribute__((noinline)) static void triad(float *restrict x, const float *rest
     }
 }
 
+/*
+ * One pass of the accumulator-in-memory kernel. Each float32x4 of c is loaded,
+ * updated and stored once per pass, as the matmul schedules do when C[i, j] is
+ * not in registers. noinline: c is written back to memory before the next pass.
+ */
+__attribute__((noinline)) static void fma_mem_acc_pass(float a, const v4f *restrict b,
+                                                       v4f *restrict c) {
+    v4f va = {a, a, a, a};
+    for (long j = 0; j < MEM_ACC_N / 4; j++) {
+        c[j] = __builtin_elementwise_fma(va, b[j], c[j]);
+    }
+}
+
 static double fma_flop_per_call(void) {
     return 2.0 * 4 * FMA_CHAINS * (double)FMA_ITERS;
+}
+
+static double fma_mem_acc_flop_per_pass(void) {
+    return 2.0 * MEM_ACC_N;
 }
 
 static double triad_bytes_per_call(long n) {
@@ -123,6 +150,22 @@ static double fma_sample(float a, float b) {
         t1 = now_ns();
     } while (t1 - t0 < MIN_SAMPLE_NS);
     return (double)calls * fma_flop_per_call() / (double)(t1 - t0);
+}
+
+/* Returns GFLOP/s (FLOP per ns). */
+static double fma_mem_acc_sample(float a, const v4f *b, v4f *c) {
+    long long t0 = now_ns();
+    long long t1;
+    long passes = 0;
+    do {
+        for (int p = 0; p < MEM_ACC_BATCH; p++) {
+            fma_mem_acc_pass(a, b, c);
+        }
+        passes += MEM_ACC_BATCH;
+        t1 = now_ns();
+    } while (t1 - t0 < MIN_SAMPLE_NS);
+    g_sink += c[0][0];
+    return (double)passes * fma_mem_acc_flop_per_pass() / (double)(t1 - t0);
 }
 
 /* Returns GB/s (1e9 bytes per second, i.e. bytes per ns). */
@@ -212,6 +255,27 @@ static int run_check(float a, float b) {
     free(x);
     free(y);
     free(z);
+
+    /* Accumulator in memory: c[j] = j, then 1000 passes with a = 1, b[j] = 0.5. */
+    v4f mem_b[MEM_ACC_N / 4];
+    v4f mem_c[MEM_ACC_N / 4];
+    for (int j = 0; j < MEM_ACC_N / 4; j++) {
+        mem_b[j] = (v4f){0.5f, 0.5f, 0.5f, 0.5f};
+    }
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        mem_c[j / 4][j % 4] = (float)j;
+    }
+    for (int p = 0; p < 1000; p++) {
+        fma_mem_acc_pass(1.0f, mem_b, mem_c);
+    }
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        float want = (float)j + 500.0f;
+        if (mem_c[j / 4][j % 4] != want) {
+            printf("check FAILED: mem_acc j=%d: got %.9g, want %.9g\n", j,
+                   (double)mem_c[j / 4][j % 4], (double)want);
+            return 1;
+        }
+    }
     printf("check ok\n");
     return 0;
 }
@@ -219,6 +283,23 @@ static int run_check(float a, float b) {
 static double g_fma_rate[SAMPLES];
 static double g_triad_rate[SAMPLES];
 static double g_triad_l2_rate[SAMPLES];
+static double g_mem_acc_rate[SAMPLES];
+
+/* Fills rate[0..samples-1] with accumulator-in-memory GFLOP/s; a from fma_operands, b[j] = 0.5. */
+static void run_mem_acc(float a, int samples, int warmup, double *rate) {
+    v4f b[MEM_ACC_N / 4];
+    v4f c[MEM_ACC_N / 4];
+    for (int j = 0; j < MEM_ACC_N / 4; j++) {
+        b[j] = (v4f){0.5f, 0.5f, 0.5f, 0.5f};
+        c[j] = (v4f){0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = fma_mem_acc_sample(a, b, c);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+}
 
 /* Fills rate[0..samples-1] with triad GB/s over n floats. Returns 1 on malloc failure. */
 static int run_triad(long n, int samples, int warmup, double *rate) {
@@ -284,6 +365,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    run_mem_acc(a, samples, warmup, g_mem_acc_rate);
     if (run_triad(TRIAD_N, samples, warmup, g_triad_rate) != 0) {
         return 1;
     }
@@ -292,10 +374,12 @@ int main(int argc, char **argv) {
     }
 
     stats_t fma = summarize(g_fma_rate, samples);
+    stats_t mem_acc = summarize(g_mem_acc_rate, samples);
     stats_t triad_st = summarize(g_triad_rate, samples);
     stats_t triad_l2_st = summarize(g_triad_l2_rate, samples);
 
     print_stats("fma", "GFLOP/s", fma, samples);
+    print_stats("mem_acc", "GFLOP/s", mem_acc, samples);
     print_stats("triad", "GB/s", triad_st, samples);
     print_stats("triad_l2", "GB/s", triad_l2_st, samples);
     printf("checksum %g\n", g_sink);
@@ -303,11 +387,15 @@ int main(int argc, char **argv) {
            "\"triad_gbs\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"fma_chains\":%d,\"triad_n\":%d,"
            "\"triad_l2_gbs\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
-           "\"triad_l2_n\":%d}\n",
+           "\"triad_l2_n\":%d,"
+           "\"fma_mem_acc_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
+           "\"mem_acc_n\":%d}\n",
            fma.median, fma.p25, fma.p75, fma.min, samples,
            triad_st.median, triad_st.p25, triad_st.p75, triad_st.min, samples,
            FMA_CHAINS, TRIAD_N,
            triad_l2_st.median, triad_l2_st.p25, triad_l2_st.p75, triad_l2_st.min, samples,
-           TRIAD_L2_N);
+           TRIAD_L2_N,
+           mem_acc.median, mem_acc.p25, mem_acc.p75, mem_acc.min, samples,
+           MEM_ACC_N);
     return 0;
 }
