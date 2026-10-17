@@ -107,18 +107,20 @@ fn register_tiled_matmul_equals_the_interpreter_bit_for_bit() {
     }
 }
 
-/// Runs clang on the C of `kernel` with `flags` and `-Rpass=licm`; returns the source and
-/// the stderr lines of the scalar-promotion remark, each with the source line it points at.
+/// Runs clang on the C of `kernel` with `flags` and `rpass`; returns the source and the
+/// stderr remark lines that contain `needle`, each with the source line it points at.
 ///
 /// clang prints `<path>:<line>:<col>: remark: Moving accesses to memory location out of
 /// the loop [-Rpass=licm]` when LICM keeps a memory location in a register for a whole
 /// loop (loads before it, stores after it). The text comes from LLVM's LICM pass; another
 /// clang version (CI runs ubuntu clang) may word it a little differently, so only the part
 /// `out of the loop` is matched. The other LICM remarks say `hoisting` or `sinking`.
-fn promotion_remarks(
+fn remarks(
     name: &str,
     kernel: &Kernel,
     flags: &[&str],
+    rpass: &str,
+    needle: &str,
 ) -> (String, Vec<(usize, String)>) {
     let source = emit_c(kernel).unwrap();
     let dir = TempDir::new(name);
@@ -127,7 +129,7 @@ fn promotion_remarks(
     std::fs::write(&c_path, &source).expect("write C source");
     let output = Command::new("clang")
         .args(flags)
-        .args(["-Rpass=licm", "-c", "-o"])
+        .args([rpass, "-c", "-o"])
         .arg(&o_path)
         .arg(&c_path)
         .output()
@@ -136,7 +138,7 @@ fn promotion_remarks(
     assert!(output.status.success(), "clang failed:\n{stderr}");
     let remarks = stderr
         .lines()
-        .filter(|line| line.contains("remark:") && line.contains("out of the loop"))
+        .filter(|line| line.contains("remark:") && line.contains(needle))
         .map(|line| {
             // `<path>:<line>:<column>: remark: ...`
             let location = line
@@ -150,6 +152,11 @@ fn promotion_remarks(
         })
         .collect();
     (source, remarks)
+}
+
+/// LICM scalar-promotion remarks for the C of `kernel` under `BENCH_FLAGS`.
+fn promotion_remarks(name: &str, kernel: &Kernel) -> (String, Vec<(usize, String)>) {
+    remarks(name, kernel, BENCH_FLAGS, "-Rpass=licm", "out of the loop")
 }
 
 /// The 1-based line number of the only line of `source` that contains `needle`.
@@ -167,7 +174,7 @@ fn line_of(source: &str, needle: &str) -> usize {
 #[test]
 fn clang_keeps_the_c_tile_in_registers_across_k_when_the_tile_is_unrolled() {
     let (kernel, _) = scheduled(TILE_UNROLLED);
-    let (source, remarks) = promotion_remarks("licm-unrolled", &kernel, BENCH_FLAGS);
+    let (source, remarks) = promotion_remarks("licm-unrolled", &kernel);
     // The remark points at an access, not at a loop. The only line that accesses `C` in
     // the update nest is the one with `* B[`; with `ii` and `ji` unrolled its `C` index
     // depends on `io` and `jo` only, so `k` is the loop it can be promoted out of.
@@ -183,6 +190,26 @@ fn clang_keeps_the_c_tile_in_registers_across_k_when_the_tile_is_unrolled() {
 fn clang_promotes_nothing_without_the_unroll_steps() {
     // The same loop nest and vectorize, only without the two unroll requests.
     let (kernel, _) = scheduled(TILE);
-    let (source, remarks) = promotion_remarks("licm-rolled", &kernel, BENCH_FLAGS);
+    let (source, remarks) = promotion_remarks("licm-rolled", &kernel);
     assert_eq!(remarks, [], "{source}");
+}
+
+#[test]
+fn clang_vectorizes_the_unrolled_tile_loop() {
+    // Promotion alone is not enough: with `-fno-slp-vectorize` (`BENCH_FLAGS`) clang can
+    // unroll the 16-iteration `ji` loop completely before the loop vectorizer runs, which
+    // leaves 64 scalar FMAs (measured by hand at N = 256: 19 GFLOP/s, against 121 for the
+    // vectorized tile).
+    let (kernel, _) = scheduled(TILE_UNROLLED);
+    let (source, remarks) = remarks(
+        "vectorize-unrolled",
+        &kernel,
+        BENCH_FLAGS,
+        "-Rpass=loop-vectorize",
+        "vectorized loop",
+    );
+    let tile_loop = line_of(&source, "for (long ji");
+    let lines: Vec<usize> = remarks.iter().map(|(line, _)| *line).collect();
+    assert_eq!(lines, [tile_loop], "{remarks:?}\n{source}");
+    println!("clang: {}", remarks[0].1);
 }
