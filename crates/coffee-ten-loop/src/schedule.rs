@@ -22,6 +22,11 @@ pub enum Step {
         nest: usize,
         loop_name: String,
     },
+    /// Ask the backend to unroll loop `loop_name` of nest `nest` fully.
+    Unroll {
+        nest: usize,
+        loop_name: String,
+    },
 }
 
 /// Steps in the order they are applied.
@@ -85,6 +90,7 @@ fn write_step(f: &mut fmt::Formatter<'_>, step: &Step) -> fmt::Result {
         } => write!(f, "split({nest}, {loop_name}, {outer}, {inner}, {factor})"),
         Step::Reorder { nest, order } => write!(f, "reorder({nest}, {})", order.join(", ")),
         Step::Vectorize { nest, loop_name } => write!(f, "vectorize({nest}, {loop_name})"),
+        Step::Unroll { nest, loop_name } => write!(f, "unroll({nest}, {loop_name})"),
     }
 }
 
@@ -191,6 +197,7 @@ impl Parser<'_> {
             "split" => self.split(),
             "reorder" => self.reorder(),
             "vectorize" => self.vectorize(),
+            "unroll" => self.unroll(),
             _ => Err(error_at(start, "unknown step")),
         }
     }
@@ -242,6 +249,15 @@ impl Parser<'_> {
         self.expect(b')')?;
         Ok(Step::Vectorize { nest, loop_name })
     }
+
+    fn unroll(&mut self) -> Result<Step, ScheduleParseError> {
+        self.expect(b'(')?;
+        let nest = self.number()?;
+        self.expect(b',')?;
+        let loop_name = self.loop_name(&[])?;
+        self.expect(b')')?;
+        Ok(Step::Unroll { nest, loop_name })
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +297,20 @@ mod tests {
         let s = Schedule::parse(EXAMPLE).expect("example is valid");
         assert_eq!(s, example());
         assert_eq!(s.to_string(), EXAMPLE);
+    }
+
+    #[test]
+    fn unroll_parses_and_prints_back() {
+        let s = Schedule::parse("unroll( 1,ii )").expect("valid");
+        assert_eq!(
+            s.steps,
+            [Step::Unroll {
+                nest: 1,
+                loop_name: "ii".to_string()
+            }]
+        );
+        assert_eq!(s.to_string(), "unroll(1, ii)");
+        assert_eq!(Schedule::parse(&s.to_string()), Ok(s));
     }
 
     #[test]

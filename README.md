@@ -68,6 +68,8 @@ name.
   list every loop once.
 - `vectorize(nest, loop)`: `loop` must be the innermost loop, not a reduction loop, and
   have stride 1 in the output.
+- `unroll(nest, loop)`: any loop, also the vectorized one, if its extent is at most 64 and
+  it is not unrolled yet. Like `vectorize` it is a request to clang (`unroll(full)`).
 
 Nests are numbered from 0 in `ct.loop_ir` order. In the example, nest 0 zero-fills the
 matmul result, nest 1 is the `i, k, j` update that `split` targets, and nest 2 is the

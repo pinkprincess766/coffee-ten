@@ -51,6 +51,12 @@ pub enum ScheduleError {
         nest: usize,
         reason: &'static str,
     },
+    /// Loop `loop_name` of the nest cannot be unrolled, for `reason` (see `unroll`).
+    IllegalUnroll {
+        step: usize,
+        nest: usize,
+        reason: &'static str,
+    },
     /// The result failed `Kernel::validate`; this is a bug in `apply` or the input kernel.
     Invalid(LoopIrError),
 }
@@ -88,6 +94,9 @@ impl fmt::Display for ScheduleError {
             }
             Self::IllegalVectorize { step, nest, reason } => {
                 write!(f, "step {step}: cannot vectorize in nest {nest}: {reason}")
+            }
+            Self::IllegalUnroll { step, nest, reason } => {
+                write!(f, "step {step}: cannot unroll in nest {nest}: {reason}")
             }
             Self::Invalid(e) => write!(f, "schedule produced an invalid kernel: {e}"),
         }
@@ -148,6 +157,9 @@ pub fn apply_classified(
             Step::Vectorize { nest, loop_name } => {
                 vectorize(&mut result, step_no, *nest, loop_name)?;
             }
+            Step::Unroll { nest, loop_name } => {
+                unroll(&mut result, step_no, *nest, loop_name)?;
+            }
         }
     }
     result.validate().map_err(ScheduleError::Invalid)?;
@@ -159,7 +171,8 @@ pub fn apply_classified(
 /// - it is not a reduction loop: its name appears with a non-zero coefficient in the store
 ///   target index (vectorized reductions are out of scope);
 /// - in the target index it appears only in the last dimension, with coefficient exactly 1,
-///   so adjacent lanes write adjacent elements.
+///   so adjacent lanes write adjacent elements;
+/// - if the loop is already unrolled, its extent is a power of two (see `unroll`).
 ///
 /// Class: `Preserving`. Each lane computes and writes its own element, and the backend
 /// keeps every operation a separate rounding (`-ffp-contract=off`), so every float result is
@@ -215,7 +228,63 @@ fn vectorize(
     if coeff_in(last) != 1 || others.iter().any(|e| coeff_in(e) != 0) {
         return Err(illegal("target stride is not 1"));
     }
+    if nest.loops[pos].unroll && !nest.loops[pos].extent.is_power_of_two() {
+        return Err(illegal("unrolled and extent is not a power of two"));
+    }
     nest.loops[pos].vectorize = true;
+    Ok(())
+}
+
+/// Largest extent `unroll` accepts. Fully unrolling a larger loop only grows the code; 64
+/// is enough for a 4x16 register tile. The limit is a code-size choice, not correctness.
+pub const MAX_UNROLL_EXTENT: usize = 64;
+
+/// Marks loop `loop_name` of nest `nest_no` for the backend to unroll fully. Legal iff the
+/// loop is not unrolled yet and its extent is at most `MAX_UNROLL_EXTENT`. Any position in
+/// the nest is allowed, including the vectorized loop if its extent is a power of two: the
+/// backend unrolls that loop by vectorizing it at a width equal to its extent, and clang
+/// ignores a width that is not a power of two.
+///
+/// Class: `Preserving`. Unrolling does not change which operations run or their order per
+/// element, and the backend keeps every operation a separate rounding (`-ffp-contract=off`),
+/// so every float result is bit for bit the same. The mark is a request to the backend.
+fn unroll(
+    kernel: &mut Kernel,
+    step: usize,
+    nest_no: usize,
+    loop_name: &str,
+) -> Result<(), ScheduleError> {
+    let nest = kernel
+        .nests
+        .get_mut(nest_no)
+        .ok_or(ScheduleError::NoSuchNest {
+            step,
+            nest: nest_no,
+        })?;
+    let l = nest
+        .loops
+        .iter_mut()
+        .find(|l| l.name == loop_name)
+        .ok_or_else(|| ScheduleError::NoSuchLoop {
+            step,
+            nest: nest_no,
+            loop_name: loop_name.to_string(),
+        })?;
+    let illegal = |reason| ScheduleError::IllegalUnroll {
+        step,
+        nest: nest_no,
+        reason,
+    };
+    if l.unroll {
+        return Err(illegal("already unrolled"));
+    }
+    if l.extent > MAX_UNROLL_EXTENT {
+        return Err(illegal("extent is larger than 64"));
+    }
+    if l.vectorize && !l.extent.is_power_of_two() {
+        return Err(illegal("vectorized and extent is not a power of two"));
+    }
+    l.unroll = true;
     Ok(())
 }
 
@@ -447,16 +516,20 @@ fn split(
         });
     }
     // A vectorized loop stays vectorized as `inner`, which is then the innermost loop.
+    // An unrolled loop is not unrolled after the split: `factor` may exceed the extent
+    // limit of `unroll`, so the new loops are unrolled by their own steps.
     let new_loops = [
         Loop {
             name: outer.to_string(),
             extent: extent.div_ceil(factor),
             vectorize: false,
+            unroll: false,
         },
         Loop {
             name: inner.to_string(),
             extent: factor,
             vectorize: nest.loops[pos].vectorize,
+            unroll: false,
         },
     ];
     nest.loops.splice(pos..=pos, new_loops);
@@ -531,6 +604,7 @@ mod tests {
             name: name.to_string(),
             extent,
             vectorize: false,
+            unroll: false,
         }
     }
 
@@ -921,6 +995,114 @@ mod tests {
                 loop_name: "x".to_string(),
             },
         );
+    }
+
+    fn illegal_unroll(step: usize, nest: usize, reason: &'static str) -> ScheduleError {
+        ScheduleError::IllegalUnroll { step, nest, reason }
+    }
+
+    #[test]
+    fn unroll_marks_any_loop_including_the_vectorized_one() {
+        let k = matmul();
+        let (s, class) = classified(&k, "unroll(1, k)");
+        assert_eq!(
+            nest_text(&s, 1),
+            concat!(
+                "for i in 0..4:\n",
+                "  for k in 0..3 (unroll):\n",
+                "    for j in 0..2:\n",
+                "      C[i, j] = C[i, j] + (A[i, k] * B[k, j])\n",
+            )
+        );
+        assert_eq!(s.nests[0], k.nests[0]);
+        assert_eq!(s.validate(), Ok(()));
+        assert_eq!(class, OrderClass::Preserving);
+        let (s, class) = classified(&k, "unroll(1, i); vectorize(1, j); unroll(1, j)");
+        let marks: Vec<_> = s.nests[1]
+            .loops
+            .iter()
+            .map(|l| (l.vectorize, l.unroll))
+            .collect();
+        assert_eq!(marks, [(false, true), (false, false), (true, true)]);
+        assert_eq!(class, OrderClass::Preserving);
+        // The order of the steps does not matter.
+        let (other, _) = classified(&k, "unroll(1, j); vectorize(1, j); unroll(1, i)");
+        assert_eq!(other, s);
+    }
+
+    #[test]
+    fn unrolling_a_loop_longer_than_the_limit_is_refused() {
+        let reason = "extent is larger than 64";
+        assert_eq!(MAX_UNROLL_EXTENT, 64);
+        // 64 is the largest legal extent, 65 is refused.
+        let (s, _) = classified(&matmul_sized(64, 3, 2), "unroll(1, i)");
+        assert!(s.nests[1].loops[0].unroll);
+        assert_refused(
+            &matmul_sized(65, 3, 2),
+            &schedule("unroll(1, i)"),
+            illegal_unroll(0, 1, reason),
+        );
+        assert_eq!(
+            illegal_unroll(0, 1, reason).to_string(),
+            "step 0: cannot unroll in nest 1: extent is larger than 64"
+        );
+    }
+
+    #[test]
+    fn an_unrolled_vectorized_loop_needs_a_power_of_two_extent() {
+        // j has extent 24 here: vectorize_width(24) would be ignored by clang.
+        let k = matmul_sized(4, 3, 24);
+        assert_refused(
+            &k,
+            &schedule("vectorize(1, j); unroll(1, j)"),
+            illegal_unroll(1, 1, "vectorized and extent is not a power of two"),
+        );
+        assert_refused(
+            &k,
+            &schedule("unroll(1, j); vectorize(1, j)"),
+            illegal_vectorize(1, 1, "unrolled and extent is not a power of two"),
+        );
+        // Each step alone is legal, and so is both at extent 32.
+        classified(&k, "vectorize(1, j)");
+        classified(&k, "unroll(1, j)");
+        classified(&matmul_sized(4, 3, 32), "vectorize(1, j); unroll(1, j)");
+    }
+
+    #[test]
+    fn unrolling_twice_is_refused() {
+        assert_refused(
+            &matmul(),
+            &schedule("unroll(1, k); unroll(1, k)"),
+            illegal_unroll(1, 1, "already unrolled"),
+        );
+    }
+
+    #[test]
+    fn unroll_names_a_missing_nest_or_loop() {
+        assert_refused(
+            &matmul(),
+            &schedule("unroll(2, j)"),
+            ScheduleError::NoSuchNest { step: 0, nest: 2 },
+        );
+        assert_refused(
+            &matmul(),
+            &schedule("unroll(1, x)"),
+            ScheduleError::NoSuchLoop {
+                step: 0,
+                nest: 1,
+                loop_name: "x".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn splitting_an_unrolled_loop_leaves_both_new_loops_rolled() {
+        let (s, _) = classified(&matmul(), "unroll(1, k); split(1, k, ko, ki, 2)");
+        assert!(s.nests[1].loops.iter().all(|l| !l.unroll));
+        // Splitting another loop keeps the mark.
+        let (s, _) = classified(&matmul(), "unroll(1, k); split(1, i, io, ii, 2)");
+        let marks: Vec<_> = s.nests[1].loops.iter().map(|l| l.unroll).collect();
+        assert_eq!(marks, [false, false, true, false]);
     }
 
     #[test]
