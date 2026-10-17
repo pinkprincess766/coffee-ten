@@ -1,6 +1,7 @@
 //! The `unroll` step: a register-tiled matmul equals the interpreter bit for bit, and clang
 //! keeps the tile of `C` in registers across the `k` loop only when the tile loops are
-//! unrolled (spec §3.5: the pragma is a request, so the test asks clang's own remarks).
+//! unrolled (spec §3.5: the pragma is a request, so the tests ask clang: its vectorizer
+//! remarks and the optimized IR).
 
 use coffee_ten_codegen_c::{BENCH_FLAGS, compile, emit_c};
 use coffee_ten_interp::{Tensor, run_f32};
@@ -109,12 +110,6 @@ fn register_tiled_matmul_equals_the_interpreter_bit_for_bit() {
 
 /// Runs clang on the C of `kernel` with `flags` and `rpass`; returns the source and the
 /// stderr remark lines that contain `needle`, each with the source line it points at.
-///
-/// clang prints `<path>:<line>:<col>: remark: Moving accesses to memory location out of
-/// the loop [-Rpass=licm]` when LICM keeps a memory location in a register for a whole
-/// loop (loads before it, stores after it). The text comes from LLVM's LICM pass; another
-/// clang version (CI runs ubuntu clang) may word it a little differently, so only the part
-/// `out of the loop` is matched. The other LICM remarks say `hoisting` or `sinking`.
 fn remarks(
     name: &str,
     kernel: &Kernel,
@@ -154,36 +149,37 @@ fn remarks(
     (source, remarks)
 }
 
-/// LICM scalar-promotion remarks for the C of `kernel` under `BENCH_FLAGS`.
-fn promotion_remarks(name: &str, kernel: &Kernel) -> (String, Vec<(usize, String)>) {
-    remarks(name, kernel, BENCH_FLAGS, "-Rpass=licm", "out of the loop")
-}
-
-/// For a failure message: `clang --version` and every LICM remark (done and missed) for the
-/// C of `kernel` under `BENCH_FLAGS`, to tell a different wording from a missed promotion.
-fn licm_diagnostics(kernel: &Kernel) -> String {
-    let version = Command::new("clang")
-        .arg("--version")
+/// The optimized LLVM IR of the C of `kernel` under `BENCH_FLAGS`, with the source and the
+/// number of float-valued phis (`phi float` or `phi <N x float>`) in it.
+///
+/// A float phi in this kernel is an accumulator carried in a register from one iteration to
+/// the next. It is counted in the IR, not taken from clang's LICM remark: clang 18, 19 and
+/// 20 promote the tile without printing "Moving accesses to memory location out of the
+/// loop" (checked by hand with clang 18.1.6, 19.1.7, 20.1.2, Apple clang 21, LLVM 22).
+fn float_phis(name: &str, kernel: &Kernel) -> (String, String, usize) {
+    let source = emit_c(kernel).unwrap();
+    let dir = TempDir::new(name);
+    let c_path = dir.0.join("k.c");
+    let ir_path = dir.0.join("k.ll");
+    std::fs::write(&c_path, &source).expect("write C source");
+    let output = Command::new("clang")
+        .args(BENCH_FLAGS)
+        .args(["-S", "-emit-llvm", "-o"])
+        .arg(&ir_path)
+        .arg(&c_path)
         .output()
-        .expect("clang");
-    let (_, done) = remarks("licm-done", kernel, BENCH_FLAGS, "-Rpass=licm", "remark:");
-    let (_, missed) = remarks(
-        "licm-missed",
-        kernel,
-        BENCH_FLAGS,
-        "-Rpass-missed=licm",
-        "remark:",
-    );
-    let lines: Vec<&str> = done
-        .iter()
-        .chain(&missed)
-        .map(|(_, l)| l.as_str())
-        .collect();
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&version.stdout),
-        lines.join("\n")
-    )
+        .expect("clang must be on PATH");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "clang failed:\n{stderr}");
+    let ir = std::fs::read_to_string(&ir_path).expect("read the IR");
+    let count = ir
+        .lines()
+        .filter(|line| {
+            line.contains("= phi float ")
+                || (line.contains("= phi <") && line.contains(" x float> "))
+        })
+        .count();
+    (source, ir, count)
 }
 
 /// The 1-based line number of the only line of `source` that contains `needle`.
@@ -200,29 +196,20 @@ fn line_of(source: &str, needle: &str) -> usize {
 
 #[test]
 fn clang_keeps_the_c_tile_in_registers_across_k_when_the_tile_is_unrolled() {
+    // One accumulator per row of the 4x16 tile: `ji` is a single vector of width 16, and
+    // `ii` is unrolled into 4 rows. The phis carry them across the `k` loop.
     let (kernel, _) = scheduled(TILE_UNROLLED);
-    let (source, remarks) = promotion_remarks("licm-unrolled", &kernel);
-    // The remark points at an access, not at a loop. The only line that accesses `C` in
-    // the update nest is the one with `* B[`; with `ii` and `ji` unrolled its `C` index
-    // depends on `io` and `jo` only, so `k` is the loop it can be promoted out of.
-    let update = line_of(&source, "* B[");
-    assert!(
-        !remarks.is_empty(),
-        "no LICM promotion remark:\n{source}\n{}",
-        licm_diagnostics(&kernel)
-    );
-    for (line, text) in &remarks {
-        assert_eq!(*line, update, "{text}\n{source}");
-    }
-    println!("clang: {} remarks, e.g. {}", remarks.len(), remarks[0].1);
+    let (source, ir, count) = float_phis("phis-unrolled", &kernel);
+    assert_eq!(count, 4, "{source}\n{ir}");
 }
 
 #[test]
-fn clang_promotes_nothing_without_the_unroll_steps() {
-    // The same loop nest and vectorize, only without the two unroll requests.
+fn clang_keeps_nothing_in_registers_without_the_unroll_steps() {
+    // The same loop nest and vectorize, only without the two unroll requests: C is loaded
+    // and stored on every iteration of `k`.
     let (kernel, _) = scheduled(TILE);
-    let (source, remarks) = promotion_remarks("licm-rolled", &kernel);
-    assert_eq!(remarks, [], "{source}");
+    let (source, ir, count) = float_phis("phis-rolled", &kernel);
+    assert_eq!(count, 0, "{source}\n{ir}");
 }
 
 #[test]
