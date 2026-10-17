@@ -91,7 +91,18 @@ const RESERVED: [&str; 41] = [
     "expf",
 ];
 
-/// Emits `kernel` as one C99 function. Buffers that are stored to are `restrict` outputs.
+/// Emits `kernel` as one C99 function. Buffers that are stored to are `restrict` outputs;
+/// `restrict` is on outputs only, inputs are `const` and may alias each other.
+///
+/// A buffer of rank >= 2 is a pointer to its rows, `float (*restrict Y)[d1]...[d(r-1)]`,
+/// and is indexed per dimension, `Y[e0][e1]...`, not as one flat offset `Y[e0 * d1 + e1]`.
+/// Reason: for the flat form InstCombine rewrites the index of a tiled loop into nested
+/// `or disjoint` of two variables, which BasicAA in LLVM 18, 19 and 20 cannot decompose,
+/// so it cannot prove two rows of a matrix disjoint. Measured by hand on the register-tile
+/// matmul (PR #42): clang 18.1.6, 19.1.7 and 20.1.2 keep the 4x16 tile of C in memory (no
+/// `phi <16 x float>` in the optimized IR), Apple clang 21 and LLVM 22 keep it in registers.
+/// The same kernel with row pointers gets 4 `phi <16 x float>` on all five versions.
+/// Rank 0 and 1 stay `float *`.
 pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
     kernel.validate().map_err(CodegenError::Invalid)?;
     check_name(&kernel.name)?;
@@ -126,10 +137,24 @@ pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
         .iter()
         .enumerate()
         .map(|(id, buffer)| {
-            if kernel.nests.iter().any(|n| n.body.target.buffer == id) {
-                format!("float *restrict {}", buffer.name)
+            let is_output = kernel.nests.iter().any(|n| n.body.target.buffer == id);
+            let (constness, restrict) = if is_output {
+                ("", "restrict ")
             } else {
-                format!("const float *{}", buffer.name)
+                ("const ", "")
+            };
+            // Rank >= 2: a pointer to rows, `float (*Y)[d1][d2]`; else a plain `float *Y`.
+            let rows: String = buffer
+                .shape
+                .iter()
+                .skip(1)
+                .map(|d| format!("[{d}]"))
+                .collect();
+            let name = &buffer.name;
+            if rows.is_empty() {
+                format!("{constness}float *{restrict}{name}")
+            } else {
+                format!("{constness}float (*{restrict}{name}){rows}")
             }
         })
         .collect();
@@ -252,7 +277,12 @@ fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
     }
 }
 
-/// Row-major offset `(e0) * s0 + ... + (e_last)`, where `s_d` is the product of the later dims.
+/// `name[e0][e1]...`, one index per dimension; rank 0 prints `name[0]`.
+///
+/// Each index is in bounds of its own dimension: `Kernel::validate` (`validate_access`)
+/// checks `0 <= e_d <= size_d - 1` per dimension, not only the flat offset, and `emit_c`
+/// has run it. So indexing a row pointer per dimension reads the same elements as the flat
+/// row-major offset would.
 fn access_c(buffers: &[Buffer], access: &Access) -> String {
     let buffer = buffers
         .get(access.buffer)
@@ -260,23 +290,8 @@ fn access_c(buffers: &[Buffer], access: &Access) -> String {
     if access.index.is_empty() {
         return format!("{}[0]", buffer.name);
     }
-    let last = access.index.len() - 1;
-    let terms: Vec<String> = access
-        .index
-        .iter()
-        .enumerate()
-        .map(|(dim, e)| {
-            if dim == last {
-                format!("({e})")
-            } else {
-                // Cannot overflow: an accessed buffer has no zero dim (validate) and its
-                // element count fits in i64 (checked in emit_c), so the stride does too.
-                let stride: usize = buffer.shape[dim + 1..].iter().product();
-                format!("({e}) * {stride}")
-            }
-        })
-        .collect();
-    format!("{}[{}]", buffer.name, terms.join(" + "))
+    let indices: String = access.index.iter().map(|e| format!("[{e}]")).collect();
+    format!("{}{indices}", buffer.name)
 }
 
 fn expr_c(buffers: &[Buffer], e: &Expr) -> String {
@@ -456,16 +471,16 @@ mod tests {
         assert_eq!(
             emit_c(&matmul()).unwrap(),
             concat!(
-                "void matmul(const float *A, const float *B, float *restrict C) {\n",
+                "void matmul(const float (*A)[3], const float (*B)[2], float (*restrict C)[2]) {\n",
                 "    for (long i = 0; i < 4; i++) {\n",
                 "        for (long j = 0; j < 2; j++) {\n",
-                "            C[(i) * 2 + (j)] = 0.0f;\n",
+                "            C[i][j] = 0.0f;\n",
                 "        }\n",
                 "    }\n",
                 "    for (long i = 0; i < 4; i++) {\n",
                 "        for (long k = 0; k < 3; k++) {\n",
                 "            for (long j = 0; j < 2; j++) {\n",
-                "                C[(i) * 2 + (j)] = C[(i) * 2 + (j)] + (A[(i) * 3 + (k)] * B[(k) * 2 + (j)]);\n",
+                "                C[i][j] = C[i][j] + (A[i][k] * B[k][j]);\n",
                 "            }\n",
                 "        }\n",
                 "    }\n",
@@ -485,10 +500,10 @@ mod tests {
         assert_eq!(
             emit_c(&matmul_split_k()).unwrap(),
             concat!(
-                "void matmul(const float *A, const float *B, float *restrict C) {\n",
+                "void matmul(const float (*A)[3], const float (*B)[2], float (*restrict C)[2]) {\n",
                 "    for (long i = 0; i < 4; i++) {\n",
                 "        for (long j = 0; j < 2; j++) {\n",
-                "            C[(i) * 2 + (j)] = 0.0f;\n",
+                "            C[i][j] = 0.0f;\n",
                 "        }\n",
                 "    }\n",
                 "    for (long i = 0; i < 4; i++) {\n",
@@ -496,7 +511,7 @@ mod tests {
                 "            for (long ki = 0; ki < 2; ki++) {\n",
                 "                for (long j = 0; j < 2; j++) {\n",
                 "                    if (2*ko + ki < 3L) {\n",
-                "                        C[(i) * 2 + (j)] = C[(i) * 2 + (j)] + (A[(i) * 3 + (2*ko + ki)] * B[(2*ko + ki) * 2 + (j)]);\n",
+                "                        C[i][j] = C[i][j] + (A[i][2*ko + ki] * B[2*ko + ki][j]);\n",
                 "                    }\n",
                 "                }\n",
                 "            }\n",
@@ -577,7 +592,7 @@ mod tests {
         assert!(c.contains(concat!(
             "                    if (2*ko + ki < 3L) {\n",
             "                        if (ki < 2L) {\n",
-            "                            C[(i) * 2 + (j)] = ",
+            "                            C[i][j] = ",
         )));
         assert!(c.contains(concat!(
             "                        }\n",
@@ -591,10 +606,10 @@ mod tests {
         let c = emit_c(&bias_relu()).unwrap();
         assert!(c.contains("static inline float ct_relu"));
         assert!(!c.contains("ct_max"));
-        assert!(
-            c.contains("            Y[(i) * 3 + (j)] = ct_relu(A[(i) * 3 + (j)] + bias[(j)]);\n")
-        );
-        assert!(c.contains("void k(const float *A, const float *bias, float *restrict Y) {\n"));
+        assert!(c.contains("            Y[i][j] = ct_relu(A[i][j] + bias[j]);\n"));
+        assert!(c.contains(
+            "void k(const float (*A)[3], const float *bias, float (*restrict Y)[3]) {\n"
+        ));
     }
 
     #[test]
@@ -619,7 +634,7 @@ mod tests {
                 "\n",
                 "void k(const float *A, float *restrict Y) {\n",
                 "    for (long i = 0; i < 4; i++) {\n",
-                "        Y[(i)] = ct_max(A[(i)], -(A[(i)]));\n",
+                "        Y[i] = ct_max(A[i], -(A[i]));\n",
                 "    }\n",
                 "}\n",
             )
@@ -652,7 +667,7 @@ mod tests {
                 "\n",
                 "void k(const float *A, const float *B, float *restrict Y) {\n",
                 "    for (long i = 0; i < 4; i++) {\n",
-                "        Y[(i)] = expf(A[(i)]) / B[(i)];\n",
+                "        Y[i] = expf(A[i]) / B[i];\n",
                 "    }\n",
                 "}\n",
             )
@@ -678,7 +693,7 @@ mod tests {
         let c = emit_c(&k).unwrap();
         // div alone needs no header; the right operand keeps its parentheses
         assert!(!c.contains("math.h"));
-        assert!(c.contains("Y[(i)] = A[(i)] / (A[(i)] / 2.0f);\n"), "{c}");
+        assert!(c.contains("Y[i] = A[i] / (A[i] / 2.0f);\n"), "{c}");
     }
 
     #[test]
