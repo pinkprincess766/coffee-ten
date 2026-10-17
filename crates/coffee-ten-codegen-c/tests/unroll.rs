@@ -12,10 +12,7 @@ use std::process::Command;
 
 const N: usize = 64;
 
-/// A 4x16 register tile of `C` over `k`, `ii` and `ji` unrolled. Without the last two steps
-/// it is the same loop nest with no unroll request.
-const TILE: &str = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
-                    reorder(1, io, jo, k, ii, ji); vectorize(1, ji)";
+/// A 4x16 register tile of `C` over `k`, `ii` and `ji` unrolled.
 const TILE_UNROLLED: &str = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
                              reorder(1, io, jo, k, ii, ji); vectorize(1, ji); \
                              unroll(1, ii); unroll(1, ji)";
@@ -203,10 +200,17 @@ fn clang_keeps_the_c_tile_in_registers_across_k_when_the_tile_is_unrolled() {
     assert_eq!(count, 4, "{source}\n{ir}");
 }
 
+/// AArch64 only: on x86-64 clang tiles this nest by itself. There it vectorizes `ji` at
+/// width 4, interleaves 4 vectors and unrolls `ii`, which gives 16 `<4 x float>`
+/// accumulators without any unroll step (ubuntu CI, clang 18.1.3). On AArch64 it unrolls
+/// `ji` before the vectorizer and keeps C in memory (clang 18-22).
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn clang_keeps_nothing_in_registers_without_the_unroll_steps() {
-    // The same loop nest and vectorize, only without the two unroll requests: C is loaded
-    // and stored on every iteration of `k`.
+    // `TILE_UNROLLED` without the two unroll requests: C is loaded and stored on every
+    // iteration of `k`.
+    const TILE: &str = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
+                        reorder(1, io, jo, k, ii, ji); vectorize(1, ji)";
     let (kernel, _) = scheduled(TILE);
     let (source, ir, count) = float_phis("phis-rolled", &kernel);
     assert_eq!(count, 0, "{source}\n{ir}");
