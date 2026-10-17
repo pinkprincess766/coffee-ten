@@ -315,6 +315,7 @@ mod tests {
             name: name.to_string(),
             extent,
             vectorize: false,
+            unroll: false,
         }
     }
 

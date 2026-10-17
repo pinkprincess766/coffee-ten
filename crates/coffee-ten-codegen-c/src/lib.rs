@@ -207,9 +207,15 @@ fn indent(level: usize) -> String {
 
 fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
     for (depth, l) in nest.loops.iter().enumerate() {
-        if l.vectorize {
+        let hints = match (l.vectorize, l.unroll) {
+            (false, false) => None,
+            (true, false) => Some("vectorize(enable)"),
+            (false, true) => Some("unroll(full)"),
+            (true, true) => Some("vectorize(enable) unroll(full)"),
+        };
+        if let Some(hints) = hints {
             out.push_str(&format!(
-                "{}#pragma clang loop vectorize(enable)\n",
+                "{}#pragma clang loop {hints}\n",
                 indent(depth + 1)
             ));
         }
@@ -314,6 +320,7 @@ mod tests {
             name: name.to_string(),
             extent,
             vectorize: false,
+            unroll: false,
         }
     }
 
@@ -515,6 +522,39 @@ mod tests {
         // Nothing else changes.
         lines.remove(at);
         assert_eq!(lines.join("\n") + "\n", emit_c(&matmul()).unwrap());
+    }
+
+    /// Each pragma line of the matmul with `schedule` applied, with the line after it.
+    fn pragma_lines(schedule: &str) -> Vec<(String, String)> {
+        let schedule = Schedule::parse(schedule).unwrap();
+        let text = emit_c(&apply(&matmul(), &schedule).unwrap()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        (0..lines.len())
+            .filter(|&n| lines[n].contains("#pragma"))
+            .map(|n| (lines[n].to_string(), lines[n + 1].to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn unroll_puts_one_pragma_before_its_for() {
+        assert_eq!(
+            pragma_lines("unroll(1, k)"),
+            [(
+                "        #pragma clang loop unroll(full)".to_string(),
+                "        for (long k = 0; k < 3; k++) {".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn unroll_with_vectorize_is_one_combined_pragma() {
+        assert_eq!(
+            pragma_lines("vectorize(1, j); unroll(1, j)"),
+            [(
+                "            #pragma clang loop vectorize(enable) unroll(full)".to_string(),
+                "            for (long j = 0; j < 2; j++) {".to_string()
+            )]
+        );
     }
 
     #[test]
