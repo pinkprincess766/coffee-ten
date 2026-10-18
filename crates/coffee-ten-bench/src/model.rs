@@ -15,8 +15,11 @@
 //! as a contiguous run starting on a line boundary, so its bytes are rounded up to whole
 //! lines; this is why a lone element costs a full line. Other dims multiply.
 //!
-//! Traffic past a cache of `S` bytes: the innermost level `p` with `F(p) > S`; then every
-//! run of the loops inside `p` is reloaded: `F(p + 1) * (iterations of loops 0..=p)`. If no
+//! Traffic past a cache of `S` bytes: the innermost level `p` with `F(p) > S`; then every run
+//! of loop `p` streams its footprint once: `F(p) * (iterations of loops 0..p)`. Loops inside
+//! `p` fit, so what an iteration of `p` shares with the next one stays cached: an access
+//! invariant in `p`, and the lines of an access that moves along `p` by less than a line
+//! (v1.1 reloaded `F(p + 1)` per iteration of `p`, which charged both again every time). If no
 //! level exceeds `S`, the traffic is `F(0)`, once. Each access is counted once, so a
 //! written `C` is not charged for its write-back or write-allocate (as in `bench/peak`).
 //!
@@ -254,10 +257,10 @@ fn traffic_past(totals: &[usize], extents: &[usize], cache_bytes: usize) -> usiz
     let overflowing = (0..extents.len()).rev().find(|&p| totals[p] > cache_bytes);
     match overflowing {
         Some(p) => {
-            let reloads = extents[..=p]
+            let runs = extents[..p]
                 .iter()
                 .fold(1_usize, |acc, e| acc.saturating_mul(*e));
-            totals[p + 1].saturating_mul(reloads)
+            totals[p].saturating_mul(runs)
         }
         None => totals[0],
     }
