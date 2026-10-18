@@ -114,12 +114,17 @@ __attribute__((noinline)) static void triad(float *restrict x, const float *rest
  * One pass of the accumulator-in-memory kernel. Each float32x4 of c is loaded,
  * updated and stored once per pass, as the matmul schedules do when C[i, j] is
  * not in registers. noinline: c is written back to memory before the next pass.
+ * Four vectors per iteration, as clang interleaves the vectorized matmul loop:
+ * with one, the loop's own instructions limit it (31 vs 47 GFLOP/s by hand, M5).
  */
 __attribute__((noinline)) static void fma_mem_acc_pass(float a, const v4f *restrict b,
                                                        v4f *restrict c) {
     v4f va = {a, a, a, a};
-    for (long j = 0; j < MEM_ACC_N / 4; j++) {
+    for (long j = 0; j < MEM_ACC_N / 4; j += 4) {
         c[j] = __builtin_elementwise_fma(va, b[j], c[j]);
+        c[j + 1] = __builtin_elementwise_fma(va, b[j + 1], c[j + 1]);
+        c[j + 2] = __builtin_elementwise_fma(va, b[j + 2], c[j + 2]);
+        c[j + 3] = __builtin_elementwise_fma(va, b[j + 3], c[j + 3]);
     }
 }
 
