@@ -951,39 +951,94 @@ mod tests {
     /// - loop j: C 4096 + A 128 + B 4096 = 8320.
     /// - loop k: C 4096 + A 4096 + B 1024 x 4096 = 4194304 -> 4202496, over L1 = 131072 (B
     ///   alone is 4 MiB). Loop j still fits.
-    /// - L1 traffic = F(j) x (iterations of i, k) = 8320 x 1024 x 1024 = 8724152320.
+    /// - L1 traffic = F(k) x (iterations of i) = 4202496 x 1024 = 4303355904: per `i`, the row
+    ///   of C stays in L1 across `k`, the row of A is read along `k` (a line serves 32 values of
+    ///   `k`), and B is streamed whole. (v1.1 charged F(j) per `k`: 8724152320, 2x too much.)
     /// - all loops: 3 x 4 MiB = 12582912 B <= L2 = 16 MiB, so memory traffic is that once.
     #[test]
     fn the_naive_nest_at_n_1024_reloads_from_l2_but_not_from_memory() {
         let p = predict(&Machine::assumed_m5(), &naive(1024)).expect("predicts");
-        assert_eq!(p.l2_bytes, 8_724_152_320);
+        assert_eq!(p.l2_bytes, 4_303_355_904);
         assert_eq!(p.mem_bytes, 12_582_912);
     }
 
     /// Tiled `io, jo, k, ii, ji` (32, 64), N = 1024: extents 32, 16, 1024, 32, 64.
-    /// - loop ji: C 256 + A 128 + B 256 = 640.
-    /// - loop ii: C 32 x 256 = 8192; A 32 x 128 = 4096; B 256 -> 12544.
+    /// - loop ii: C 32 x 256 = 8192; A 32 x 128 = 4096; B 256 -> 12544, fits L1.
     /// - loop k: C 8192; A 32 x 4096 = 131072; B 1024 x 256 = 262144 -> 401408 > L1.
-    /// - L1 traffic = F(ii) x (io, jo, k iterations) = 12544 x 32 x 16 x 1024 = 6576668672,
-    ///   which is less than the naive 8724152320.
+    /// - L1 traffic = F(k) x (io, jo iterations) = 401408 x 32 x 16 = 205520896: per tile the
+    ///   `k` loop streams A and B once and keeps C. (v1.1 charged F(ii) per `k`: 6576668672.)
+    /// - memory: 3 x 4 MiB fits L2, once. The naive nest moves 4303355904 past L1, 21x more.
     #[test]
     fn tiling_moves_less_from_l2_than_the_naive_nest() {
         let machine = Machine::assumed_m5();
         let tiled = predict(&machine, &scheduled(1024, TILED)).expect("predicts");
         let plain = predict(&machine, &naive(1024)).expect("predicts");
-        assert_eq!(tiled.l2_bytes, 6_576_668_672);
+        assert_eq!(tiled.l2_bytes, 205_520_896);
+        assert_eq!(tiled.mem_bytes, 12_582_912);
         assert!(tiled.l2_bytes < plain.l2_bytes);
     }
 
+    /// `TILED` + `vectorize(ji)` at N = 512: extents 16, 8, 512, 32, 64; same traffic as
+    /// unvectorized. Line 128 B; the 64 floats of `ji` are 2 lines.
+    /// - loop ii: C 32 x 256 = 8192; A 32 x 128 = 4096; B 256 -> 12544, fits L1.
+    /// - loop k: C 8192; A 32 rows x (512 el = 2048 B) = 65536; B 512 rows x 256 = 131072 ->
+    ///   204800 > L1 = 131072.
+    /// - L1 traffic = 204800 x (16 x 8 tiles) = 26214400. Per tile that is the whole footprint
+    ///   once: v1.1 charged F(ii) = 12544 per `k` (822083584 over all tiles), counting the C
+    ///   tile and 32 lines of A again at every `k`.
+    /// - memory: 3 x 1 MiB fits L2, once.
     #[test]
-    fn the_cache_size_decides_the_level_that_is_reloaded() {
+    fn tiled_vectorize_at_n_512_streams_its_k_loop_once_per_tile() {
+        let kernel = scheduled(512, &format!("{TILED}; vectorize(1, ji)"));
+        let p = predict(&Machine::assumed_m5(), &kernel).expect("predicts");
+        assert_eq!(p.l2_bytes, 26_214_400);
+        assert_eq!(p.mem_bytes, 3 * 512 * 512 * 4);
+    }
+
+    /// `TILED` + `vectorize(ji)` at N = 1024: the footprints are those of the test above at
+    /// N = 1024, 401408 over L1, extents 32, 16 tiles: 401408 x 512 = 205520896; memory
+    /// 12582912. The model has no cost for the 4 KiB row stride (cache sets, TLB), see the
+    /// S3 measurement of this schedule: 26.7 against 56.0 GFLOP/s at N = 512.
+    #[test]
+    fn tiled_vectorize_at_n_1024_has_the_traffic_of_the_scalar_tiles() {
+        let kernel = scheduled(1024, &format!("{TILED}; vectorize(1, ji)"));
+        let p = predict(&Machine::assumed_m5(), &kernel).expect("predicts");
+        assert_eq!(p.l2_bytes, 205_520_896);
+        assert_eq!(p.mem_bytes, 12_582_912);
+    }
+
+    /// Register tile 4x16, N = 1024: `split i by 4; split j by 16; reorder io, jo, k, ii, ji;
+    /// vectorize ji; unroll ii; unroll ji`. Extents 256, 64, 1024, 4, 16; line 128 B = 32
+    /// floats, so the 16 floats of `ji` (64 B) take a whole line.
+    /// - loop ii: C 4 x 128 = 512; A 4 x 128 = 512; B 128 -> 1152, fits L1.
+    /// - loop k: C 512; A 4 rows x (1024 el = 4096 B) = 16384; B 1024 rows x 128 = 131072 ->
+    ///   147968, over L1 = 131072 by 16896 B. Without the rounding to whole lines B would be
+    ///   64 KiB, the tile 80 KiB and it would fit; but the other half of each line of B belongs
+    ///   to the next `jo`, 128 KiB of L1 away, so the rounding is the right capacity.
+    /// - L1 traffic = 147968 x (256 x 64 tiles) = 2424307712 (2.4 GB; on the P1 machine, 125 GB/s
+    ///   and 126.7 GFLOP/s: 19.4 ms against 16.9 ms of FMAs, so "l2" at 110.7 GFLOP/s). v1.1 charged F(ii) = 1152 per
+    ///   `k`, 19327352832, which is 13.9 GFLOP/s: C is invariant in `k` and a line of A serves 32
+    ///   values of `k`, neither is read again from L2 per `k`.
+    /// - memory: 3 x 4 MiB fits L2, once.
+    #[test]
+    fn the_register_tile_at_n_1024_streams_its_k_loop_once_per_tile() {
+        let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
+                    reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
+        let p = predict(&Machine::assumed_m5(), &scheduled(1024, tile)).expect("predicts");
+        assert_eq!(p.l2_bytes, 2_424_307_712);
+        assert_eq!(p.mem_bytes, 12_582_912);
+    }
+
+    #[test]
+    fn the_cache_size_decides_the_level_that_is_streamed() {
         // Footprints 10, 100, 1000 for 3 loops of extents 4, 5, 6 (outer first), body 1.
         let totals = [1000, 100, 10, 1];
         let extents = [4, 5, 6];
         assert_eq!(traffic_past(&totals, &extents, 1000), 1000);
-        assert_eq!(traffic_past(&totals, &extents, 999), 100 * 4);
-        assert_eq!(traffic_past(&totals, &extents, 99), 10 * 4 * 5);
-        assert_eq!(traffic_past(&totals, &extents, 9), 4 * 5 * 6);
+        // The outermost loop does not fit: it streams its footprint, once.
+        assert_eq!(traffic_past(&totals, &extents, 999), 1000);
+        assert_eq!(traffic_past(&totals, &extents, 99), 100 * 4);
+        assert_eq!(traffic_past(&totals, &extents, 9), 10 * 4 * 5);
     }
 
     #[test]
@@ -1310,7 +1365,7 @@ mod tests {
     );
 
     /// The S3 machine (mem_acc 31.1262 is from the old, loop-overhead-bound kernel), N = 256:
-    /// the register tiles are the top 3 of the space; the next schedule has no unroll. The
+    /// the 6 register tiles are the top 6 of the space; the next schedule has no unroll. The
     /// 4x16 tile at N = 128 is bound by the FMA peak, not by loads and stores.
     #[test]
     fn register_tiles_rank_first_on_the_s3_machine() {
@@ -1319,8 +1374,8 @@ mod tests {
         assert!(mem_acc_measured);
         assert_eq!(machine.mem_acc_gflops, 31.1262);
         let ranked = rank_matmul(&machine, 256).expect("ranks");
-        assert!(ranked[..3].iter().all(|r| r.schedule.contains("unroll(")));
-        assert!(!ranked[3].schedule.contains("unroll("));
+        assert!(ranked[..6].iter().all(|r| r.schedule.contains("unroll(")));
+        assert!(!ranked[6].schedule.contains("unroll("));
         let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
                     reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
         let p = predict_schedule(&machine, 128, tile).expect("predicts");
