@@ -1,6 +1,7 @@
 /*
  * peak: single-thread f32 peak FLOP/s (FMA loop), FMA rate with the accumulator
- * in memory, single-thread memory bandwidth and L2 bandwidth (STREAM triad).
+ * in memory (vector and scalar), single-thread memory bandwidth and L2 bandwidth
+ * (STREAM triad).
  * See README.md.
  *
  * Build (from the repo root):
@@ -128,6 +129,21 @@ __attribute__((noinline)) static void fma_mem_acc_pass(float a, const v4f *restr
     }
 }
 
+/*
+ * Scalar twin of fma_mem_acc_pass: per element, load b, load c, fmaf, store c,
+ * one float per iteration. That is the shape clang gives the inner loop of the
+ * naive matmul under the benchmark flags (ldr s, ldr s, fmadd s, str s, add,
+ * cmp, b.ne). The pragmas keep it so: peak.c is built with -O2, where the loop
+ * or the SLP vectorizer would otherwise make it fmla.4s.
+ */
+__attribute__((noinline)) static void fma_mem_acc_scalar_pass(float a, const float *restrict b,
+                                                              float *restrict c) {
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+    for (long j = 0; j < MEM_ACC_N; j++) {
+        c[j] = __builtin_fmaf(a, b[j], c[j]);
+    }
+}
+
 static double fma_flop_per_call(void) {
     return 2.0 * 4 * FMA_CHAINS * (double)FMA_ITERS;
 }
@@ -170,6 +186,22 @@ static double fma_mem_acc_sample(float a, const v4f *b, v4f *c) {
         t1 = now_ns();
     } while (t1 - t0 < MIN_SAMPLE_NS);
     g_sink += c[0][0];
+    return (double)passes * fma_mem_acc_flop_per_pass() / (double)(t1 - t0);
+}
+
+/* Returns GFLOP/s (FLOP per ns). */
+static double fma_mem_acc_scalar_sample(float a, const float *b, float *c) {
+    long long t0 = now_ns();
+    long long t1;
+    long passes = 0;
+    do {
+        for (int p = 0; p < MEM_ACC_BATCH; p++) {
+            fma_mem_acc_scalar_pass(a, b, c);
+        }
+        passes += MEM_ACC_BATCH;
+        t1 = now_ns();
+    } while (t1 - t0 < MIN_SAMPLE_NS);
+    g_sink += c[0];
     return (double)passes * fma_mem_acc_flop_per_pass() / (double)(t1 - t0);
 }
 
@@ -281,6 +313,24 @@ static int run_check(float a, float b) {
             return 1;
         }
     }
+    /* Scalar accumulator in memory: same as above with one float per FMA. */
+    float sc_b[MEM_ACC_N];
+    float sc_c[MEM_ACC_N];
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        sc_b[j] = 0.5f;
+        sc_c[j] = (float)j;
+    }
+    for (int p = 0; p < 1000; p++) {
+        fma_mem_acc_scalar_pass(1.0f, sc_b, sc_c);
+    }
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        float want = (float)j + 500.0f;
+        if (sc_c[j] != want) {
+            printf("check FAILED: mem_acc_scalar j=%d: got %.9g, want %.9g\n", j,
+                   (double)sc_c[j], (double)want);
+            return 1;
+        }
+    }
     printf("check ok\n");
     return 0;
 }
@@ -289,6 +339,7 @@ static double g_fma_rate[SAMPLES];
 static double g_triad_rate[SAMPLES];
 static double g_triad_l2_rate[SAMPLES];
 static double g_mem_acc_rate[SAMPLES];
+static double g_mem_acc_scalar_rate[SAMPLES];
 
 /* Fills rate[0..samples-1] with accumulator-in-memory GFLOP/s; a from fma_operands, b[j] = 0.5. */
 static void run_mem_acc(float a, int samples, int warmup, double *rate) {
@@ -300,6 +351,22 @@ static void run_mem_acc(float a, int samples, int warmup, double *rate) {
     }
     for (int s = 0; s < warmup + samples; s++) {
         double r = fma_mem_acc_sample(a, b, c);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+}
+
+/* Fills rate[0..samples-1] with scalar accumulator-in-memory GFLOP/s; a from fma_operands, b[j] = 0.5. */
+static void run_mem_acc_scalar(float a, int samples, int warmup, double *rate) {
+    float b[MEM_ACC_N];
+    float c[MEM_ACC_N];
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        b[j] = 0.5f;
+        c[j] = 0.0f;
+    }
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = fma_mem_acc_scalar_sample(a, b, c);
         if (s >= warmup) {
             rate[s - warmup] = r;
         }
@@ -371,6 +438,7 @@ int main(int argc, char **argv) {
     }
 
     run_mem_acc(a, samples, warmup, g_mem_acc_rate);
+    run_mem_acc_scalar(a, samples, warmup, g_mem_acc_scalar_rate);
     if (run_triad(TRIAD_N, samples, warmup, g_triad_rate) != 0) {
         return 1;
     }
@@ -380,11 +448,13 @@ int main(int argc, char **argv) {
 
     stats_t fma = summarize(g_fma_rate, samples);
     stats_t mem_acc = summarize(g_mem_acc_rate, samples);
+    stats_t mem_acc_scalar = summarize(g_mem_acc_scalar_rate, samples);
     stats_t triad_st = summarize(g_triad_rate, samples);
     stats_t triad_l2_st = summarize(g_triad_l2_rate, samples);
 
     print_stats("fma", "GFLOP/s", fma, samples);
     print_stats("mem_acc", "GFLOP/s", mem_acc, samples);
+    print_stats("mem_acc_s", "GFLOP/s", mem_acc_scalar, samples);
     print_stats("triad", "GB/s", triad_st, samples);
     print_stats("triad_l2", "GB/s", triad_l2_st, samples);
     printf("checksum %g\n", g_sink);
@@ -394,13 +464,16 @@ int main(int argc, char **argv) {
            "\"triad_l2_gbs\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"triad_l2_n\":%d,"
            "\"fma_mem_acc_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
-           "\"mem_acc_n\":%d}\n",
+           "\"mem_acc_n\":%d,"
+           "\"fma_mem_acc_scalar_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
            fma.median, fma.p25, fma.p75, fma.min, samples,
            triad_st.median, triad_st.p25, triad_st.p75, triad_st.min, samples,
            FMA_CHAINS, TRIAD_N,
            triad_l2_st.median, triad_l2_st.p25, triad_l2_st.p75, triad_l2_st.min, samples,
            TRIAD_L2_N,
            mem_acc.median, mem_acc.p25, mem_acc.p75, mem_acc.min, samples,
-           MEM_ACC_N);
+           MEM_ACC_N,
+           mem_acc_scalar.median, mem_acc_scalar.p25, mem_acc_scalar.p75, mem_acc_scalar.min,
+           samples);
     return 0;
 }
