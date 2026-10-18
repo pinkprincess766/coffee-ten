@@ -37,6 +37,8 @@ It is the compute ceiling the cost model should use for such schedules: the fma 
 reached only when the accumulator stays in registers, so it overstates what these schedules
 can do. --check verifies it exactly (c[j] = j + 500 after 1000 passes).
 
+fma_mem_acc_scalar is the same access pattern as fma_mem_acc in scalar code, one float per load, FMA and store, like the naive and tiled matmul schedules. It is the scalar load/store calibration point of the cost model: the naive matmul measures 7.5-8.4 GFLOP/s, while the vector point divided by 4 lanes predicts about 11.5.
+
 FMA_CHAINS = 16 assumes 4 pipes x 4-cycle latency (not measured).
 The QoS class raises the chance of a P-core; it does not guarantee one.
 
