@@ -1,4 +1,4 @@
-//! Analytic cost model, version 1 (spec §7.1): cache traffic from the loop footprints plus a
+//! Analytic cost model, version 1.1 (spec §7.1): cache traffic from the loop footprints plus a
 //! roofline whose compute ceiling is the lower of the FMA and the load/store ceiling.
 //! Deterministic; the machine numbers are inputs (assumed, or read from a results file).
 //!
@@ -22,6 +22,8 @@
 //!
 //! Compute ceiling, see `mem_ops_per_fma`: the update nest keeps `C[i, j]` in memory, so a
 //! good vectorized schedule is bound by loads and stores, not by FMA issue (v0 missed this).
+//! v1.1: accesses held in registers across a loop are paid once per outer iteration, see
+//! `mem_ops_per_fma`.
 
 use crate::BenchError;
 use crate::cli::MAX_N;
@@ -34,6 +36,10 @@ use std::fmt::Write as _;
 
 /// The matmul update nest; nest 0 is the init nest.
 const UPDATE_NEST: usize = 1;
+/// Vector registers one access may keep across a loop, see `mem_ops_per_fma`. ASSUMED, not
+/// measured: NEON has 32; the same number as `MAX_ACCUMULATORS` in `space.rs` (private there),
+/// which leaves 8 for the operands.
+const REG_BUDGET: usize = 24;
 /// Bytes of one f32 element.
 const ELEMENT_BYTES: usize = 4;
 /// How many ranked schedules the CLI prints.
@@ -174,6 +180,15 @@ fn distinct_values(
     loops: &[Loop],
     from: usize,
 ) -> Result<usize, BenchError> {
+    distinct_values_where(index, loops, |pos| pos >= from)
+}
+
+/// Distinct values of one index dim over the loops `pos` of `loops` with `keep(pos)`.
+fn distinct_values_where(
+    index: &coffee_ten_loop::AffineExpr,
+    loops: &[Loop],
+    keep: impl Fn(usize) -> bool,
+) -> Result<usize, BenchError> {
     let mut count = 1_usize;
     let mut span = 1_usize;
     for (name, coeff) in &index.terms {
@@ -181,7 +196,7 @@ fn distinct_values(
             .iter()
             .position(|l| &l.name == name)
             .ok_or_else(|| model_err(format!("index names the unknown loop {name}")))?;
-        if pos < from || *coeff == 0 {
+        if !keep(pos) || *coeff == 0 {
             continue;
         }
         let extent = loops[pos].extent;
@@ -282,15 +297,136 @@ fn access_ops(access: &Access, inner: &Loop, lanes: usize) -> usize {
     }
 }
 
-/// Memory ops `m` per FMA op in one iteration of the innermost loop of the update `nest`.
+/// Vector registers an access needs to hold the elements it touches over the loops `from..`
+/// of `loops`: the distinct values over the loops that are not vectorized, times, if the
+/// vectorized (last) loop is inside, 1 if the access is invariant in it, `extent / lanes`
+/// rounded up for unit stride and `extent` for a strided access (scalars).
+fn registers_over(
+    access: &Access,
+    loops: &[Loop],
+    from: usize,
+    lanes: usize,
+) -> Result<usize, BenchError> {
+    let mut registers = 1_usize;
+    for index in &access.index {
+        let values =
+            distinct_values_where(index, loops, |pos| pos >= from && !loops[pos].vectorize)?;
+        registers = registers.saturating_mul(values);
+    }
+    if let Some(v) = loops.last().filter(|l| l.vectorize)
+        && from < loops.len()
+    {
+        // `access_ops` of the vectorized loop: 0 invariant, 1 unit stride, `lanes` strided.
+        registers = registers.saturating_mul(match access_ops(access, v, lanes) {
+            0 => 1,
+            1 => v.extent.div_ceil(lanes),
+            _ => v.extent,
+        });
+    }
+    Ok(registers)
+}
+
+/// Memory ops `access` costs over the whole update nest, loads of it or stores of it (the
+/// same count for either; `C[i, j]` has both). Counted as iterations of the loops that are not
+/// held across: a loop `p` is held across if
+/// - the access is invariant in `p`, and
+/// - the elements it touches over the loops inside `p` fit `REG_BUDGET` registers, and
+/// - every loop inside `p` that the access depends on is unrolled or vectorized (a register
+///   cannot be indexed by a loop variable; tested for the `C` tile in
+///   `crates/coffee-ten-codegen-c/tests/unroll.rs`, where clang keeps nothing in registers
+///   without the unroll steps).
 ///
-/// The nest does one multiply-add (1 FMA op, vector or scalar) per iteration. Memory ops: each
-/// distinct Load of the stored value that depends on the innermost loop counts `access_ops`;
-/// loads invariant in it count 0 (hoisted: held in a register across the loop). The store
-/// counts at least 1 even if its target is invariant: the loop IR and our C backend store in
-/// every iteration, and `float *restrict` would let clang sink it, but we do not assume
-/// that (it is not measured). So `i, k, j` has `C` load, `B` load, `C` store, `A` hoisted: m = 3
-/// (scalar or vector); `i, j, k` has `A`, `B`, store of `C`, `C` load hoisted: m = 3.
+/// Each loop that is not held across multiplies the count by its iterations (the vectorized
+/// loop by `extent / lanes` rounded up, times `lanes` for a strided access).
+fn total_ops(access: &Access, loops: &[Loop], lanes: usize) -> Result<f64, BenchError> {
+    let mut ops = 1.0_f64;
+    let mut rolled_dependence_inside = false;
+    for (p, l) in loops.iter().enumerate().rev() {
+        let depends = access
+            .index
+            .iter()
+            .any(|index| coeff_of(index, &l.name) != 0);
+        let held = !depends
+            && !rolled_dependence_inside
+            && registers_over(access, loops, p + 1, lanes)? <= REG_BUDGET;
+        if depends && !l.unroll && !l.vectorize {
+            rolled_dependence_inside = true;
+        }
+        if held {
+            continue;
+        }
+        ops *= if l.vectorize {
+            l.extent.div_ceil(lanes) as f64 * access_ops(access, l, lanes).max(1) as f64
+        } else {
+            l.extent as f64
+        };
+    }
+    Ok(ops)
+}
+
+/// `(memory ops, FMA ops)` over the whole update `nest`. FMA ops: the product of the extents,
+/// the vectorized loop as `extent / lanes` (rounded up) vector FMAs. Memory ops: `total_ops`
+/// of each distinct Load of the stored value plus of the store.
+fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
+    if lanes == 0 {
+        return Err(model_err("lanes must be positive".to_string()));
+    }
+    if nest.loops.is_empty() {
+        return Err(model_err("the nest has no loops".to_string()));
+    }
+    let mut all_loads = Vec::new();
+    loads(&nest.body.value, &mut all_loads);
+    let mut mem_ops = total_ops(&nest.body.target, &nest.loops, lanes)?;
+    for load in distinct(all_loads) {
+        mem_ops += total_ops(load, &nest.loops, lanes)?;
+    }
+    let fma_ops = nest.loops.iter().fold(1.0, |acc, l| {
+        acc * if l.vectorize {
+            l.extent.div_ceil(lanes) as f64
+        } else {
+            l.extent as f64
+        }
+    });
+    Ok((mem_ops, fma_ops))
+}
+
+/// Memory ops `m` per FMA op of the update `nest`: the total memory ops over the nest divided
+/// by the total FMA ops (vector FMAs if the last loop is vectorized), after registers took
+/// the hoistable accesses out of the loops. Model v1.1.
+///
+/// Rule, see `total_ops`: an access is held in registers across a loop that it does not depend
+/// on, if what it touches inside that loop fits `REG_BUDGET` vector registers; its ops are then
+/// paid once per iteration of the loops outside, not per iteration of the held loop. v1 only
+/// knew this for the innermost loop (counting the hoisted access as 0, and the store of an
+/// invariant target as 1). Now the cost of a hoisted access is its loads over the loops
+/// outside, so v1 hand values change by a small amount, e.g. the naive `i, k, j` has `C` load,
+/// `B` load, `C` store per FMA and `A[i, k]` once per `j` loop: m = 3 + 1 / (iterations of j),
+/// at N = 64: 3.015625 scalar, 3.0625 vectorized (16 vector iterations), no longer exactly 3.
+/// The store of an invariant target is held too: `i, j, k` has `A`, `B` per FMA and `C` load
+/// and store once per `k` loop: m = 2 + 2 / N.
+///
+/// Hand values, `lanes` = 4, N = 64 (`K` = 64 iterations of `k`, one tile = one `io, jo`):
+/// - Register tile 4x16, `split i by 4; split j by 16; reorder io, jo, k, ii, ji; vectorize ji;
+///   unroll ii; unroll ji`. `C` over `ii, ji` needs 4 * 4 = 16 <= 24 registers and is held
+///   across `k`: 16 loads and 16 stores per tile. `A[i, k]` per `k` and `ii`: 4 scalar loads
+///   (held across `ji`). `B[k, j]` per `k`: 4 vector loads. FMAs 4 * 4 per `k`. Per tile
+///   (4 + 4) * K + 32 = 544 ops over 16 * K = 1024 FMAs: m = 0.53125, which is 0.5 + 32 / (16
+///   K); the 0.5 of "A 4, B 4, FMA 16" is the limit of large `K`.
+/// - 2x8: A 2 K, B 2 K, C 4 + 4: 264 / 256 = 1.03125. 8x8: A 8 K, B 2 K, C 16 + 16: 672 / 1024
+///   = 0.65625.
+/// - `tiled+vectorize`, `split i by 32; split j by 64; reorder io, jo, k, ii, ji; vectorize
+///   ji`: `B[k, j]` over `ji` needs 16 registers and is held across `ii` (16 vector loads per
+///   `k`); `C` over `ii, ji` needs 32 * 16 = 512 > 24 and `ii` is not unrolled: not held, 16
+///   loads and 16 stores per `k` and `ii`; `A[i, k]` is held across `ji`: 1 load per `k` and
+///   `ii`. Per `k` and `ii`: 16 + 16 + 1 + 16 / 32 = 33.5 over 16 FMAs: m = 2.09375, not 3.
+/// - Naive `i, k, j` vectorized at N = 256: `B`, `C` over `j` need 64 registers (not held, they
+///   depend on `j` anyway), `A` is held across `j`: per `i, k`: 64 + 64 + 64 + 1 = 193 over 64
+///   FMAs: m = 3.015625.
+///
+/// NOT modelled: register pressure beyond `REG_BUDGET` per access (all accesses together may
+/// need more than the 32 registers) and spills. ASSUMED: `REG_BUDGET` equals the space limit
+/// `MAX_ACCUMULATORS` (24), which keeps the register tiles in registers. The `fma_mem_acc`
+/// calibration below is unchanged.
 ///
 /// Load/store ceiling, a ONE-POINT calibration, not a fit of the model. The `fma_mem_acc`
 /// kernel does vector FMAs with m = 3 (load b, load c, store c) at `mem_acc_gflops` = G. Its
@@ -300,19 +436,9 @@ fn access_ops(access: &Access, inner: &Loop, lanes: usize) -> usize {
 /// `G * 3 / m` GFLOP/s (vectorized) and, at 2 FLOP per scalar FMA, `G * 3 / (m * lanes)`
 /// GFLOP/s (scalar). ASSUMED: a scalar memory op costs as much as a vector one, loads and
 /// stores share one pool, and nothing else (address arithmetic, the loop branch) limits.
-pub fn mem_ops_per_fma(nest: &LoopNest, lanes: usize) -> Result<usize, BenchError> {
-    let inner = nest
-        .loops
-        .last()
-        .ok_or_else(|| model_err("the nest has no loops".to_string()))?;
-    let mut all_loads = Vec::new();
-    loads(&nest.body.value, &mut all_loads);
-    let load_ops: usize = distinct(all_loads)
-        .into_iter()
-        .map(|load| access_ops(load, inner, lanes))
-        .sum();
-    let store_ops = access_ops(&nest.body.target, inner, lanes).max(1);
-    Ok(load_ops + store_ops)
+pub fn mem_ops_per_fma(nest: &LoopNest, lanes: usize) -> Result<f64, BenchError> {
+    let (mem_ops, fma_ops) = nest_ops(nest, lanes)?;
+    Ok(mem_ops / fma_ops)
 }
 
 /// Predicts the update nest of `kernel` on `machine`. Errors if the machine numbers are not
@@ -337,7 +463,7 @@ pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchEr
     // The load/store ceiling is derived at `mem_ops_per_fma`.
     let is_vectorized = nest.loops.last().is_some_and(|l| l.vectorize);
     let lanes = machine.lanes as f64;
-    let mem_ops = mem_ops_per_fma(nest, machine.lanes)? as f64;
+    let mem_ops = mem_ops_per_fma(nest, machine.lanes)?;
     let ldst_per_fma = machine.mem_acc_gflops * MEM_ACC_KERNEL_MEM_OPS / mem_ops;
     let (fma_gflops, ldst_gflops) = if is_vectorized {
         (machine.peak_gflops, ldst_per_fma)
@@ -549,7 +675,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "PREDICTION by the analytic model v1, not a measurement"
+        "PREDICTION by the analytic model v1.1, not a measurement"
     );
     let _ = writeln!(
         text,
@@ -678,7 +804,7 @@ pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "analytic model v1 (PREDICTION) against the measurements in {source}"
+        "analytic model v1.1 (PREDICTION) against the measurements in {source}"
     );
     let _ = writeln!(
         out,
@@ -1027,36 +1153,40 @@ mod tests {
         assert_eq!(text.matches("reorder(1,").count(), TOP, "{text}");
     }
 
-    fn mem_ops(n: usize, text: &str) -> usize {
+    fn mem_ops(n: usize, text: &str) -> f64 {
         let kernel = scheduled(n, text);
         mem_ops_per_fma(update_nest(&kernel), Machine::assumed_m5().lanes).expect("counts")
     }
 
-    /// Per iteration of the innermost loop. Naive nest `i, k, j`: C[i,j] load, A[i,k] load,
-    /// B[k,j] load, C[i,j] store. Innermost j: A is invariant, hoisted (0): load C, load B,
-    /// store C = 3. Vectorized on j, C and B are unit stride in j, so 3 vector ops = 3.
+    /// Naive nest `i, k, j`: per FMA C[i,j] load, B[k,j] load, C[i,j] store, and A[i,k] once per
+    /// `j` loop (held across it in a register): m = 3 + 1 / (iterations of j). Scalar at N = 64
+    /// and vectorized at N = 256 (4 lanes) both iterate j 64 times: 3 + 1/64 = 3.015625. C and
+    /// B over j need 64 and 16 * 4 registers at most, and depend on j, so they are not held.
+    /// (Vectorized at N = 64, a row of C is 16 registers and IS held across k: m = 1.09375.)
     #[test]
-    fn the_naive_nest_has_three_memory_ops_per_fma_scalar_or_vector() {
-        assert_eq!(mem_ops(64, ""), 3);
-        assert_eq!(mem_ops(64, "vectorize(1, j)"), 3);
-        assert_eq!(mem_ops(64, TILED), 3);
+    fn the_naive_nest_has_about_three_memory_ops_per_fma_scalar_or_vector() {
+        assert_eq!(mem_ops(64, ""), 3.015625);
+        assert_eq!(mem_ops(256, "vectorize(1, j)"), 3.015625);
+        assert_eq!(mem_ops(64, TILED), 3.015625);
+        assert_eq!(mem_ops(64, "vectorize(1, j)"), 1.09375);
     }
 
-    /// `i, j, k`: innermost k. A[i,k] load and B[k,j] load depend on k (2). The C[i,j] load is
-    /// invariant in k, hoisted (0). The C[i,j] store is invariant too, but the loop IR (and our
-    /// C backend) stores in every iteration, so it counts 1: m = 3. The "hoisted store" reading
-    /// would give 2; it is not used because no measurement says clang sinks the store.
+    /// `i, j, k`: A[i,k] and B[k,j] depend on k: 2 per FMA. C[i,j] is invariant in k and one
+    /// register: held across k, its load and store are paid once per `k` loop: m = 2 + 2 / 64.
+    /// (v1 counted the store in every iteration, m = 3, because no measurement showed that
+    /// clang sinks it; the register tile and `tiled+vectorize` measurements say it does.)
     #[test]
-    fn a_store_invariant_in_the_innermost_loop_still_counts_one_op() {
-        assert_eq!(mem_ops(64, "reorder(1, i, j, k)"), 3);
+    fn an_invariant_target_is_held_across_the_innermost_loop() {
+        assert_eq!(mem_ops(64, "reorder(1, i, j, k)"), 2.03125);
     }
 
-    /// `i, k, j` vectorized on j (4 lanes), with the load B[k, j] turned into B[j, k] by hand
-    /// (`apply` cannot make a strided load here): B is strided in j, 4 scalar ops. C load 1,
-    /// A hoisted 0, C store 1 (unit stride, as `vectorize` demands). m = 1 + 4 + 1 = 6.
+    /// `i, k, j` vectorized on j (4 lanes), N = 256, with the load B[k, j] turned into B[j, k]
+    /// by hand (`apply` cannot make a strided load here): B is strided in j, 4 scalar ops per
+    /// vector iteration. Per vector iteration C load 1, B 4, C store 1; A once per j loop (64
+    /// vector iterations). m = (6 * 64 + 1) / 64 = 6.015625.
     #[test]
     fn a_strided_load_in_a_vectorized_loop_costs_one_op_per_lane() {
-        let mut kernel = scheduled(64, "vectorize(1, j)");
+        let mut kernel = scheduled(256, "vectorize(1, j)");
         let Expr::Binary(_, _, product) = &mut kernel.nests[UPDATE_NEST].body.value else {
             panic!("C + A * B");
         };
@@ -1067,19 +1197,91 @@ mod tests {
             panic!("load B");
         };
         b.index.reverse();
-        assert_eq!(mem_ops_per_fma(update_nest(&kernel), 4), Ok(6));
+        assert_eq!(mem_ops_per_fma(update_nest(&kernel), 4), Ok(6.015625));
     }
 
-    /// mem_acc = 60 (placeholder), m = 3: vectorized 60 * 3 / 3 = 60, scalar 60 * 3 / (3 * 4) =
-    /// 15. Both are below the FMA ceilings 100 and 100 / 4 = 25, so they are the ld/st bound.
+    /// Register tiles at N = 64 (K = 64 iterations of k, 4 lanes). C over `ii, ji` fits 24
+    /// registers and is held across k: its loads and stores are paid once per tile. Per tile:
+    /// - 4x16: A 4 K, B 4 K, C 16 + 16: (8 * 64 + 32) / (16 * 64) = 544 / 1024 = 0.53125. The
+    ///   0.5 of "A 4, B 4, FMA 16 per k" is the limit of large K.
+    /// - 2x8: A 2 K, B 2 K, C 4 + 4: 264 / 256 = 1.03125.
+    /// - 8x8: A 8 K, B 2 K, C 16 + 16: 672 / 1024 = 0.65625.
+    #[test]
+    fn register_tiles_pay_a_k_th_of_the_tile_and_hold_c() {
+        let tile = |ri: usize, rj: usize| {
+            format!(
+                "split(1, i, io, ii, {ri}); split(1, j, jo, ji, {rj}); \
+                 reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)"
+            )
+        };
+        assert_eq!(mem_ops(64, &tile(4, 16)), 0.53125);
+        assert_eq!(mem_ops(64, &tile(2, 8)), 1.03125);
+        assert_eq!(mem_ops(64, &tile(8, 8)), 0.65625);
+    }
+
+    /// The same 4x16 tile without the unroll steps: `ii` is a loop that C depends on, so a
+    /// register cannot hold C across k (clang keeps nothing, `tests/unroll.rs`). C: 16 + 16
+    /// per k; A 4 per k (held across ji), B 4 per k: 40 / 16 = 2.5.
+    #[test]
+    fn a_tile_without_unroll_does_not_hold_c() {
+        let rolled = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
+                      reorder(1, io, jo, k, ii, ji); vectorize(1, ji)";
+        assert_eq!(mem_ops(64, rolled), 2.5);
+    }
+
+    /// `tiled+vectorize` (32 x 64, N = 64): B over ji is 16 registers, held across ii: 16 loads
+    /// per k. C over `ii, ji` is 32 * 16 = 512 registers, not held: 16 loads and 16 stores per
+    /// k and ii. A[i,k] held across ji: 1 per k and ii. Per k and ii (16 FMAs):
+    /// (16 + 16 + 1 + 16 / 32) / 16 = 33.5 / 16 = 2.09375.
+    #[test]
+    fn tiled_vectorized_holds_b_across_ii() {
+        assert_eq!(mem_ops(64, &format!("{TILED}; vectorize(1, ji)")), 2.09375);
+    }
+
+    /// An unrolled loop that is not part of a tile, N = 4. `i, k, j` with `k` unrolled: `j`
+    /// is the plain loop inside it, so nothing is held that was not before: same as without
+    /// unroll, 3 + 1 / 4 = 3.25. `i, j, k` with `k` unrolled: A[i,k] (4 registers) is held
+    /// across j: 4 * 4 = 16 loads; B[k,j] 64; C[i,j] held across k: 16 loads and 16 stores:
+    /// 112 / 64 = 1.75. All three loops unrolled: A, B and C are 16 elements each and loaded
+    /// once (stored once): 64 / 64 = 1.
+    #[test]
+    fn unrolled_loops_outside_a_tile_hold_what_fits() {
+        assert_eq!(mem_ops(4, "unroll(1, k)"), 3.25);
+        assert_eq!(mem_ops(4, ""), 3.25);
+        assert_eq!(mem_ops(4, "reorder(1, i, j, k); unroll(1, k)"), 1.75);
+        assert_eq!(mem_ops(4, "unroll(1, i); unroll(1, k); unroll(1, j)"), 1.0);
+    }
+
+    /// mem_acc = 60 (placeholder), vectorized at N = 256 and scalar at N = 64 both have m =
+    /// 3.015625: vectorized 60 * 3 / m = 59.689..., scalar 60 * 3 / (m * 4) = 14.922... Both are
+    /// below the FMA ceilings 100 and 100 / 4 = 25, so they are the ld/st bound. A register tile
+    /// (4x16, N = 64, m = 0.53125) has the ceiling 60 * 3 / m = 338.8, so the FMA peak binds.
     #[test]
     fn the_ldst_ceiling_follows_the_one_point_calibration() {
-        let machine = Machine::assumed_m5();
+        // Fast caches, so that at N = 256 the L2 traffic does not bind.
+        let machine = Machine {
+            mem_gbs: 1e6,
+            l2_gbs: 1e6,
+            ..Machine::assumed_m5()
+        };
+        let m = 3.015625;
         let scalar = predict(&machine, &naive(64)).expect("predicts");
-        let vector = predict(&machine, &scheduled(64, "vectorize(1, j)")).expect("predicts");
-        assert!((scalar.gflops - 15.0).abs() < 1e-9, "{}", scalar.gflops);
-        assert!((vector.gflops - 60.0).abs() < 1e-9, "{}", vector.gflops);
+        let vector = predict(&machine, &scheduled(256, "vectorize(1, j)")).expect("predicts");
+        assert!(
+            (scalar.gflops - 60.0 * 3.0 / (m * 4.0)).abs() < 1e-9,
+            "{}",
+            scalar.gflops
+        );
+        assert!(
+            (vector.gflops - 60.0 * 3.0 / m).abs() < 1e-9,
+            "{}",
+            vector.gflops
+        );
         assert_eq!((scalar.bound, vector.bound), ("ldst", "ldst"));
+        let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
+                    reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
+        let tiled = predict(&machine, &scheduled(64, tile)).expect("predicts");
+        assert_eq!((tiled.gflops, tiled.bound), (100.0, "compute"));
     }
 
     /// With peak 40 the FMA ceilings are 40 (vectorized) and 40 / 4 = 10 (scalar), below the
@@ -1101,6 +1303,35 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../bench/results/2026-10-16-ffce49d.jsonl"
     );
+
+    const S3: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../bench/results/2026-10-18-4928ffa.jsonl"
+    );
+
+    /// The S3 machine (mem_acc 31.1262 is from the old, loop-overhead-bound kernel), N = 256:
+    /// the register tiles are the top 3 of the space; the next schedule has no unroll. The
+    /// 4x16 tile at N = 128 is bound by the FMA peak, not by loads and stores.
+    #[test]
+    fn register_tiles_rank_first_on_the_s3_machine() {
+        let text = std::fs::read_to_string(S3).expect("the S3 file");
+        let (machine, mem_acc_measured) = machine_from_results(&text).expect("parses");
+        assert!(mem_acc_measured);
+        assert_eq!(machine.mem_acc_gflops, 31.1262);
+        let ranked = rank_matmul(&machine, 256).expect("ranks");
+        assert!(ranked[..3].iter().all(|r| r.schedule.contains("unroll(")));
+        assert!(!ranked[3].schedule.contains("unroll("));
+        let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
+                    reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
+        let p = predict_schedule(&machine, 128, tile).expect("predicts");
+        // flops / (flops / peak) rounds twice: a few ulp, far below 1e-9 relative.
+        assert!(
+            (p.gflops / machine.peak_gflops - 1.0).abs() < 1e-9,
+            "{}",
+            p.gflops
+        );
+        assert_eq!(p.bound, "compute");
+    }
 
     /// The peak line of the committed S2 file has no `fma_mem_acc_gflops`.
     #[test]
