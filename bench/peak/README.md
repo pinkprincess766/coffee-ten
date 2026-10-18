@@ -30,6 +30,9 @@ fma_mem_acc is the FMA throughput when every FMA also loads and stores its accum
 current matmul schedules do while C[i, j] lives in memory: c[j] = fma(a, b[j], c[j]) over 1024
 floats in two 4 KiB arrays, assumed L1-resident (L1D 128 KiB, assumed). Its 256 float32x4
 vectors are more than the 32 vector registers, so c cannot stay in registers across passes.
+The loop does four vectors per iteration, as clang interleaves the vectorized matmul loop;
+with one vector per iteration the loop instructions themselves were the limit (the
+2026-10-18 results file has that older kernel: 31 GFLOP/s, against about 47 now).
 It is the compute ceiling the cost model should use for such schedules: the fma figure is
 reached only when the accumulator stays in registers, so it overstates what these schedules
 can do. --check verifies it exactly (c[j] = j + 500 after 1000 passes).
