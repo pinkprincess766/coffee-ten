@@ -14,7 +14,7 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 | Code | S1, S2: commit `ffce49d`; S3: commit `4928ffa` (adds `unroll` and row-pointer indexing, #42–#44); clean tree (`"dirty": false` in every record) |
 | Sessions | S1 2026-10-15, 60 s pauses between series; S2 2026-10-16 on a cold Mac, 180 s pauses; S3 2026-10-18 on a cold Mac, 60 s pauses |
 | Method | per (kernel, N): one warm-up round, then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
-| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50) |
+| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`) |
 
 Every variant was checked against the naive kernel within the inner-product error bound
 before it was timed.
@@ -118,6 +118,42 @@ results; the rest is marked as an observation.
 - **The naive kernel runs at ~7.5 GFLOP/s, 6% of peak**, flat in N: scalar code,
   one fused multiply-add per inner iteration, bounded by issue and load/store rather
   than by the memory hierarchy.
+
+## Hypothesis A (spec §7.1), run 1: not met
+
+The hypothesis: the analytic model's top 10 contains a schedule at least 90% as fast as
+the best one random search finds with 1000 measurements. Run 1 (commit `c435f89`, N = 256,
+seed 1, machine P2):
+
+1. 1000 random candidates of the 7334-schedule space, 5 samples each;
+2. the model's top 10, same way;
+3. the best of each group in one interleaved run, 30 rounds; the decision uses only that run.
+
+| | schedule | median [p25–p75], GFLOP/s |
+|---|---|---|
+| best random (candidate 886 of 1000) | 4×16 register tile | **121.97** [121.83–122.27] |
+| best of the model's top 10 (rank 2) | `split i 128, j 64, k 128; reorder io, ko, jo, ii, ki, ji; vectorize ji` | **75.86** [75.71–76.39] |
+
+**Ratio 0.622: the criterion is not met.** Over the 1000 random candidates the model's
+Spearman correlation with the measurements is 0.292, and its median error is ×2.10 (on
+the 19 hand-picked S3 schedules it was 0.922 and ×1.07). Why, from the log:
+
+- **`vectorize` on a short loop does nothing.** Under the benchmark flags clang fully
+  unrolls a loop of 8 or 16 iterations before its loop vectorizer runs, so the pragma
+  finds no loop and the code stays scalar. Vectorized random candidates by `ji` extent
+  (measured median vs the model's median prediction): 8: 13.0 vs 80.5; 16: 14.9 vs 93.9;
+  32: 24.1 vs 66.0; 64: 24.7 vs 67.8; 128: 20.6 vs 46.5 GFLOP/s. The model believes the
+  schedule; the schedule does not do what it says. This is a code generator problem first.
+- **The model's top 10 has no register tile.** It predicts schedules with `ii, ki, ji`
+  innermost at the FMA peak (a 16-vector row of C held in registers across `ki`, never
+  checked in clang); they measured 31–77. The six register tiles tie with them at the
+  peak, and the tie is broken by the schedule text, which puts `ii, 128` before `ii, 2`.
+- **Random search found a register tile only once** (candidate 886): 6 tiles among 7334
+  candidates give 0.8 expected in 1000 draws.
+
+Next: make `vectorize` vectorize short loops, check the C-row hoisting across `ki` in the
+optimized IR, break ties at the cap by something other than the text, then repeat with a
+new seed. Until then the hypothesis stays open; this run is kept as it is.
 
 ## Validity
 
