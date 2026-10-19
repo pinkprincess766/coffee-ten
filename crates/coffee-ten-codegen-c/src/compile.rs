@@ -175,20 +175,25 @@ pub fn compile_with_flags(
 
     if !library_path.exists() {
         std::fs::create_dir_all(cache_dir).map_err(io_error)?;
-        std::fs::write(&source_path, &source).map_err(io_error)?;
-        // Build under a private name and rename, so a reader never sees a half-written file.
-        let temp_path = cache_dir.join(format!(
-            "{stem}.{}.tmp-{}",
-            std::env::consts::DLL_EXTENSION,
-            std::process::id()
+        // Write and build under names private to this call, then rename, so a reader never
+        // sees a half-written file. Private to the call, not just the process: `cargo test`
+        // threads of one process build the same kernel at the same time.
+        let call = format!("{}-{}", std::process::id(), next_call_id());
+        let temp_source = cache_dir.join(format!("{stem}.tmp-{call}.c"));
+        let temp_library = cache_dir.join(format!(
+            "{stem}.{}.tmp-{call}",
+            std::env::consts::DLL_EXTENSION
         ));
-        let built = run_clang(flags, &source_path, &temp_path);
-        let renamed =
-            built.and_then(|()| std::fs::rename(&temp_path, &library_path).map_err(io_error));
-        if renamed.is_err() {
-            let _ = std::fs::remove_file(&temp_path);
+        let built = std::fs::write(&temp_source, &source)
+            .map_err(io_error)
+            .and_then(|()| run_clang(flags, &temp_source, &temp_library))
+            .and_then(|()| std::fs::rename(&temp_source, &source_path).map_err(io_error))
+            .and_then(|()| std::fs::rename(&temp_library, &library_path).map_err(io_error));
+        if built.is_err() {
+            let _ = std::fs::remove_file(&temp_source);
+            let _ = std::fs::remove_file(&temp_library);
         }
-        renamed?;
+        built?;
     }
 
     let (library, entry) = load(&library_path)?;
@@ -198,6 +203,12 @@ pub fn compile_with_flags(
         buffer_lens,
         library_path,
     })
+}
+
+/// A number no other `compile` call of this process has had.
+fn next_call_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `void ct_entry(float *const *bufs) { name((void *)bufs[0], (void *)bufs[1], ...); }`
