@@ -533,6 +533,32 @@ mod tests {
     }
 
     #[test]
+    fn threads_compiling_the_same_kernel_at_once_all_succeed() {
+        // `cargo test` runs tests as threads of one process, and two tests may build the
+        // same kernel into the same cache at the same moment. Each round starts from an
+        // empty cache, so every thread misses it and builds.
+        const THREADS: usize = 8;
+        for round in 0..5 {
+            let dir = TempDir::new(&format!("race-{round}"));
+            let barrier = std::sync::Barrier::new(THREADS);
+            let results: Vec<Result<PathBuf, CompileError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            compile(&matmul(), &dir.0).map(|k| k.library_path().to_path_buf())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for result in results {
+                assert!(result.is_ok(), "round {round}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
     fn different_flags_get_different_libraries() {
         let dir = TempDir::new("flags");
         let test = compile_with_flags(&matmul(), &dir.0, TEST_FLAGS).unwrap();
