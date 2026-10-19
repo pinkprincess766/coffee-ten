@@ -60,7 +60,12 @@ pub const PLACEHOLDER_L2_GBS: f64 = 200.0;
 /// PLACEHOLDER, not measured: GFLOP/s of the `fma_mem_acc` kernel of `bench/peak` (every vector
 /// FMA loads and stores its accumulator in L1). Replace by the `fma_mem_acc_gflops` median.
 pub const PLACEHOLDER_MEM_ACC_GFLOPS: f64 = 60.0;
-/// Memory ops per FMA of the `fma_mem_acc` kernel: load b, load c, store c.
+/// PLACEHOLDER, not measured: GFLOP/s of the `fma_mem_acc_scalar` kernel of `bench/peak` (the
+/// same pattern in scalar code). Set to the vector placeholder / lanes (4), which is what the
+/// model used for scalar nests before this point was measured. Replace by the
+/// `fma_mem_acc_scalar_gflops` median.
+pub const PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS: f64 = PLACEHOLDER_MEM_ACC_GFLOPS / 4.0;
+/// Memory ops per FMA of the `fma_mem_acc` kernels: load b, load c, store c.
 const MEM_ACC_KERNEL_MEM_OPS: f64 = 3.0;
 
 /// The machine the model predicts for. All fields are inputs, none is detected.
@@ -76,6 +81,10 @@ pub struct Machine {
     /// `fma_mem_acc` kernel, `MEM_ACC_KERNEL_MEM_OPS` memory ops per FMA): the load/store
     /// calibration point.
     pub mem_acc_gflops: f64,
+    /// GFLOP/s of the same pattern in scalar code (the `fma_mem_acc_scalar` kernel, the
+    /// instruction shape of the naive inner loop): the load/store calibration point of scalar
+    /// nests.
+    pub mem_acc_scalar_gflops: f64,
     /// L1 data cache size in bytes.
     pub l1_bytes: usize,
     /// L2 cache size in bytes.
@@ -96,6 +105,7 @@ impl Machine {
             mem_gbs: PLACEHOLDER_MEM_GBS,
             l2_gbs: PLACEHOLDER_L2_GBS,
             mem_acc_gflops: PLACEHOLDER_MEM_ACC_GFLOPS,
+            mem_acc_scalar_gflops: PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS,
             l1_bytes: 128 * 1024,
             l2_bytes: 16 * 1024 * 1024,
             line_bytes: 128,
@@ -109,6 +119,7 @@ impl Machine {
             self.mem_gbs,
             self.l2_gbs,
             self.mem_acc_gflops,
+            self.mem_acc_scalar_gflops,
         ];
         let sizes = [self.l1_bytes, self.l2_bytes, self.line_bytes, self.lanes];
         if speeds.iter().all(|s| s.is_finite() && *s > 0.0) && sizes.iter().all(|s| *s > 0) {
@@ -431,14 +442,19 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
 /// `MAX_ACCUMULATORS` (24), which keeps the register tiles in registers. The `fma_mem_acc`
 /// calibration below is unchanged.
 ///
-/// Load/store ceiling, a ONE-POINT calibration, not a fit of the model. The `fma_mem_acc`
-/// kernel does vector FMAs with m = 3 (load b, load c, store c) at `mem_acc_gflops` = G. Its
-/// vector FMA rate is G / (2 * lanes), so the core retires 3 * G / (2 * lanes) memory ops per
-/// second, if memory ops are what limits it. A nest with m ops per FMA then runs
-/// `G / (2 * lanes) * 3 / m` FMAs per second, which is, at 2 * lanes FLOP per vector FMA,
-/// `G * 3 / m` GFLOP/s (vectorized) and, at 2 FLOP per scalar FMA, `G * 3 / (m * lanes)`
-/// GFLOP/s (scalar). ASSUMED: a scalar memory op costs as much as a vector one, loads and
-/// stores share one pool, and nothing else (address arithmetic, the loop branch) limits.
+/// Load/store ceiling, TWO calibration points, each for its own code shape, not a fit of the
+/// model. The `fma_mem_acc` kernel does vector FMAs with m = 3 (load b, load c, store c) at
+/// `mem_acc_gflops` = G. Its vector FMA rate is G / (2 * lanes), so the core retires
+/// 3 * G / (2 * lanes) memory ops per second, if memory ops are what limits it. A vectorized
+/// nest with m ops per FMA then runs `G / (2 * lanes) * 3 / m` FMAs per second, which is, at
+/// 2 * lanes FLOP per vector FMA, `G * 3 / m` GFLOP/s. A scalar nest (last loop not
+/// vectorized) uses the other point: the `fma_mem_acc_scalar` kernel, the same pattern in
+/// scalar code with the instruction shape of the naive inner loop, at `mem_acc_scalar_gflops`
+/// = S; at 2 FLOP per scalar FMA it gives `S * 3 / m` GFLOP/s. S is NOT G / lanes: measured on
+/// P2, G = 46.94 and S = 8.563, not 11.7. ASSUMED: loads and stores share one pool; for a
+/// vectorized nest nothing else (address arithmetic, the loop branch) limits; the scalar point
+/// already contains that overhead of the naive loop shape, and every scalar nest is assumed to
+/// pay the same.
 pub fn mem_ops_per_fma(nest: &LoopNest, lanes: usize) -> Result<f64, BenchError> {
     let (mem_ops, fma_ops) = nest_ops(nest, lanes)?;
     Ok(mem_ops / fma_ops)
@@ -467,12 +483,12 @@ pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchEr
     let is_vectorized = nest.loops.last().is_some_and(|l| l.vectorize);
     let lanes = machine.lanes as f64;
     let mem_ops = mem_ops_per_fma(nest, machine.lanes)?;
-    let ldst_per_fma = machine.mem_acc_gflops * MEM_ACC_KERNEL_MEM_OPS / mem_ops;
-    let (fma_gflops, ldst_gflops) = if is_vectorized {
-        (machine.peak_gflops, ldst_per_fma)
+    let (fma_gflops, mem_acc_gflops) = if is_vectorized {
+        (machine.peak_gflops, machine.mem_acc_gflops)
     } else {
-        (machine.peak_gflops / lanes, ldst_per_fma / lanes)
+        (machine.peak_gflops / lanes, machine.mem_acc_scalar_gflops)
     };
+    let ldst_gflops = mem_acc_gflops * MEM_ACC_KERNEL_MEM_OPS / mem_ops;
     let ceiling_gflops = fma_gflops.min(ldst_gflops);
     let compute_s = flops / (ceiling_gflops * 1e9);
     let memory_s = mem_bytes as f64 / (machine.mem_gbs * 1e9);
@@ -589,9 +605,12 @@ fn string_after(line: &str, key: &str) -> Option<String> {
     }
 }
 
-/// The machine of the `"kind":"peak"` line of a results file, and whether its `mem_acc` is
-/// measured. Without `fma_mem_acc_gflops` in the line, `mem_acc_gflops` stays the placeholder.
-pub fn machine_from_results(text: &str) -> Result<(Machine, bool), BenchError> {
+/// The machine of the `"kind":"peak"` line of a results file, and whether its `mem_acc` and
+/// `mem_acc_scalar` are measured. Without `fma_mem_acc_gflops` in the line, `mem_acc_gflops`
+/// stays the placeholder. Without `fma_mem_acc_scalar_gflops`, `mem_acc_scalar_gflops` is
+/// `mem_acc_gflops / lanes` (the placeholder, or the measured vector point over lanes, as the
+/// model did before the scalar point existed).
+pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchError> {
     let line = text
         .lines()
         .find(|line| line.contains("\"kind\":\"peak\""))
@@ -610,20 +629,38 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool), BenchError> {
     if let Some(gflops) = mem_acc {
         machine.mem_acc_gflops = gflops;
     }
+    let mem_acc_scalar = median_after(line, "fma_mem_acc_scalar_gflops");
+    machine.mem_acc_scalar_gflops =
+        mem_acc_scalar.unwrap_or(machine.mem_acc_gflops / machine.lanes as f64);
     machine.check()?;
-    Ok((machine, mem_acc.is_some()))
+    Ok((machine, mem_acc.is_some(), mem_acc_scalar.is_some()))
 }
 
 /// The header note on where the machine numbers of `--from path` came from.
-fn from_note(path: &str, mem_acc_measured: bool) -> String {
-    if mem_acc_measured {
-        format!("peak, mem, L2, mem_acc from {path}")
-    } else {
-        format!(
-            "peak, mem, L2 from {path}; mem_acc {PLACEHOLDER_MEM_ACC_GFLOPS} is a PLACEHOLDER \
+fn from_note(path: &str, mem_acc_measured: bool, mem_acc_scalar_measured: bool) -> String {
+    let mut note = format!(
+        "peak, mem, L2{}{} from {path}",
+        if mem_acc_measured { ", mem_acc" } else { "" },
+        if mem_acc_scalar_measured {
+            ", mem_acc_scalar"
+        } else {
+            ""
+        }
+    );
+    if !mem_acc_measured {
+        let _ = write!(
+            note,
+            "; mem_acc {PLACEHOLDER_MEM_ACC_GFLOPS} is a PLACEHOLDER \
              (no fma_mem_acc_gflops in the peak line)"
-        )
+        );
     }
+    if !mem_acc_scalar_measured {
+        note.push_str(
+            "; mem_acc_scalar is a PLACEHOLDER, mem_acc / lanes \
+             (no fma_mem_acc_scalar_gflops in the peak line)",
+        );
+    }
+    note
 }
 
 fn read_results(path: &str) -> Result<String, BenchError> {
@@ -656,9 +693,9 @@ pub fn parse_model_args<I: IntoIterator<Item = String>>(
                 })?);
             }
             "--from" => {
-                let (from, mem_acc_measured) = machine_from_results(&read_results(&value)?)?;
+                let (from, vector, scalar) = machine_from_results(&read_results(&value)?)?;
                 machine = from;
-                source = from_note(&value, mem_acc_measured);
+                source = from_note(&value, vector, scalar);
             }
             "--peak" => machine.peak_gflops = speed()?,
             "--mem-gbs" => machine.mem_gbs = speed()?,
@@ -687,12 +724,13 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     );
     let _ = writeln!(
         text,
-        "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s ({source}); \
-         L1 {} B, L2 {} B, line {} B, {} lanes (ASSUMED)",
+        "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
+         mem_acc_scalar {} GFLOP/s ({source}); L1 {} B, L2 {} B, line {} B, {} lanes (ASSUMED)",
         machine.peak_gflops,
         machine.mem_gbs,
         machine.l2_gbs,
         machine.mem_acc_gflops,
+        machine.mem_acc_scalar_gflops,
         machine.l1_bytes,
         machine.l2_bytes,
         machine.line_bytes,
@@ -765,7 +803,7 @@ fn short_schedule(schedule: &str) -> String {
 /// The report of `coffee-ten-bench model compare`: the model against the `matmul` records of
 /// the results file `text` (`source` is its name) that are not flagged `drift`.
 pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
-    let (machine, mem_acc_measured) = machine_from_results(text)?;
+    let (machine, mem_acc_measured, mem_acc_scalar_measured) = machine_from_results(text)?;
     let (mut drifted, mut other_kernels) = (0, 0);
     let (mut measured, mut predicted, mut rows) = (Vec::new(), Vec::new(), String::new());
     for (number, line) in text.lines().enumerate().map(|(i, line)| (i + 1, line)) {
@@ -811,12 +849,14 @@ pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
     );
     let _ = writeln!(
         out,
-        "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s ({})",
+        "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
+         mem_acc_scalar {} GFLOP/s ({})",
         machine.peak_gflops,
         machine.mem_gbs,
         machine.l2_gbs,
         machine.mem_acc_gflops,
-        from_note(source, mem_acc_measured)
+        machine.mem_acc_scalar_gflops,
+        from_note(source, mem_acc_measured, mem_acc_scalar_measured)
     );
     let _ = writeln!(
         out,
@@ -1075,6 +1115,7 @@ mod tests {
         // A huge mem_acc takes the load/store ceiling out, leaving the FMA ceiling of v0.
         let machine = Machine {
             mem_acc_gflops: 1e9,
+            mem_acc_scalar_gflops: 1e9,
             ..Machine::assumed_m5()
         };
         let plain = predict(&machine, &naive(64)).expect("predicts");
@@ -1310,8 +1351,9 @@ mod tests {
         assert_eq!(mem_ops(4, "unroll(1, i); unroll(1, k); unroll(1, j)"), 1.0);
     }
 
-    /// mem_acc = 60 (placeholder), vectorized at N = 256 and scalar at N = 64 both have m =
-    /// 3.015625: vectorized 60 * 3 / m = 59.689..., scalar 60 * 3 / (m * 4) = 14.922... Both are
+    /// mem_acc = 60 and mem_acc_scalar = 60 / 4 = 15 (placeholders), vectorized at N = 256 and
+    /// scalar at N = 64 both have m = 3.015625: vectorized 60 * 3 / m = 59.689..., scalar
+    /// 15 * 3 / m = 14.922... Both are
     /// below the FMA ceilings 100 and 100 / 4 = 25, so they are the ld/st bound. A register tile
     /// (4x16, N = 64, m = 0.53125) has the ceiling 60 * 3 / m = 338.8, so the FMA peak binds.
     #[test]
@@ -1326,7 +1368,7 @@ mod tests {
         let scalar = predict(&machine, &naive(64)).expect("predicts");
         let vector = predict(&machine, &scheduled(256, "vectorize(1, j)")).expect("predicts");
         assert!(
-            (scalar.gflops - 60.0 * 3.0 / (m * 4.0)).abs() < 1e-9,
+            (scalar.gflops - 15.0 * 3.0 / m).abs() < 1e-9,
             "{}",
             scalar.gflops
         );
@@ -1340,6 +1382,36 @@ mod tests {
                     reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
         let tiled = predict(&machine, &scheduled(64, tile)).expect("predicts");
         assert_eq!((tiled.gflops, tiled.bound), (100.0, "compute"));
+    }
+
+    /// The measured P2 points: mem_acc 46.9387, mem_acc_scalar 8.563 (not 46.9387 / 4 = 11.73).
+    /// The naive `i, k, j` at N = 64 is scalar with m = 3.015625, so its ceiling is
+    /// 8.563 * 3 / 3.015625 = 8.5186..., below the scalar FMA ceiling 100 / 4. The vectorized
+    /// nest (N = 256, same m) uses mem_acc only: 46.9387 * 3 / 3.015625, whatever the scalar point.
+    #[test]
+    fn a_scalar_nest_uses_the_scalar_calibration_point() {
+        let machine = Machine {
+            mem_acc_gflops: 46.9387,
+            mem_acc_scalar_gflops: 8.563,
+            mem_gbs: 1e6,
+            l2_gbs: 1e6,
+            ..Machine::assumed_m5()
+        };
+        let m = 3.015625;
+        let scalar = predict(&machine, &naive(64)).expect("predicts");
+        let expected = 8.563 * 3.0 / m;
+        assert!((scalar.gflops - expected).abs() < 1e-9, "{}", scalar.gflops);
+        assert!((scalar.gflops - 8.5186).abs() < 1e-4, "{}", scalar.gflops);
+        assert_eq!(scalar.bound, "ldst");
+        let vector = predict(&machine, &scheduled(256, "vectorize(1, j)")).expect("predicts");
+        let expected = 46.9387 * 3.0 / m;
+        assert!((vector.gflops - expected).abs() < 1e-9, "{}", vector.gflops);
+        let other = Machine {
+            mem_acc_scalar_gflops: 1.0,
+            ..machine
+        };
+        let again = predict(&other, &scheduled(256, "vectorize(1, j)")).expect("predicts");
+        assert_eq!(again.gflops, vector.gflops);
     }
 
     /// With peak 40 the FMA ceilings are 40 (vectorized) and 40 / 4 = 10 (scalar), below the
@@ -1373,9 +1445,12 @@ mod tests {
     #[test]
     fn register_tiles_rank_first_on_the_s3_machine() {
         let text = std::fs::read_to_string(S3).expect("the S3 file");
-        let (machine, mem_acc_measured) = machine_from_results(&text).expect("parses");
-        assert!(mem_acc_measured);
+        let (machine, mem_acc_measured, scalar_measured) =
+            machine_from_results(&text).expect("parses");
+        assert!(mem_acc_measured && !scalar_measured);
         assert_eq!(machine.mem_acc_gflops, 31.1262);
+        // No scalar field: the scalar point stays the vector one over lanes, as before.
+        assert_eq!(machine.mem_acc_scalar_gflops, 31.1262 / 4.0);
         let ranked = rank_matmul(&machine, 256).expect("ranks");
         assert!(ranked[..6].iter().all(|r| r.schedule.contains("unroll(")));
         assert!(!ranked[6].schedule.contains("unroll("));
@@ -1395,13 +1470,19 @@ mod tests {
     #[test]
     fn from_reads_the_committed_peak_line_and_keeps_the_placeholder_mem_acc() {
         let text = std::fs::read_to_string(S2).expect("the committed file");
-        let (machine, mem_acc_measured) = machine_from_results(&text).expect("parses");
+        let (machine, mem_acc_measured, scalar_measured) =
+            machine_from_results(&text).expect("parses");
         assert_eq!(
             (machine.peak_gflops, machine.mem_gbs, machine.l2_gbs),
             (122.0494, 107.8728, 120.3851)
         );
         assert_eq!(machine.mem_acc_gflops, PLACEHOLDER_MEM_ACC_GFLOPS);
-        assert!(!mem_acc_measured);
+        assert_eq!(
+            machine.mem_acc_scalar_gflops,
+            PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS
+        );
+        assert_eq!(PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS, 15.0);
+        assert!(!mem_acc_measured && !scalar_measured);
         let args = ["--n", "8", "--from", S2, "--l2-gbs", "50"];
         let (_, from, source) = parse_model_args(args.map(String::from)).expect("parses");
         assert_eq!((from.peak_gflops, from.l2_gbs), (122.0494, 50.0));
@@ -1411,15 +1492,36 @@ mod tests {
     #[test]
     fn from_reads_mem_acc_when_the_peak_line_has_it() {
         let line = r#"{"kind":"peak","fma_gflops":{"median":100.5,"n":30},"triad_gbs":{"median":90.25,"n":30},"fma_mem_acc_gflops":{"median":61.5,"p25":60.0,"n":30},"triad_l2_gbs":{"median":110.0,"n":30}}"#;
-        let (machine, mem_acc_measured) = machine_from_results(line).expect("parses");
+        let (machine, mem_acc_measured, scalar_measured) =
+            machine_from_results(line).expect("parses");
         assert_eq!(
             (machine.peak_gflops, machine.mem_gbs, machine.l2_gbs),
             (100.5, 90.25, 110.0)
         );
         assert_eq!(machine.mem_acc_gflops, 61.5);
-        assert!(mem_acc_measured);
+        assert_eq!(machine.mem_acc_scalar_gflops, 61.5 / 4.0);
+        assert!(mem_acc_measured && !scalar_measured);
         assert!(machine_from_results(r#"{"kernel":"matmul"}"#).is_err());
         assert!(machine_from_results(r#"{"kind":"peak","fma_gflops":{"median":1.0}}"#).is_err());
+    }
+
+    #[test]
+    fn from_reads_mem_acc_scalar_when_the_peak_line_has_it() {
+        let line = r#"{"kind":"peak","fma_gflops":{"median":100.5,"n":30},"triad_gbs":{"median":90.25,"n":30},"fma_mem_acc_gflops":{"median":61.5,"n":30},"fma_mem_acc_scalar_gflops":{"median":8.5632,"n":30},"triad_l2_gbs":{"median":110.0,"n":30}}"#;
+        let (machine, mem_acc_measured, scalar_measured) =
+            machine_from_results(line).expect("parses");
+        assert_eq!(
+            (machine.mem_acc_gflops, machine.mem_acc_scalar_gflops),
+            (61.5, 8.5632)
+        );
+        assert!(mem_acc_measured && scalar_measured);
+        let note = from_note("f", mem_acc_measured, scalar_measured);
+        assert!(!note.contains("PLACEHOLDER"), "{note}");
+        let note = from_note("f", true, false);
+        assert!(note.contains("mem_acc_scalar is a PLACEHOLDER"), "{note}");
+        // The report header carries the scalar point.
+        let header = report(8, &machine, &note, &[]);
+        assert!(header.contains("mem_acc_scalar 8.5632 GFLOP/s"), "{header}");
     }
 
     #[test]
