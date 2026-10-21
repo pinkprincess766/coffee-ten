@@ -1,5 +1,6 @@
-//! Analytic cost model, version 1.1 (spec §7.1): cache traffic from the loop footprints plus a
-//! roofline whose compute ceiling is the lower of the FMA and the load/store ceiling.
+//! Analytic cost model, version 1.2 (spec §7.1): cache traffic from the loop footprints plus a
+//! roofline whose compute ceiling is the lowest of the FMA, the load/store and the latency
+//! ceiling (dependent FMA chains of a reduction held in registers, see `latency_gflops`).
 //! Deterministic; the machine numbers are inputs (assumed, or read from a results file).
 //!
 //! Only the update nest (nest 1) of a matmul kernel is modelled; the init nest is ignored.
@@ -71,6 +72,16 @@ pub const PLACEHOLDER_MEM_ACC_GFLOPS: f64 = 60.0;
 /// model used for scalar nests before this point was measured. Replace by the
 /// `fma_mem_acc_scalar_gflops` median.
 pub const PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS: f64 = PLACEHOLDER_MEM_ACC_GFLOPS / 4.0;
+/// PLACEHOLDER: GFLOP/s of one dependent scalar FMA chain (the `fma_chain` kernel of
+/// `bench/peak`). Hand microbenchmark on an Apple M5: 0.76 ns per FMA. Replace by the
+/// `fma_chain_gflops` median.
+pub const PLACEHOLDER_FMA_CHAIN_GFLOPS: f64 = 2.6;
+/// PLACEHOLDER: GFLOP/s of the naive scalar reduction split into independent chains of
+/// `CHAIN_CALIBRATION_LENGTH` FMAs (the `fma_chain256` kernel of `bench/peak`). Hand
+/// microbenchmark on an Apple M5. Replace by the `fma_chain256_gflops` median.
+pub const PLACEHOLDER_FMA_CHAIN256_GFLOPS: f64 = 3.49;
+/// Chain length at which `fma_chain256_gflops` is measured, and so the window `W` is calibrated.
+const CHAIN_CALIBRATION_LENGTH: f64 = 256.0;
 /// Memory ops per FMA of the `fma_mem_acc` kernels: load b, load c, store c.
 const MEM_ACC_KERNEL_MEM_OPS: f64 = 3.0;
 
@@ -91,6 +102,12 @@ pub struct Machine {
     /// instruction shape of the naive inner loop): the load/store calibration point of scalar
     /// nests.
     pub mem_acc_scalar_gflops: f64,
+    /// GFLOP/s of one dependent scalar FMA chain (the `fma_chain` kernel): the latency
+    /// calibration point, see `latency_gflops`.
+    pub fma_chain_gflops: f64,
+    /// GFLOP/s of a reduction split into independent chains of 256 scalar FMAs (the
+    /// `fma_chain256` kernel): how far the core overlaps chains, see `latency_gflops`.
+    pub fma_chain256_gflops: f64,
     /// L1 data cache size in bytes.
     pub l1_bytes: usize,
     /// L2 cache size in bytes.
@@ -112,11 +129,19 @@ impl Machine {
             l2_gbs: PLACEHOLDER_L2_GBS,
             mem_acc_gflops: PLACEHOLDER_MEM_ACC_GFLOPS,
             mem_acc_scalar_gflops: PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS,
+            fma_chain_gflops: PLACEHOLDER_FMA_CHAIN_GFLOPS,
+            fma_chain256_gflops: PLACEHOLDER_FMA_CHAIN256_GFLOPS,
             l1_bytes: 128 * 1024,
             l2_bytes: 16 * 1024 * 1024,
             line_bytes: 128,
             lanes: 4,
         }
+    }
+
+    /// The overlap window `W` of `latency_gflops` in FMAs: the independent FMAs the core keeps
+    /// in flight beyond the dependent chain, `256 * (chain256 / chain - 1)`.
+    fn window_fmas(&self) -> f64 {
+        CHAIN_CALIBRATION_LENGTH * (self.fma_chain256_gflops / self.fma_chain_gflops - 1.0)
     }
 
     fn check(&self) -> Result<(), BenchError> {
@@ -126,9 +151,16 @@ impl Machine {
             self.l2_gbs,
             self.mem_acc_gflops,
             self.mem_acc_scalar_gflops,
+            self.fma_chain_gflops,
+            self.fma_chain256_gflops,
         ];
         let sizes = [self.l1_bytes, self.l2_bytes, self.line_bytes, self.lanes];
-        if speeds.iter().all(|s| s.is_finite() && *s > 0.0) && sizes.iter().all(|s| *s > 0) {
+        // A chain of 256 independent-enough FMAs cannot be slower than one dependent chain.
+        let window_ok = self.fma_chain256_gflops >= self.fma_chain_gflops;
+        if speeds.iter().all(|s| s.is_finite() && *s > 0.0)
+            && sizes.iter().all(|s| *s > 0)
+            && window_ok
+        {
             Ok(())
         } else {
             Err(BenchError::Setup(format!(
@@ -149,7 +181,8 @@ pub struct Prediction {
     /// Bytes moved from L2 into L1 (traffic past L1).
     pub l2_bytes: usize,
     /// The roofline term that sets `time_s`: "compute" (FMA issue), "ldst" (loads and stores
-    /// per FMA), "memory" or "l2". A tie goes to the first of "compute"/"ldst", then "memory".
+    /// per FMA), "latency" (dependent FMA chains), "memory" or "l2". A tie goes to the first of
+    /// "compute"/"ldst"/"latency", then "memory".
     pub bound: &'static str,
     /// Memory ops per FMA op of the nest, see `mem_ops_per_fma`; breaks ties in `order`.
     pub mem_ops_per_fma: f64,
@@ -367,35 +400,41 @@ fn registers_over(
     Ok(registers)
 }
 
-/// Memory ops `access` costs over the whole update nest, loads of it or stores of it (the
-/// same count for either; `C[i, j]` has both). Counted as iterations of the loops that are not
-/// held across: a loop `p` is held across if
+/// Per loop of `loops`: whether `access` is held in registers across it. A loop `p` is held
+/// across if
 /// - the access is invariant in `p`, and
 /// - the elements it touches over the loops inside `p` fit `REG_BUDGET` registers, and
 /// - every loop inside `p` that the access depends on is unrolled or vectorized (a register
 ///   cannot be indexed by a loop variable; tested for the `C` tile in
 ///   `crates/coffee-ten-codegen-c/tests/unroll.rs`, where clang keeps nothing in registers
 ///   without the unroll steps).
-///
-/// Each loop that is not held across multiplies the count by its iterations (the vectorized
-/// loop by `extent / lanes` rounded up, times `lanes` for a strided access).
-fn total_ops(access: &Access, loops: &[Loop], lanes: usize) -> Result<f64, BenchError> {
-    let mut ops = 1.0_f64;
+fn held_across(access: &Access, loops: &[Loop], lanes: usize) -> Result<Vec<bool>, BenchError> {
+    let mut held = vec![false; loops.len()];
     let mut rolled_dependence_inside = false;
     for (p, l) in loops.iter().enumerate().rev() {
         let depends = access
             .index
             .iter()
             .any(|index| coeff_of(index, &l.name) != 0);
-        let held = !depends
+        held[p] = !depends
             && !rolled_dependence_inside
             && registers_over(access, loops, p + 1, lanes)? <= REG_BUDGET;
         if depends && !l.unroll && !l.vectorize {
             rolled_dependence_inside = true;
         }
-        if held {
-            continue;
-        }
+    }
+    Ok(held)
+}
+
+/// Memory ops `access` costs over the whole update nest, loads of it or stores of it (the
+/// same count for either; `C[i, j]` has both). Counted as iterations of the loops that are not
+/// held across, see `held_across`. Each loop that is not held across multiplies the count by
+/// its iterations (the vectorized loop by `extent / lanes` rounded up, times `lanes` for a
+/// strided access).
+fn total_ops(access: &Access, loops: &[Loop], lanes: usize) -> Result<f64, BenchError> {
+    let held = held_across(access, loops, lanes)?;
+    let mut ops = 1.0_f64;
+    for (l, _) in loops.iter().zip(&held).filter(|(_, held)| !**held) {
         ops *= if l.vectorize {
             l.extent.div_ceil(lanes) as f64 * access_ops(access, l, lanes).max(1) as f64
         } else {
@@ -493,6 +532,73 @@ pub fn mem_ops_per_fma(nest: &LoopNest, lanes: usize) -> Result<f64, BenchError>
     Ok(mem_ops / fma_ops)
 }
 
+/// Latency ceiling in GFLOP/s of the update `nest` (as compiled, see `as_compiled`), `None` if
+/// there is none.
+///
+/// Derivation. Let `p` be the innermost loop that is not unrolled. If the store target `C` is
+/// held in registers across `p` (`held_across`: it does not depend on `p`, and stays in
+/// registers), each FMA on an accumulator waits for the previous one: the FMAs form dependent
+/// chains. `A` accumulator registers are in flight per iteration of `p` (`registers_over` the
+/// loops inside `p`; a vector register counts once, a scalar once). The chain is as long as `p`
+/// and the consecutive enclosing loops that `C` is also held across: `L` = the product of their
+/// iterations. If `C` is not held across `p`, every FMA stores its result and the chain is
+/// broken through memory; nothing is modelled then (`None`).
+///
+/// A core overlaps a window of `W` FMAs beyond the dependent one, so the FMA rate is
+/// `chain_rate * (A + W / L)` with `chain_rate = fma_chain_gflops / 2` FMAs per ns: `A` chains
+/// run side by side, and the window is shared by the `L` FMAs of a chain. In GFLOP/s that is
+/// `fma_chain_gflops * (A + W / L)`, times `lanes` for vector FMAs.
+///
+/// Calibration, Apple M5, hand microbenchmark (BENCH flags), reductions `ko, i, j, ki` with the
+/// naive loop body split into independent chains of length `L`: one dependent scalar FMA chain
+/// 2.6 GFLOP/s (0.76 ns per FMA); L = 256: 3.49, 128: 4.30, 64: 6.36, 32: 7.85, 16: 6.76,
+/// 8: 7.01 GFLOP/s. `W` = 256 * (3.49 / 2.6 - 1) = 87.6 FMAs is calibrated at L = 256 ONLY. The
+/// law then gives 4.38 at L = 128 (measured 4.30) and 6.16 at L = 64 (6.36): checks, not fits.
+/// For L <= 32 the measurement stays under the law (9.72 at L = 32): the scalar load/store
+/// ceiling binds there (`fma_mem_acc_scalar`), which the model only partly reproduces, see
+/// `a_split_reduction_follows_the_overlap_law_for_long_chains`.
+///
+/// ASSUMED: the window is measured in FMAs for the naive body shape (two loads, an FMA; other
+/// bodies may have another window); the latency of a vector FMA equals the scalar one; `A`
+/// chains do not compete for the window (the law was only measured at `A` = 1).
+fn latency_gflops(
+    nest: &LoopNest,
+    machine: &Machine,
+    is_vectorized: bool,
+) -> Result<Option<f64>, BenchError> {
+    let loops = &nest.loops;
+    let Some(p) = loops.iter().rposition(|l| !l.unroll) else {
+        return Ok(None);
+    };
+    let target = &nest.body.target;
+    let held = held_across(target, loops, machine.lanes)?;
+    if !held[p] {
+        return Ok(None);
+    }
+    let chain_length: f64 = loops[..=p]
+        .iter()
+        .zip(&held)
+        .rev()
+        .take_while(|(_, held)| **held)
+        .map(|(l, _)| {
+            if l.vectorize {
+                l.extent.div_ceil(machine.lanes) as f64
+            } else {
+                l.extent as f64
+            }
+        })
+        .product();
+    let chains = registers_over(target, loops, p + 1, machine.lanes)? as f64;
+    let lanes = if is_vectorized {
+        machine.lanes as f64
+    } else {
+        1.0
+    };
+    Ok(Some(
+        machine.fma_chain_gflops * (chains + machine.window_fmas() / chain_length) * lanes,
+    ))
+}
+
 /// Predicts the update nest of `kernel` on `machine`. Errors if the machine numbers are not
 /// positive and finite or the kernel has no nest 1 or an index names an unknown loop.
 pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchError> {
@@ -525,17 +631,23 @@ pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchEr
         (machine.peak_gflops / lanes, machine.mem_acc_scalar_gflops)
     };
     let ldst_gflops = mem_acc_gflops * MEM_ACC_KERNEL_MEM_OPS / mem_ops;
-    let ceiling_gflops = fma_gflops.min(ldst_gflops);
+    // The lowest compute ceiling; a tie goes to the first of compute, ldst, latency.
+    let mut ceiling = ("compute", fma_gflops);
+    if ldst_gflops < ceiling.1 {
+        ceiling = ("ldst", ldst_gflops);
+    }
+    if let Some(latency) = latency_gflops(&as_compiled(nest), machine, is_vectorized)?
+        && latency < ceiling.1
+    {
+        ceiling = ("latency", latency);
+    }
+    let (compute_bound, ceiling_gflops) = ceiling;
     let compute_s = flops / (ceiling_gflops * 1e9);
     let memory_s = mem_bytes as f64 / (machine.mem_gbs * 1e9);
     let l2_s = l2_bytes as f64 / (machine.l2_gbs * 1e9);
     let time_s = compute_s.max(memory_s).max(l2_s);
     let bound = if compute_s >= memory_s && compute_s >= l2_s {
-        if ldst_gflops < fma_gflops {
-            "ldst"
-        } else {
-            "compute"
-        }
+        compute_bound
     } else if memory_s >= l2_s {
         "memory"
     } else {
@@ -649,7 +761,8 @@ fn string_after(line: &str, key: &str) -> Option<String> {
 }
 
 /// The machine of the `"kind":"peak"` line of a results file, and whether its `mem_acc` and
-/// `mem_acc_scalar` are measured. Without `fma_mem_acc_gflops` in the line, `mem_acc_gflops`
+/// `mem_acc_scalar` are measured. `fma_chain` and `fma_chain256` are read when the line has
+/// them (`chain_measured` says which), else they stay the placeholders. Without `fma_mem_acc_gflops` in the line, `mem_acc_gflops`
 /// stays the placeholder. Without `fma_mem_acc_scalar_gflops`, `mem_acc_scalar_gflops` is
 /// `mem_acc_gflops / lanes` (the placeholder, or the measured vector point over lanes, as the
 /// model did before the scalar point existed).
@@ -675,12 +788,30 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
     let mem_acc_scalar = median_after(line, "fma_mem_acc_scalar_gflops");
     machine.mem_acc_scalar_gflops =
         mem_acc_scalar.unwrap_or(machine.mem_acc_gflops / machine.lanes as f64);
+    if let Some(gflops) = median_after(line, "fma_chain_gflops") {
+        machine.fma_chain_gflops = gflops;
+    }
+    if let Some(gflops) = median_after(line, "fma_chain256_gflops") {
+        machine.fma_chain256_gflops = gflops;
+    }
     machine.check()?;
     Ok((machine, mem_acc.is_some(), mem_acc_scalar.is_some()))
 }
 
+/// Whether the peak line of `text` has `fma_chain_gflops` and `fma_chain256_gflops`.
+pub fn chain_measured(text: &str) -> (bool, bool) {
+    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    let has = |key: &str| line.is_some_and(|line| median_after(line, key).is_some());
+    (has("fma_chain_gflops"), has("fma_chain256_gflops"))
+}
+
 /// The header note on where the machine numbers of `--from path` came from.
-fn from_note(path: &str, mem_acc_measured: bool, mem_acc_scalar_measured: bool) -> String {
+fn from_note(
+    path: &str,
+    mem_acc_measured: bool,
+    mem_acc_scalar_measured: bool,
+    chain_measured: (bool, bool),
+) -> String {
     let mut note = format!(
         "peak, mem, L2{}{} from {path}",
         if mem_acc_measured { ", mem_acc" } else { "" },
@@ -702,6 +833,17 @@ fn from_note(path: &str, mem_acc_measured: bool, mem_acc_scalar_measured: bool) 
             "; mem_acc_scalar is a PLACEHOLDER, mem_acc / lanes \
              (no fma_mem_acc_scalar_gflops in the peak line)",
         );
+    }
+    for (measured, key) in [
+        (chain_measured.0, "fma_chain"),
+        (chain_measured.1, "fma_chain256"),
+    ] {
+        if !measured {
+            let _ = write!(
+                note,
+                "; {key} is a PLACEHOLDER (no {key}_gflops in the peak line)"
+            );
+        }
     }
     note
 }
@@ -736,9 +878,10 @@ pub fn parse_model_args<I: IntoIterator<Item = String>>(
                 })?);
             }
             "--from" => {
-                let (from, vector, scalar) = machine_from_results(&read_results(&value)?)?;
+                let text = read_results(&value)?;
+                let (from, vector, scalar) = machine_from_results(&text)?;
                 machine = from;
-                source = from_note(&value, vector, scalar);
+                source = from_note(&value, vector, scalar, chain_measured(&text));
             }
             "--peak" => machine.peak_gflops = speed()?,
             "--mem-gbs" => machine.mem_gbs = speed()?,
@@ -758,7 +901,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "PREDICTION by the analytic model v1.1, not a measurement"
+        "PREDICTION by the analytic model v1.2, not a measurement"
     );
     let _ = writeln!(
         text,
@@ -768,12 +911,16 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let _ = writeln!(
         text,
         "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
-         mem_acc_scalar {} GFLOP/s ({source}); L1 {} B, L2 {} B, line {} B, {} lanes (ASSUMED)",
+         mem_acc_scalar {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
+         FMAs) ({source}); L1 {} B, L2 {} B, line {} B, {} lanes (ASSUMED)",
         machine.peak_gflops,
         machine.mem_gbs,
         machine.l2_gbs,
         machine.mem_acc_gflops,
         machine.mem_acc_scalar_gflops,
+        machine.fma_chain_gflops,
+        machine.fma_chain256_gflops,
+        machine.window_fmas(),
         machine.l1_bytes,
         machine.l2_bytes,
         machine.line_bytes,
@@ -888,18 +1035,27 @@ pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "analytic model v1.1 (PREDICTION) against the measurements in {source}"
+        "analytic model v1.2 (PREDICTION) against the measurements in {source}"
     );
     let _ = writeln!(
         out,
         "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
-         mem_acc_scalar {} GFLOP/s ({})",
+         mem_acc_scalar {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
+         FMAs) ({})",
         machine.peak_gflops,
         machine.mem_gbs,
         machine.l2_gbs,
         machine.mem_acc_gflops,
         machine.mem_acc_scalar_gflops,
-        from_note(source, mem_acc_measured, mem_acc_scalar_measured)
+        machine.fma_chain_gflops,
+        machine.fma_chain256_gflops,
+        machine.window_fmas(),
+        from_note(
+            source,
+            mem_acc_measured,
+            mem_acc_scalar_measured,
+            chain_measured(text)
+        )
     );
     let _ = writeln!(
         out,
@@ -988,6 +1144,25 @@ mod tests {
 
     fn update_nest(kernel: &Kernel) -> &coffee_ten_loop::LoopNest {
         &kernel.nests[UPDATE_NEST]
+    }
+
+    /// `machine` without the latency ceiling (`W` = 0 and a chain rate no kernel reaches), for
+    /// tests of the other ceilings.
+    fn without_latency(machine: Machine) -> Machine {
+        Machine {
+            fma_chain_gflops: 1e9,
+            fma_chain256_gflops: 1e9,
+            ..machine
+        }
+    }
+
+    /// Fast caches, so that at N = 256 the traffic does not bind.
+    fn fast_caches() -> Machine {
+        Machine {
+            mem_gbs: 1e6,
+            l2_gbs: 1e6,
+            ..Machine::assumed_m5()
+        }
     }
 
     /// Naive `i, k, j`, N = 64, line 128 B = 32 floats. Accesses in the order C, A, B.
@@ -1221,11 +1396,8 @@ mod tests {
     /// By text alone the 2x8 tile would come first (`... 2)` < `... 4)` < `... 8)`).
     #[test]
     fn equal_times_at_the_cap_rank_by_fewer_memory_ops_per_fma() {
-        let machine = Machine {
-            mem_gbs: 1e6,
-            l2_gbs: 1e6,
-            ..Machine::assumed_m5()
-        };
+        // The 2x8 tile has 4 accumulators and is latency-bound, see `latency_gflops`.
+        let machine = without_latency(fast_caches());
         let tile = |ri: usize, rj: usize| {
             let text = format!(
                 "split(1, i, io, ii, {ri}); split(1, j, jo, ji, {rj}); \
@@ -1461,11 +1633,8 @@ mod tests {
     /// does not apply: peak 100, not 100 / 4.
     #[test]
     fn a_vectorized_and_unrolled_short_loop_stays_vectorized() {
-        let machine = Machine {
-            mem_gbs: 1e6,
-            l2_gbs: 1e6,
-            ..Machine::assumed_m5()
-        };
+        // The 2x8 tile has 4 accumulators and is latency-bound, see `latency_gflops`.
+        let machine = without_latency(fast_caches());
         let tile = "split(1, i, io, ii, 2); split(1, j, jo, ji, 8); \
                     reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
         let p = predict(&machine, &scheduled(64, tile)).expect("predicts");
@@ -1573,6 +1742,158 @@ mod tests {
         assert_eq!((scalar.bound, vector.bound), ("compute", "compute"));
     }
 
+    /// The latency ceiling of `text` on `machine`, N = 256, as `predict` computes it.
+    fn latency(machine: &Machine, text: &str) -> Option<f64> {
+        let kernel = scheduled(256, text);
+        let nest = as_compiled(update_nest(&kernel));
+        let vectorized = nest.loops.last().is_some_and(|l| l.vectorize);
+        latency_gflops(&nest, machine, vectorized).expect("analyses")
+    }
+
+    /// Placeholders: chain 2.6, chain256 3.49 GFLOP/s, so W = 256 * (3.49 / 2.6 - 1) = 87.6308
+    /// FMAs and the rate is 2.6 * (A + W / L). Scalar nests at N = 256, caches fast.
+    /// - naive `i, j, k`: C is held across `k`, A = 1, L = 256: 2.6 * (1 + W / 256) = 3.49, the
+    ///   calibration point itself. The ld/st ceiling (15 * 3 / (2 + 2 / 256) = 22.4) and the
+    ///   FMA ceiling (25) are far above: "latency".
+    /// - `ko, i, j, ki` with `ki` = 64: C depends on `j`, so the chain stops at `ki`: L = 64:
+    ///   2.6 * (1 + W / 64) = 6.16 (measured 6.36, a check, not a fit); with 128: 4.375 (4.30).
+    /// - `i, j, ko, ki`: C does not depend on `ko` either and is held across it: L = 64 * 4 = 256.
+    /// - `ki` = 32: 9.72 (measured 7.85). The ld/st ceiling with the measured P2 point
+    ///   8.563 * 3 / (2 + 2 / 32) = 12.46 is above it, so latency still binds; at `ki` = 16 the
+    ///   law gives 16.8 and the ld/st ceiling 12.09 binds. The microbenchmark has the ld/st
+    ///   ceiling bind from L = 32 (7.85, 6.76): the model's ld/st ceiling is too high for it.
+    #[test]
+    fn a_split_reduction_follows_the_overlap_law_for_long_chains() {
+        let machine = fast_caches();
+        let w = 256.0 * (3.49 / 2.6 - 1.0);
+        assert!((machine.window_fmas() - w).abs() < 1e-12);
+        let near = |got: Option<f64>, want: f64| {
+            let got = got.expect("has a latency ceiling");
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        };
+        near(
+            latency(&machine, "reorder(1, i, j, k)"),
+            2.6 * (1.0 + w / 256.0),
+        );
+        near(latency(&machine, "reorder(1, i, j, k)"), 3.49);
+        let split =
+            |ki: usize, order: &str| format!("split(1, k, ko, ki, {ki}); reorder(1, {order})");
+        near(
+            latency(&machine, &split(64, "ko, i, j, ki")),
+            2.6 * (1.0 + w / 64.0),
+        );
+        near(
+            latency(&machine, &split(128, "ko, i, j, ki")),
+            2.6 * (1.0 + w / 128.0),
+        );
+        near(latency(&machine, &split(64, "i, j, ko, ki")), 3.49);
+        near(
+            latency(&machine, &split(32, "ko, i, j, ki")),
+            2.6 * (1.0 + w / 32.0),
+        );
+        let bound = |machine: &Machine, text: &str| {
+            let p = predict_schedule(machine, 256, text).expect("predicts");
+            (p.bound, p.gflops)
+        };
+        let (b64, g64) = bound(&machine, &split(64, "ko, i, j, ki"));
+        assert_eq!(b64, "latency");
+        assert!((g64 - 6.16).abs() < 1e-2, "{g64}");
+        let (naive_bound, naive_gflops) = bound(&machine, "reorder(1, i, j, k)");
+        assert_eq!(naive_bound, "latency");
+        assert!((naive_gflops - 3.49).abs() < 1e-9, "{naive_gflops}");
+        let p2 = Machine {
+            mem_acc_gflops: 46.9387,
+            mem_acc_scalar_gflops: 8.563,
+            ..machine
+        };
+        let (b32, g32) = bound(&p2, &split(32, "ko, i, j, ki"));
+        assert_eq!(b32, "latency");
+        assert!((g32 - 9.72).abs() < 1e-2, "{g32}");
+        let (b16, g16) = bound(&p2, &split(16, "ko, i, j, ki"));
+        assert_eq!(b16, "ldst");
+        assert!((g16 - 8.563 * 3.0 / 2.125).abs() < 1e-9, "{g16}");
+    }
+
+    /// The register tile 4x16 at N = 256: C over `ii, ji` is 4 * 4 = 16 vector accumulators,
+    /// held across `k` (L = 256): 2.6 * (16 + W / 256) * 4 lanes = 169.96 GFLOP/s, above the
+    /// peak 100: not latency-bound. The 2x8 tile has 2 * 2 = 4 accumulators:
+    /// 2.6 * (4 + 0.34) * 4 = 45.1, latency-bound.
+    #[test]
+    fn a_register_tile_has_enough_chains_unless_it_is_small() {
+        let machine = fast_caches();
+        let w = machine.window_fmas();
+        let tile = |ri: usize, rj: usize| {
+            format!(
+                "split(1, i, io, ii, {ri}); split(1, j, jo, ji, {rj}); \
+                 reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)"
+            )
+        };
+        let want = 2.6 * (16.0 + w / 256.0) * 4.0;
+        let got = latency(&machine, &tile(4, 16)).expect("latency ceiling");
+        assert!(
+            (got - want).abs() < 1e-9 && (got - 169.96).abs() < 1e-2,
+            "{got}"
+        );
+        let p = predict_schedule(&machine, 256, &tile(4, 16)).expect("predicts");
+        assert_eq!((p.bound, p.gflops), ("compute", 100.0));
+        let small = latency(&machine, &tile(2, 8)).expect("latency ceiling");
+        assert!(
+            (small - 2.6 * (4.0 + w / 256.0) * 4.0).abs() < 1e-9,
+            "{small}"
+        );
+        let p = predict_schedule(&machine, 256, &tile(2, 8)).expect("predicts");
+        assert_eq!(p.bound, "latency");
+    }
+
+    /// `i, k, j`: C depends on the innermost loop `j`, every FMA stores its result and the
+    /// chain is broken through memory: no latency ceiling, scalar or vectorized.
+    #[test]
+    fn a_target_that_moves_with_the_innermost_loop_has_no_latency_ceiling() {
+        let machine = fast_caches();
+        assert_eq!(latency(&machine, ""), None);
+        assert_eq!(latency(&machine, "vectorize(1, j)"), None);
+        assert_eq!(latency(&machine, "reorder(1, k, i, j)"), None);
+    }
+
+    #[test]
+    fn a_longer_chain_cannot_be_slower_than_a_single_one() {
+        let bad = Machine {
+            fma_chain256_gflops: 2.0,
+            ..Machine::assumed_m5()
+        };
+        assert!(predict(&bad, &naive(8)).is_err());
+    }
+
+    #[test]
+    fn from_reads_the_chain_points_when_the_peak_line_has_them() {
+        let line = r#"{"kind":"peak","fma_gflops":{"median":100.5,"n":30},"triad_gbs":{"median":90.25,"n":30},"triad_l2_gbs":{"median":110.0,"n":30},"fma_chain_gflops":{"median":2.5,"n":30},"fma_chain256_gflops":{"median":3.5,"n":30}}"#;
+        let (machine, _, _) = machine_from_results(line).expect("parses");
+        assert_eq!(
+            (machine.fma_chain_gflops, machine.fma_chain256_gflops),
+            (2.5, 3.5)
+        );
+        assert!((machine.window_fmas() - 102.4).abs() < 1e-9);
+        let note = from_note("f", true, true, chain_measured(line));
+        assert!(!note.contains("fma_chain"), "{note}");
+        let line = line.replace("fma_chain256_gflops", "x");
+        let (placeholder, _, _) = machine_from_results(&line).expect("parses");
+        assert_eq!(
+            (
+                placeholder.fma_chain_gflops,
+                placeholder.fma_chain256_gflops
+            ),
+            (2.5, PLACEHOLDER_FMA_CHAIN256_GFLOPS)
+        );
+        let note = from_note("f", true, true, chain_measured(&line));
+        assert!(note.contains("fma_chain256 is a PLACEHOLDER"), "{note}");
+        assert!(!note.contains("fma_chain is a PLACEHOLDER"), "{note}");
+        let header = report(8, &placeholder, &note, &[]);
+        assert!(
+            header.contains("fma_chain 2.5 GFLOP/s, fma_chain256 3.49 GFLOP/s"),
+            "{header}"
+        );
+    }
+
     const S2: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../bench/results/2026-10-16-ffce49d.jsonl"
@@ -1596,8 +1917,20 @@ mod tests {
         // No scalar field: the scalar point stays the vector one over lanes, as before.
         assert_eq!(machine.mem_acc_scalar_gflops, 31.1262 / 4.0);
         let ranked = rank_matmul(&machine, 256).expect("ranks");
-        assert!(ranked[..6].iter().all(|r| r.schedule.contains("unroll(")));
-        assert!(!ranked[6].schedule.contains("unroll("));
+        // The register tiles with at least 16 vector accumulators rank first (4x16, 8x8,
+        // 2x32). The ones with 8 (2x16, 4x8) are latency-bound: with the placeholder chain
+        // points 2.6 * (8 + W / 256) * 4 = 86.8 GFLOP/s, just below the best non-unrolled
+        // schedules (87.2).
+        assert!(ranked[..3].iter().all(|r| r.schedule.contains("unroll(")));
+        assert!(!ranked[3].schedule.contains("unroll("));
+        let two_by_sixteen = ranked
+            .iter()
+            .find(|r| {
+                r.schedule
+                    .contains("split(1, i, io, ii, 2); split(1, j, jo, ji, 16)")
+            })
+            .expect("the 2x16 tile is in the space");
+        assert_eq!(two_by_sixteen.prediction.bound, "latency");
         let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
                     reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
         let p = predict_schedule(&machine, 128, tile).expect("predicts");
@@ -1659,9 +1992,9 @@ mod tests {
             (61.5, 8.5632)
         );
         assert!(mem_acc_measured && scalar_measured);
-        let note = from_note("f", mem_acc_measured, scalar_measured);
+        let note = from_note("f", mem_acc_measured, scalar_measured, (true, true));
         assert!(!note.contains("PLACEHOLDER"), "{note}");
-        let note = from_note("f", true, false);
+        let note = from_note("f", true, false, (true, true));
         assert!(note.contains("mem_acc_scalar is a PLACEHOLDER"), "{note}");
         // The report header carries the scalar point.
         let header = report(8, &machine, &note, &[]);
