@@ -1,7 +1,8 @@
 /*
  * peak: single-thread f32 peak FLOP/s (FMA loop), FMA rate with the accumulator
- * in memory (vector and scalar), single-thread memory bandwidth and L2 bandwidth
- * (STREAM triad).
+ * in memory (vector and scalar), the latency-bound rate of one dependent scalar FMA
+ * chain and of independent chains of length 256, single-thread memory bandwidth and
+ * L2 bandwidth (STREAM triad).
  * See README.md.
  *
  * Build (from the repo root):
@@ -50,6 +51,29 @@ typedef float v4f __attribute__((vector_size(16)));
 #define MEM_ACC_N 1024
 /* Passes between clock reads; a sample repeats batches until it has run MIN_SAMPLE_NS. */
 #define MEM_ACC_BATCH 1024
+
+/*
+ * Dependent FMA chain: FMAs per call. Long enough that call overhead is noise.
+ * The operands are fma_operands() (a = 1, b = 0.5) scaled so a * b = 1e-7: x starts at 1
+ * and creeps up by about 1e-7 per FMA until the increment is below half an ulp
+ * (x = 2), where it stops. x stays in [1, 2]: normal, no denormal, no inf.
+ */
+#define CHAIN_ITERS (1L << 20)
+#define CHAIN_A_SCALE 1e-3f
+#define CHAIN_B_SCALE 2e-4f
+
+/*
+ * Reduction chains of length CHAIN256_K, the naive matmul loop body: for each of
+ * CHAIN256_J columns, acc = c[j]; acc = fma(a[k], b[k * J + j], acc) over k; c[j] = acc.
+ * The shape of the matmul reduction at N = 256: b is K x J = 256 x 256 floats = 256 KiB
+ * (row stride 1 KiB), so each chain walks a column of b with a 1 KiB stride over 256 KiB,
+ * which is L2, not L1D (128 KiB, assumed). a is one 256-float row (1 KiB), c is 1 KiB.
+ * The overlap this measures is for that access shape; it is ASSUMED to carry to other N.
+ */
+#define CHAIN256_J 256
+#define CHAIN256_K 256
+/* Passes between clock reads; one pass is 256 x 256 FMAs, about 20 us at 3.5 GFLOP/s. */
+#define CHAIN256_BATCH 64
 
 #define SAMPLES 30
 #define QUICK_SAMPLES 3
@@ -144,12 +168,52 @@ __attribute__((noinline)) static void fma_mem_acc_scalar_pass(float a, const flo
     }
 }
 
+/*
+ * One endless dependent chain through the addend: x = fma(a, b, x), one fmadd per
+ * iteration, each waiting for the previous one. a and b are runtime values, so the
+ * loop cannot be folded; noinline keeps it a loop in its own function.
+ */
+__attribute__((noinline)) static float fma_chain_kernel(long iters, float a, float b, float x) {
+    for (long t = 0; t < iters; t++) {
+        x = __builtin_fmaf(a, b, x);
+    }
+    return x;
+}
+
+/*
+ * Naive matmul reduction in the (ko, i, j, ki) shape: CHAIN256_J independent chains of
+ * length CHAIN256_K, the accumulator in a register for the whole chain. Per inner
+ * iteration: ldr s (a), ldr s (b), fmadd, add, cmp, b.ne. The pragmas keep clang from
+ * vectorizing across j or unrolling over k, which would change what is measured.
+ */
+__attribute__((noinline)) static void fma_chain256_pass(const float *restrict a,
+                                                        const float *restrict b,
+                                                        float *restrict c) {
+#pragma clang loop vectorize(disable) interleave(disable)
+    for (long j = 0; j < CHAIN256_J; j++) {
+        float acc = c[j];
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+        for (long k = 0; k < CHAIN256_K; k++) {
+            acc = __builtin_fmaf(a[k], b[k * CHAIN256_J + j], acc);
+        }
+        c[j] = acc;
+    }
+}
+
 static double fma_flop_per_call(void) {
     return 2.0 * 4 * FMA_CHAINS * (double)FMA_ITERS;
 }
 
 static double fma_mem_acc_flop_per_pass(void) {
     return 2.0 * MEM_ACC_N;
+}
+
+static double fma_chain_flop_per_call(void) {
+    return 2.0 * (double)CHAIN_ITERS;
+}
+
+static double fma_chain256_flop_per_pass(void) {
+    return 2.0 * CHAIN256_J * CHAIN256_K;
 }
 
 static double triad_bytes_per_call(long n) {
@@ -203,6 +267,38 @@ static double fma_mem_acc_scalar_sample(float a, const float *b, float *c) {
     } while (t1 - t0 < MIN_SAMPLE_NS);
     g_sink += c[0];
     return (double)passes * fma_mem_acc_flop_per_pass() / (double)(t1 - t0);
+}
+
+/* Returns GFLOP/s (FLOP per ns). */
+static double fma_chain_sample(float a, float b) {
+    long long t0 = now_ns();
+    long long t1;
+    long calls = 0;
+    /* x is fed from call to call: with identical arguments clang hoists the pure call out of the loop. */
+    float x = 1.0f;
+    do {
+        x = fma_chain_kernel(CHAIN_ITERS, a, b, x);
+        calls++;
+        t1 = now_ns();
+    } while (t1 - t0 < MIN_SAMPLE_NS);
+    g_sink += x;
+    return (double)calls * fma_chain_flop_per_call() / (double)(t1 - t0);
+}
+
+/* Returns GFLOP/s (FLOP per ns). */
+static double fma_chain256_sample(const float *a, const float *b, float *c) {
+    long long t0 = now_ns();
+    long long t1;
+    long passes = 0;
+    do {
+        for (int p = 0; p < CHAIN256_BATCH; p++) {
+            fma_chain256_pass(a, b, c);
+        }
+        passes += CHAIN256_BATCH;
+        t1 = now_ns();
+    } while (t1 - t0 < MIN_SAMPLE_NS);
+    g_sink += c[0];
+    return (double)passes * fma_chain256_flop_per_pass() / (double)(t1 - t0);
 }
 
 /* Returns GB/s (1e9 bytes per second, i.e. bytes per ns). */
@@ -331,6 +427,57 @@ static int run_check(float a, float b) {
             return 1;
         }
     }
+
+    /* Dependent chain vs a plain loop of the same recurrence; benchmark constants, so every step rounds. */
+    float chain_a = 1.0f * CHAIN_A_SCALE;
+    float chain_b = 0.5f * CHAIN_B_SCALE;
+    float chain_want = 1.0f;
+    for (long t = 0; t < 1000; t++) {
+        chain_want = __builtin_fmaf(chain_a, chain_b, chain_want);
+    }
+    float chain_got = fma_chain_kernel(1000, chain_a, chain_b, 1.0f);
+    if (chain_got != chain_want) {
+        printf("check FAILED: fma_chain: got %.9g, want %.9g\n", (double)chain_got,
+               (double)chain_want);
+        return 1;
+    }
+
+    /* Chains of 256 vs a plain reference with fmaf in the same k order, 3 passes. */
+    float *ch_a = malloc(CHAIN256_K * sizeof *ch_a);
+    float *ch_b = malloc((size_t)CHAIN256_K * CHAIN256_J * sizeof *ch_b);
+    float ch_c[CHAIN256_J];
+    float ch_ref[CHAIN256_J];
+    if (!ch_a || !ch_b) {
+        printf("check FAILED: malloc\n");
+        return 1;
+    }
+    for (int k = 0; k < CHAIN256_K; k++) {
+        ch_a[k] = 0.01f * (float)(k % 7 + 1);
+    }
+    for (int i = 0; i < CHAIN256_K * CHAIN256_J; i++) {
+        ch_b[i] = 0.1f * (float)(i % 5 + 1);
+    }
+    for (int j = 0; j < CHAIN256_J; j++) {
+        ch_c[j] = (float)j;
+        ch_ref[j] = (float)j;
+    }
+    for (int p = 0; p < 3; p++) {
+        fma_chain256_pass(ch_a, ch_b, ch_c);
+        for (int j = 0; j < CHAIN256_J; j++) {
+            for (int k = 0; k < CHAIN256_K; k++) {
+                ch_ref[j] = __builtin_fmaf(ch_a[k], ch_b[k * CHAIN256_J + j], ch_ref[j]);
+            }
+        }
+    }
+    for (int j = 0; j < CHAIN256_J; j++) {
+        if (ch_c[j] != ch_ref[j]) {
+            printf("check FAILED: fma_chain256 j=%d: got %.9g, want %.9g\n", j,
+                   (double)ch_c[j], (double)ch_ref[j]);
+            return 1;
+        }
+    }
+    free(ch_a);
+    free(ch_b);
     printf("check ok\n");
     return 0;
 }
@@ -340,6 +487,8 @@ static double g_triad_rate[SAMPLES];
 static double g_triad_l2_rate[SAMPLES];
 static double g_mem_acc_rate[SAMPLES];
 static double g_mem_acc_scalar_rate[SAMPLES];
+static double g_chain_rate[SAMPLES];
+static double g_chain256_rate[SAMPLES];
 
 /* Fills rate[0..samples-1] with accumulator-in-memory GFLOP/s; a from fma_operands, b[j] = 0.5. */
 static void run_mem_acc(float a, int samples, int warmup, double *rate) {
@@ -371,6 +520,45 @@ static void run_mem_acc_scalar(float a, int samples, int warmup, double *rate) {
             rate[s - warmup] = r;
         }
     }
+}
+
+/* Fills rate[0..samples-1] with dependent-chain GFLOP/s. */
+static void run_chain(float a, float b, int samples, int warmup, double *rate) {
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = fma_chain_sample(a * CHAIN_A_SCALE, b * CHAIN_B_SCALE);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+}
+
+/* Fills rate[0..samples-1] with chain-of-256 GFLOP/s; a[k] = a, b = 0.5. Returns 1 on malloc failure. */
+static int run_chain256(float a, int samples, int warmup, double *rate) {
+    float *ka = malloc(CHAIN256_K * sizeof *ka);
+    float *kb = malloc((size_t)CHAIN256_K * CHAIN256_J * sizeof *kb);
+    float kc[CHAIN256_J];
+    if (!ka || !kb) {
+        fprintf(stderr, "malloc failed\n");
+        return 1;
+    }
+    for (int k = 0; k < CHAIN256_K; k++) {
+        ka[k] = a;
+    }
+    for (int i = 0; i < CHAIN256_K * CHAIN256_J; i++) {
+        kb[i] = 0.5f;
+    }
+    for (int j = 0; j < CHAIN256_J; j++) {
+        kc[j] = 0.0f;
+    }
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = fma_chain256_sample(ka, kb, kc);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+    free(ka);
+    free(kb);
+    return 0;
 }
 
 /* Fills rate[0..samples-1] with triad GB/s over n floats. Returns 1 on malloc failure. */
@@ -439,6 +627,10 @@ int main(int argc, char **argv) {
 
     run_mem_acc(a, samples, warmup, g_mem_acc_rate);
     run_mem_acc_scalar(a, samples, warmup, g_mem_acc_scalar_rate);
+    run_chain(a, b, samples, warmup, g_chain_rate);
+    if (run_chain256(a, samples, warmup, g_chain256_rate) != 0) {
+        return 1;
+    }
     if (run_triad(TRIAD_N, samples, warmup, g_triad_rate) != 0) {
         return 1;
     }
@@ -449,12 +641,16 @@ int main(int argc, char **argv) {
     stats_t fma = summarize(g_fma_rate, samples);
     stats_t mem_acc = summarize(g_mem_acc_rate, samples);
     stats_t mem_acc_scalar = summarize(g_mem_acc_scalar_rate, samples);
+    stats_t chain = summarize(g_chain_rate, samples);
+    stats_t chain256 = summarize(g_chain256_rate, samples);
     stats_t triad_st = summarize(g_triad_rate, samples);
     stats_t triad_l2_st = summarize(g_triad_l2_rate, samples);
 
     print_stats("fma", "GFLOP/s", fma, samples);
     print_stats("mem_acc", "GFLOP/s", mem_acc, samples);
     print_stats("mem_acc_s", "GFLOP/s", mem_acc_scalar, samples);
+    print_stats("chain", "GFLOP/s", chain, samples);
+    print_stats("chain256", "GFLOP/s", chain256, samples);
     print_stats("triad", "GB/s", triad_st, samples);
     print_stats("triad_l2", "GB/s", triad_l2_st, samples);
     printf("checksum %g\n", g_sink);
@@ -465,7 +661,9 @@ int main(int argc, char **argv) {
            "\"triad_l2_n\":%d,"
            "\"fma_mem_acc_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"mem_acc_n\":%d,"
-           "\"fma_mem_acc_scalar_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
+           "\"fma_mem_acc_scalar_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
+           "\"fma_chain_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
+           "\"fma_chain256_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
            fma.median, fma.p25, fma.p75, fma.min, samples,
            triad_st.median, triad_st.p25, triad_st.p75, triad_st.min, samples,
            FMA_CHAINS, TRIAD_N,
@@ -474,6 +672,8 @@ int main(int argc, char **argv) {
            mem_acc.median, mem_acc.p25, mem_acc.p75, mem_acc.min, samples,
            MEM_ACC_N,
            mem_acc_scalar.median, mem_acc_scalar.p25, mem_acc_scalar.p75, mem_acc_scalar.min,
-           samples);
+           samples,
+           chain.median, chain.p25, chain.p75, chain.min, samples,
+           chain256.median, chain256.p25, chain256.p75, chain256.min, samples);
     return 0;
 }
