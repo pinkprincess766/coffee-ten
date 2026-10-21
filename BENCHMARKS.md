@@ -14,7 +14,7 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 | Code | S1, S2: commit `ffce49d`; S3: commit `4928ffa` (adds `unroll` and row-pointer indexing, #42–#44); clean tree (`"dirty": false` in every record) |
 | Sessions | S1 2026-10-15, 60 s pauses between series; S2 2026-10-16 on a cold Mac, 180 s pauses; S3 2026-10-18 on a cold Mac, 60 s pauses |
 | Method | per (kernel, N): a warm-up (S1–S3 and run 1: one round of one 10 ms sample per variant; from #61: each variant runs 300 ms), then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
-| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58) |
+| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58), `bench/results/2026-10-21-hypothesis-a-run2.jsonl` (hypothesis A, run 2, commit `702dcf1`) |
 
 Every variant was checked against the naive kernel within the inner-product error bound
 before it was timed.
@@ -168,6 +168,45 @@ recorded 30–44 against 52–79 in the harness. The decision run above is not a
 interleaved rounds of already compiled kernels. The Spearman figures computed against
 these candidates (0.292, and later 0.564 after the model fixes #57, #59) are therefore not
 evidence about the model. A time-based warm-up is the fix, then run 2 with a new seed.
+
+## Hypothesis A (spec §7.1), run 2: met
+
+Run 2 (commit `702dcf1`, N = 256, seed 2, machine P3). It is run 1's procedure with three
+differences: the model knows short vectorized loops, FMA latency and tie-breaking (#57,
+#59); `search` warms each candidate for 300 ms (#61); and the seed is new. Within each
+random candidate's 5 samples the spread is now p75/p25 = 1.004 (run 1: 1.4–1.6).
+
+| | schedule | median [p25–p75], GFLOP/s |
+|---|---|---|
+| best random (candidate 953 of 1000) | 8×8 register tile | **112.98** [112.52–113.04] |
+| best of the model's top 10 (rank 1) | 4×16 register tile | **121.85** [121.40–121.92] |
+
+**Ratio 1.079: the criterion is met.** The model's first measurement already gives its best
+schedule. Random search stays at 88–90 GFLOP/s until candidate 953, the only register tile
+among its 1000 draws. Over the 1000 random candidates the model has Spearman 0.571 and a
+median error of ×1.37 (P3 machine, `model compare`). By group (measured vs predicted median):
+
+| group | n | measured | predicted | pred / meas |
+|---|---|---|---|---|
+| vectorized, `ji` = 128 | 46 | 45.6 | 45.8 | 1.00 |
+| scalar, `ji` innermost | 271 | 7.8 | 8.4 | 1.07 |
+| scalar, `k`/`ki` innermost | 239 | 7.3 | 6.8 | 0.82 |
+| scalar, `ii` innermost | 243 | 6.9 | 8.4 | 1.22 (wide) |
+| "vectorized", `ji` = 8 or 16 (scalar code) | 101 | 22–29 | 18–21 | 0.69 |
+| vectorized, `ji` = 32 or 64 | 98 | 55–60 | 76–106 | 1.43–1.50 |
+
+What this does and does not show:
+
+- **The criterion is met because of the register tiles.** The model ranks them first, and random
+  search meets one in about 0.8 of 1000 draws. Spec §7.1 named this risk in advance. The test
+  says the model finds the region a 1000-draw random search mostly misses; it says less
+  about the model's precision elsewhere. Spearman 0.571 says that.
+- **This is the first clean measurement of the random candidates.** Run 1's per-candidate
+  numbers were biased (see above). Most of what looked like a ×2.2–3.3 model error on
+  vectorized schedules was that bias; the real error there is about ×1.45.
+- **The model's fixes were found on run 1's data**, then frozen before run 2. Run 2's random
+  sample is new (seed 2). The model's top 10 does not depend on the seed.
+- **Not tested:** other N, other seeds beyond 1 and 2, other machines.
 
 ## Validity
 
