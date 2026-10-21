@@ -13,7 +13,7 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 | Compiler | Apple clang 21.0.0, `-std=c99 -O2 -ffp-contract=fast -fno-vectorize -fno-slp-vectorize` (FMA contraction allowed; only the schedule vectorizes) |
 | Code | S1, S2: commit `ffce49d`; S3: commit `4928ffa` (adds `unroll` and row-pointer indexing, #42–#44); clean tree (`"dirty": false` in every record) |
 | Sessions | S1 2026-10-15, 60 s pauses between series; S2 2026-10-16 on a cold Mac, 180 s pauses; S3 2026-10-18 on a cold Mac, 60 s pauses |
-| Method | per (kernel, N): one warm-up round, then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
+| Method | per (kernel, N): a warm-up (S1–S3 and run 1: one round of one 10 ms sample per variant; from #61: each variant runs 300 ms), then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
 | Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58) |
 
 Every variant was checked against the naive kernel within the inner-product error bound
@@ -194,6 +194,14 @@ evidence about the model. A time-based warm-up is the fix, then run 2 with a new
   instructions** (one vector per iteration), below the 56–64 GFLOP/s of `tiled + vec`
   that it should bound. The kernel now does four vectors per iteration (#46); P1
   measured it at 46.0 GFLOP/s [45.9–46.1].
+- **A kernel runs slow for about 100 ms after its thread has been idle** (waiting for clang,
+  or one of `run.sh`'s pauses): it starts at 25–50% of its steady rate (M5, N = 256, naive,
+  vectorized and register-tile kernels alike). S1–S3 warmed each variant for one 10 ms
+  sample only, so their first rounds ran slow. With 30 interleaved rounds this moves the
+  medians little, but it is a likely cause of the `drift` flags on the first series after a
+  pause (matmul N = 64 naive in S2 and S3; not verified). It ruined `search`'s 6 short
+  samples per freshly compiled candidate (hypothesis A run 1). From #61 every variant runs
+  300 ms before round 1.
 - **Not measured:** NumPy/Accelerate (it may use the matrix units; a comparison would not
   measure the compiler), multiple threads, N above 1024, other machines. L1 and L2
   sizes are assumed, not measured.

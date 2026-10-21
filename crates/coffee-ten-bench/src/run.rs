@@ -197,6 +197,31 @@ fn time_sample(
     Ok(flop_per_call * calls as f64 / elapsed.as_secs_f64() / 1e9)
 }
 
+/// Each variant runs this long before round 1. Measured on an Apple M5 with `n = 256`: after the
+/// thread has been idle (waiting for clang, or a pause of 50 ms or more) the same kernel runs at
+/// 25-50% of its speed and reaches 95% of the steady rate after about 100 ms, for the naive
+/// kernel, a vectorized one and a register tile alike. 300 ms is three times that.
+pub const WARMUP_MS: u64 = 300;
+/// The warm-up of a `--quick` run, which is not a measurement.
+pub const QUICK_WARMUP_MS: u64 = 5;
+
+/// Calls `call` until `elapsed` (time since the warm-up began) reaches `warmup`; at least one
+/// call. Returns the number of calls.
+fn warm_up<E>(
+    warmup: Duration,
+    mut call: impl FnMut() -> Result<(), E>,
+    mut elapsed: impl FnMut() -> Duration,
+) -> Result<u64, E> {
+    let mut calls = 0u64;
+    loop {
+        call()?;
+        calls += 1;
+        if elapsed() >= warmup {
+            return Ok(calls);
+        }
+    }
+}
+
 /// What a run measures; the same for every record of the run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RunInfo {
@@ -370,14 +395,24 @@ pub fn run(config: &Config) -> Result<Vec<Record>, BenchError> {
     let mut rng = Rng::new(config.seed);
     let mut order: Vec<usize> = (0..variants.len()).collect();
     let mut rates: Vec<Vec<f64>> = vec![Vec::with_capacity(config.samples); variants.len()];
-    // Round 0 is the warm-up and is discarded.
-    for round in 0..=config.samples {
+    // After the thread has been idle (waiting for clang, a pause) a kernel runs slow for ~100 ms
+    // (see `WARMUP_MS`): every variant warms up in the interleaved order before round 1, and the
+    // warm-up is not recorded.
+    let warmup = Duration::from_millis(if config.quick {
+        QUICK_WARMUP_MS
+    } else {
+        WARMUP_MS
+    });
+    rng.shuffle(&mut order);
+    for &index in &order {
+        let start = Instant::now();
+        warm_up(warmup, || variants[index].run_once(), || start.elapsed())?;
+    }
+    for _ in 0..config.samples {
         rng.shuffle(&mut order);
         for &index in &order {
             let rate = time_sample(&mut variants[index], flop_per_call, min_sample)?;
-            if round > 0 {
-                rates[index].push(rate);
-            }
+            rates[index].push(rate);
         }
     }
 
@@ -400,6 +435,30 @@ pub fn run(config: &Config) -> Result<Vec<Record>, BenchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_up_runs_until_the_warmup_time_has_passed() {
+        // A fake clock that advances 1 ms per call: WARMUP_MS ms need WARMUP_MS calls.
+        let calls = std::cell::Cell::new(0u64);
+        let done = warm_up::<()>(
+            Duration::from_millis(WARMUP_MS),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            || Duration::from_millis(calls.get()),
+        );
+        assert_eq!(done, Ok(WARMUP_MS));
+        assert_eq!(calls.get(), WARMUP_MS);
+    }
+
+    #[test]
+    fn warm_up_calls_once_for_a_zero_warmup_and_stops_on_error() {
+        let zero = warm_up::<()>(Duration::ZERO, || Ok(()), || Duration::ZERO);
+        assert_eq!(zero, Ok(1));
+        let failed = warm_up(Duration::from_secs(1), || Err("boom"), || Duration::ZERO);
+        assert_eq!(failed, Err("boom"));
+    }
 
     #[test]
     fn min_subnormal_is_two_to_the_minus_149() {
