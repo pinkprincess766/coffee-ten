@@ -14,7 +14,7 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 | Code | S1, S2: commit `ffce49d`; S3: commit `4928ffa` (adds `unroll` and row-pointer indexing, #42–#44); clean tree (`"dirty": false` in every record) |
 | Sessions | S1 2026-10-15, 60 s pauses between series; S2 2026-10-16 on a cold Mac, 180 s pauses; S3 2026-10-18 on a cold Mac, 60 s pauses |
 | Method | per (kernel, N): one warm-up round, then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
-| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`) |
+| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58) |
 
 Every variant was checked against the naive kernel within the inner-product error bound
 before it was timed.
@@ -27,7 +27,9 @@ before it was timed.
 | Memory triad, 3 × 128 MiB | 105.3 GB/s | 107.9 GB/s | 112.1 GB/s |
 | L2 triad, 3 × 1 MiB | 119.6 GB/s | 120.4 GB/s | 128.1 GB/s |
 | FMA with the accumulator in memory (`fma_mem_acc`) | — | — | 31.1 GFLOP/s, old kernel, see below; P1: **46.0** [45.9–46.1]; P2: **46.9** [46.8–47.0] |
-| The same in scalar code (`fma_mem_acc_scalar`) | — | — | P2: **8.56** [8.54–8.58] GFLOP/s |
+| The same in scalar code (`fma_mem_acc_scalar`) | — | — | P2: **8.56** [8.54–8.58] GFLOP/s; P3: 8.47 [8.44–8.51] |
+| One dependent scalar FMA chain (`fma_chain`) | — | — | P3: **2.605** [2.599–2.612] GFLOP/s (0.77 ns per FMA) |
+| Independent chains of length 256, N = 256 matmul body (`fma_chain256`) | — | — | P3: **3.133** [3.124–3.144] GFLOP/s; overlap window W = 256 × (3.133 / 2.605 − 1) ≈ 52 FMAs |
 
 The S1/S2 roofline columns below are S2's median over S2's FMA peak (122.0 GFLOP/s); the
 register-tile section uses S3's median over S3's peak (129.2 GFLOP/s). Matmul's
@@ -155,6 +157,13 @@ Next: make `vectorize` vectorize short loops, check the C-row hoisting across `k
 optimized IR, break ties at the cap by something other than the text, then repeat with a
 new seed. Until then the hypothesis stays open; this run is kept as it is.
 
+Since then the model has learned that a short vectorized loop is scalar and how to break
+ties (#57), and it has an FMA latency ceiling for reductions (#59), calibrated by P3. Over the same 1000
+candidates it now has Spearman 0.564 and a median error of ×1.53. These candidates were
+used to find the fixes, so this is not an independent test; run 2 needs a new seed. The
+largest remaining error is the vectorized candidates with `ji` ≥ 32: measured 21–25,
+predicted 46–67 GFLOP/s.
+
 ## Validity
 
 - **S1's second half is not usable.** In S1 most `relu(A @ B + bias)` series and matmul at
@@ -172,7 +181,7 @@ new seed. Until then the hypothesis stays open; this run is kept as it is.
   separated from these runs.
 - **The FMA peak has a slow lower tail in S3, P1 and P2**: p25 117.7 and min 58.2 in S3,
   p25 118.6 and min 59.6 in P1, p25 118.2 and min 60.1 in P2, against medians of 129.2,
-  126.7 and 128.8. S3's run overlapped a
+  126.7 and 128.8 (P3: p25 127.2, min 85.8, median 130.6). S3's run overlapped a
   background build for its first seconds and an earlier version of this note blamed
   that; P1 ran with nothing else and shows the same tail, so the cause is open
   (frequency ramp at the start, or a migration to an efficiency core). The median is used.
