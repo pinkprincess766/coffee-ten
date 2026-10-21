@@ -157,12 +157,17 @@ Next: make `vectorize` vectorize short loops, check the C-row hoisting across `k
 optimized IR, break ties at the cap by something other than the text, then repeat with a
 new seed. Until then the hypothesis stays open; this run is kept as it is.
 
-Since then the model has learned that a short vectorized loop is scalar and how to break
-ties (#57), and it has an FMA latency ceiling for reductions (#59), calibrated by P3. Over the same 1000
-candidates it now has Spearman 0.564 and a median error of ×1.53. These candidates were
-used to find the fixes, so this is not an independent test; run 2 needs a new seed. The
-largest remaining error is the vectorized candidates with `ji` ≥ 32: measured 21–25,
-predicted 46–67 GFLOP/s.
+**The per-candidate numbers of this run are biased low and are not usable to judge the
+model.** `search` compiles each candidate and measures it at once, with one 10 ms warm-up
+round and 5 samples of 10 ms. Right after a fresh compile a kernel runs at about half
+speed for tens of milliseconds. One schedule (`split i 32, j 64; reorder jo, io, k, ii, ji;
+vectorize ji`) gave 34–36 GFLOP/s, spread 21–41, when freshly compiled, and 58–60, tight,
+from the cache. It was recorded in this run at 24.1, while the interleaved harness measures
+60. A fresh 30-candidate search repeated the pattern: its best four vectorized picks
+recorded 30–44 against 52–79 in the harness. The decision run above is not affected: 30
+interleaved rounds of already compiled kernels. The Spearman figures computed against
+these candidates (0.292, and later 0.564 after the model fixes #57, #59) are therefore not
+evidence about the model. A time-based warm-up is the fix, then run 2 with a new seed.
 
 ## Validity
 
