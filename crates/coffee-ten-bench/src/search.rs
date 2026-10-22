@@ -11,17 +11,24 @@
 //! runs the best random and the best model-top schedule together in one interleaved `run`,
 //! and decides on that run alone.
 //!
+//! With `--local --from <results.jsonl>` the budget is spent on a hill climb instead of the
+//! random sample: the third curve of spec §7.1. The model picks the next neighbor; a
+//! measurement becomes the incumbent only when it is strictly faster. `--local` and
+//! `--model-top` are separate experiments.
+//!
 //! Every log line is a `record_json` line plus a last field `"group"`: `"naive"` (the
-//! reference), `"random"` (the sample), `"model"` (the model's top K, rank order) or
-//! `"final"` (the interleaved decision run: best random, then best model).
+//! reference), `"random"` (the sample), `"model"` (the model's top K, rank order),
+//! `"local"` (the hill climb) or `"final"` (the interleaved decision run: best random,
+//! then best model).
 
 use crate::BenchError;
 use crate::cli::{Config, DEFAULT_SEED, KernelKind, MAX_N, QUICK_MIN_SAMPLE_MS, QUICK_SAMPLES};
+use crate::local::local_search;
 use crate::log::append_lines;
 use crate::meta::Metadata;
-use crate::model::{Machine, machine_from_results, rank_matmul, spearman};
+use crate::model::{Machine, Ranked, machine_from_results, rank_matmul, spearman};
 use crate::run::{Record, record_json, run};
-use crate::space::{Candidate, matmul_space};
+use crate::space::{Candidate, matmul_space, neighbors};
 use crate::stats::{Rng, Stats, summarize};
 use coffee_ten_loop::Schedule;
 use std::collections::HashMap;
@@ -35,7 +42,7 @@ pub const DEFAULT_SAMPLES: usize = 5;
 pub const DEFAULT_MIN_SAMPLE_MS: u64 = 10;
 pub const SEARCH_USAGE: &str = "usage: coffee-ten-bench search --n <N> --budget <M> \
 [--seed <SEED>] [--samples <S>] [--min-sample-ms <MS>] [--log <path>] [--quick] \
-[--model-top <K> --from <results.jsonl>]";
+[--model-top <K> --from <results.jsonl>] [--local --from <results.jsonl>]";
 /// Spec §7.1: the model's best must reach this fraction of the best random schedule.
 pub const CRITERION_RATIO: f64 = 0.9;
 
@@ -55,8 +62,11 @@ pub struct SearchConfig {
     pub log: Option<PathBuf>,
     /// Also measure the model's top K schedules (K >= 1; cut to the space size).
     pub model_top: Option<usize>,
-    /// Results file whose peak line is the model's machine; set exactly when `model_top` is.
+    /// Results file whose peak line is the model's machine. Set exactly with `model_top` or
+    /// with `local`.
     pub from: Option<PathBuf>,
+    /// Hill climb on the model's neighbors instead of the random sample.
+    pub local: bool,
 }
 
 /// What a search measured.
@@ -66,7 +76,8 @@ pub struct Search {
     pub space_size: usize,
     /// The naive kernel, the reference. It is not a candidate and not in the curve.
     pub naive: Record,
-    /// The sampled candidates, in the order they were measured.
+    /// The sampled candidates, in the order they were measured. With `--local`, the hill-climb
+    /// measurements instead of the random sample.
     pub records: Vec<Record>,
     /// The model group; `None` without `--model-top`.
     pub model: Option<ModelGroup>,
@@ -208,25 +219,84 @@ fn measure_final(
     Ok(FinalRun { random, model })
 }
 
+/// The hill climb of `--local`: `budget` measurements, group `"local"`.
+fn measure_local(
+    config: &SearchConfig,
+    metadata: &Metadata,
+    space: &[Candidate],
+    ranked: &[Ranked],
+) -> Result<Vec<Record>, BenchError> {
+    if ranked.len() != space.len() {
+        return Err(BenchError::Setup(
+            "the model did not rank the whole space".to_string(),
+        ));
+    }
+    let index_of: HashMap<&str, usize> = space
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.schedule.as_str(), index))
+        .collect();
+    let mut rank_of = vec![usize::MAX; space.len()];
+    for (rank, entry) in ranked.iter().enumerate() {
+        let Some(&index) = index_of.get(entry.schedule.as_str()) else {
+            return Err(BenchError::Setup(format!(
+                "the model ranked a schedule that is not in the space: {}",
+                entry.schedule
+            )));
+        };
+        if rank_of[index] != usize::MAX {
+            return Err(BenchError::Setup(
+                "the model ranked a schedule twice".to_string(),
+            ));
+        }
+        rank_of[index] = rank;
+    }
+    if rank_of.contains(&usize::MAX) {
+        return Err(BenchError::Setup(
+            "the model did not rank the whole space".to_string(),
+        ));
+    }
+    let steps = neighbors(space, config.n, config.n, config.n);
+    let mut records = Vec::new();
+    local_search(&steps, &rank_of, config.budget, |index| {
+        let record = measure_and_log(config, metadata, "local", &space[index].schedule)?;
+        let median = record.stats.median;
+        records.push(record);
+        Ok(median)
+    })?;
+    Ok(records)
+}
+
 /// Measures the naive kernel, then the sampled candidates one after another; with
-/// `--model-top` then the model's top K and the final run. A candidate that fails the check
-/// stops the search with its error; the records logged before it stay in the log.
+/// `--model-top` then the model's top K and the final run. `--local` measures the hill
+/// climb instead of the sample. A candidate that fails the check stops the search with
+/// its error; the records logged before it stay in the log.
 pub fn search(config: &SearchConfig, metadata: &Metadata) -> Result<Search, BenchError> {
     let space = matmul_space(config.n, config.n, config.n);
     let space_size = space.len();
     // Ranked before anything is measured: a bad `--from` fails at once.
-    let model_input = match (config.model_top, &config.from) {
-        (Some(top), Some(path)) => {
+    let model_input = match &config.from {
+        Some(path) if config.model_top.is_some() || config.local => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| BenchError::Setup(format!("cannot read {}: {e}", path.display())))?;
             // Only `.0`: the rest of the tuple is about which ceilings were measured.
             let machine = machine_from_results(&text)?.0;
             let ranked = rank_matmul(&machine, config.n)?;
-            Some((top, machine, ranked))
+            Some((machine, ranked))
         }
         _ => None,
     };
     let naive = measure_and_log(config, metadata, "naive", "")?;
+    if config.local {
+        let (_, ranked) = model_input.expect("invariant: --local ranks before measuring");
+        let records = measure_local(config, metadata, &space, &ranked)?;
+        return Ok(Search {
+            space_size,
+            naive,
+            records,
+            model: None,
+        });
+    }
     let mut records = Vec::new();
     for candidate in sample(space, config.budget, config.seed) {
         records.push(measure_and_log(
@@ -237,7 +307,10 @@ pub fn search(config: &SearchConfig, metadata: &Metadata) -> Result<Search, Benc
         )?);
     }
     let mut model = None;
-    if let Some((top, machine, ranked)) = model_input {
+    if let Some((machine, ranked)) = model_input {
+        let top = config
+            .model_top
+            .expect("invariant: the model group has --model-top");
         let predicted: HashMap<&str, f64> = ranked
             .iter()
             .map(|r| (r.schedule.as_str(), r.prediction.gflops))
@@ -343,6 +416,17 @@ pub fn report(config: &SearchConfig, result: &Search, metadata: &Metadata) -> St
         "naive {:.3} GFLOP/s (the reference; not a candidate, not in the curve)",
         result.naive.stats.median
     );
+    if config.local {
+        let from = config
+            .from
+            .as_ref()
+            .map_or(String::new(), |path| path.display().to_string());
+        let _ = writeln!(
+            text,
+            "local search (spec 7.1): hill climb on one model step, restart from the next model \
+             rank when that neighborhood is measured; machine from {from}"
+        );
+    }
     let _ = writeln!(text, "{:>4}  {:>11}  best_schedule", "m", "best_gflops");
     let medians: Vec<f64> = result.records.iter().map(|r| r.stats.median).collect();
     let best = best_index_so_far(&medians);
@@ -520,9 +604,14 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
     let mut log = None;
     let mut model_top = None;
     let mut from = None;
+    let mut local = false;
     while let Some(flag) = args.next() {
         if flag == "--quick" {
             quick = true;
+            continue;
+        }
+        if flag == "--local" {
+            local = true;
             continue;
         }
         let value = args
@@ -551,7 +640,17 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
     if model_top == Some(0) {
         return Err(usage("--model-top must be at least 1".to_string()));
     }
-    if model_top.is_some() != from.is_some() {
+    if local && model_top.is_some() {
+        return Err(usage(
+            "--local and --model-top are different experiments".to_string(),
+        ));
+    }
+    if local && from.is_none() {
+        return Err(usage(
+            "--local needs --from (the machine of the model)".to_string(),
+        ));
+    }
+    if !local && model_top.is_some() != from.is_some() {
         return Err(usage(
             "--model-top and --from (the machine of the model) go together".to_string(),
         ));
@@ -573,6 +672,7 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
         log,
         model_top,
         from,
+        local,
     })
 }
 
@@ -582,7 +682,7 @@ mod tests {
     use crate::meta::UNKNOWN;
     use crate::run::{RunInfo, make_record};
     use coffee_ten_loop::OrderClass;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
 
     fn test_metadata(seed: u64) -> Metadata {
@@ -695,6 +795,7 @@ mod tests {
                 log: None,
                 model_top: None,
                 from: None,
+                local: false,
             }
         );
         let quick = parse(&["--n", "16", "--budget", "3", "--samples", "50", "--quick"]).unwrap();
@@ -741,6 +842,7 @@ mod tests {
             log: Some(path.clone()),
             model_top: None,
             from: None,
+            local: false,
         };
         let metadata = test_metadata(config.seed);
         // `run` aborts with `BenchError::Mismatch` before timing a wrong variant, so an `Ok`
@@ -792,6 +894,13 @@ mod tests {
         assert!(with(&["--model-top", "3"]).is_err());
         assert!(with(&["--from", "p"]).is_err());
         assert!(with(&["--model-top"]).is_err());
+        assert!(with(&["--local"]).is_err());
+        assert!(with(&["--local", "--from", "p"]).is_ok());
+        assert!(with(&["--local", "--model-top", "2", "--from", "p"]).is_err());
+        let local = with(&["--local", "--from", "peak.jsonl"]).unwrap();
+        assert!(local.local);
+        assert_eq!(local.from, Some(PathBuf::from("peak.jsonl")));
+        assert_eq!(local.model_top, None);
     }
 
     #[test]
@@ -848,6 +957,7 @@ mod tests {
             log: None,
             model_top: Some(2),
             from: Some(PathBuf::from("peak.jsonl")),
+            local: false,
         };
         let result = Search {
             space_size: 100,
@@ -930,6 +1040,78 @@ mod tests {
         \"triad_gbs\":{\"median\":100.0},\"triad_l2_gbs\":{\"median\":100.0}}";
 
     #[test]
+    fn quick_local_search_on_16_measures_the_hill_climb_and_logs_it() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let log = dir.join(format!("coffee-ten-bench-search-local-{pid}.jsonl"));
+        let peak = dir.join(format!("coffee-ten-bench-search-local-peak-{pid}.jsonl"));
+        let _ = fs::remove_file(&log);
+        fs::write(&peak, format!("{PEAK_LINE}\n")).unwrap();
+        let config = SearchConfig {
+            n: 16,
+            budget: 4,
+            seed: 1,
+            samples: QUICK_SAMPLES,
+            min_sample_ms: QUICK_MIN_SAMPLE_MS,
+            quick: true,
+            log: Some(log.clone()),
+            model_top: None,
+            from: Some(peak.clone()),
+            local: true,
+        };
+        let metadata = test_metadata(config.seed);
+        let result = search(&config, &metadata).unwrap();
+        let log_text = fs::read_to_string(&log).unwrap();
+        fs::remove_file(&log).unwrap();
+        fs::remove_file(&peak).unwrap();
+
+        assert!(result.model.is_none());
+        assert_eq!(result.records.len(), 4);
+        let space = matmul_space(16, 16, 16);
+        let machine = machine_from_results(PEAK_LINE).unwrap().0;
+        let ranked = rank_matmul(&machine, 16).unwrap();
+        assert_eq!(result.records[0].schedule, ranked[0].schedule);
+        let index_of: HashMap<&str, usize> = space
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.schedule.as_str(), index))
+            .collect();
+        let mut rank_of = vec![0; space.len()];
+        for (rank, entry) in ranked.iter().enumerate() {
+            rank_of[index_of[entry.schedule.as_str()]] = rank;
+        }
+        let medians: HashMap<usize, f64> = result
+            .records
+            .iter()
+            .map(|record| (index_of[record.schedule.as_str()], record.stats.median))
+            .collect();
+        let order = local_search(&neighbors(&space, 16, 16, 16), &rank_of, 4, |index| {
+            Ok::<f64, &str>(medians[&index])
+        })
+        .unwrap();
+        let got: Vec<usize> = result
+            .records
+            .iter()
+            .map(|record| index_of[record.schedule.as_str()])
+            .collect();
+        assert_eq!(got, order);
+        let distinct: HashSet<usize> = got.iter().copied().collect();
+        assert_eq!(distinct.len(), got.len());
+
+        let groups: Vec<&str> = log_text
+            .lines()
+            .map(|line| {
+                let tail = line.rsplit_once("\"group\":\"").unwrap().1;
+                tail.strip_suffix("\"}").unwrap()
+            })
+            .collect();
+        assert_eq!(groups, ["naive", "local", "local", "local", "local"]);
+        let text = report(&config, &result, &metadata);
+        assert!(text.contains("local search (spec 7.1)"), "{text}");
+        assert!(!text.contains("criterion (spec 7.1)"), "{text}");
+    }
+
+    #[test]
     fn quick_model_search_on_16_logs_every_group_and_decides_on_the_final_run() {
         let dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -947,6 +1129,7 @@ mod tests {
             log: Some(log.clone()),
             model_top: Some(2),
             from: Some(peak.clone()),
+            local: false,
         };
         let metadata = test_metadata(config.seed);
         let result = search(&config, &metadata).unwrap();
@@ -1019,6 +1202,7 @@ mod tests {
             log: Some(log.clone()),
             model_top: Some(1),
             from: Some(PathBuf::from("/nonexistent/peak.jsonl")),
+            local: false,
         };
         assert!(search(&config, &test_metadata(1)).is_err());
         assert!(!log.exists());
