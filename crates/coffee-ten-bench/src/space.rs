@@ -9,10 +9,20 @@
 //! by `ri` and `rj`, order `io, jo, k, ii, ji`, `ji` vectorized, `ii` and `ji` unrolled,
 //! so the `ri x rj` tile of C stays in vector registers across `k`. Only this one shape:
 //! no `k` split, no other orders, no other unroll choices.
+//!
+//! `neighbors` is one step of local search on that set. A step is one of: an adjacent
+//! swap inside the outer block or inside the inner block; one tile factor moved to the
+//! next entry of `tile_options` (splitting tries each index of the inner block); the
+//! `vectorize` bit, when the innermost loop is `j` or
+//! `ji`; the register-tile `unroll` pair, added or removed together. A swap or a factor
+//! step that would change the innermost loop while it is vectorized is not a step: turn
+//! `vectorize` off first. A register tile steps only to an adjacent `ri` or `rj`, or to
+//! the same schedule without `unroll`.
 
 use crate::cli::MAX_N;
 use coffee_ten_ir::{Graph, Shape};
 use coffee_ten_loop::{Kernel, OrderClass, Schedule, Step, apply_classified, lower};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 /// Tile factors tried per loop; a loop can also stay unsplit.
@@ -262,6 +272,364 @@ pub fn parse_space_args<I: IntoIterator<Item = String>>(
         return Err(usage(format!("--n must be in 1..={MAX_N}, got {n}")));
     }
     Ok(n)
+}
+
+/// One local-search step from each candidate: indexes into `candidates`, no duplicates,
+/// never the candidate itself. A move whose schedule is not in `candidates` is dropped.
+/// `m`, `k` and `n` are the matmul extents, the same ones `enumerate_matmul` took.
+pub fn neighbors(candidates: &[Candidate], m: usize, k: usize, n: usize) -> Vec<Vec<usize>> {
+    let index_of: HashMap<&str, usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.schedule.as_str(), index))
+        .collect();
+    // Axis 0 is `i` (extent m), axis 1 is `j` (extent n), axis 2 is `k`.
+    let extents = [m, n, k];
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(current, candidate)| {
+            let point = point_of(&candidate.schedule);
+            let encoded = text_of(&point);
+            assert_eq!(
+                encoded, candidate.schedule,
+                "invariant: a space schedule round-trips"
+            );
+            let mut row = Vec::new();
+            for moved in moves_of(&point, extents) {
+                let text = text_of(&moved);
+                if let Some(&index) = index_of.get(text.as_str())
+                    && index != current
+                    && !row.contains(&index)
+                {
+                    row.push(index);
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+/// The decisions a candidate is built from. `factor` is in `AXES` order (`i`, `j`, `k`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Point {
+    factor: [Option<usize>; 3],
+    outer: Vec<String>,
+    inner: Vec<String>,
+    vectorize: bool,
+    register: bool,
+}
+
+fn is_inner_loop(name: &str) -> bool {
+    matches!(name, "ii" | "ji" | "ki")
+}
+
+fn innermost(point: &Point) -> &str {
+    point
+        .inner
+        .last()
+        .or_else(|| point.outer.last())
+        .expect("invariant: a nest has a loop")
+}
+
+fn names_eq(names: &[String], expect: &[&str]) -> bool {
+    names.iter().map(String::as_str).eq(expect.iter().copied())
+}
+
+/// The point `text` was built from. `text` is a space candidate: it has a reorder, and
+/// an `unroll` only as the register-tile pair.
+fn point_of(text: &str) -> Point {
+    let schedule = Schedule::parse(text).expect("invariant: candidate texts parse");
+    let mut factor = [None; 3];
+    let mut order = None;
+    let mut vectorize = false;
+    let mut unroll = Vec::new();
+    for step in schedule.steps {
+        match step {
+            Step::Split {
+                nest,
+                loop_name,
+                outer,
+                inner,
+                factor: value,
+            } => {
+                assert_eq!(
+                    nest, UPDATE_NEST,
+                    "invariant: splits are on the update nest"
+                );
+                let axis = AXES
+                    .iter()
+                    .position(|axis| axis.name == loop_name)
+                    .expect("invariant: a split names i, j or k");
+                assert_eq!(outer, AXES[axis].outer, "invariant: split outer name");
+                assert_eq!(inner, AXES[axis].inner, "invariant: split inner name");
+                factor[axis] = Some(value);
+            }
+            Step::Reorder { nest, order: names } => {
+                assert_eq!(
+                    nest, UPDATE_NEST,
+                    "invariant: reorder is on the update nest"
+                );
+                order = Some(names);
+            }
+            Step::Vectorize { nest, .. } => {
+                assert_eq!(
+                    nest, UPDATE_NEST,
+                    "invariant: vectorize is on the update nest"
+                );
+                vectorize = true;
+            }
+            Step::Unroll { nest, loop_name } => {
+                assert_eq!(nest, UPDATE_NEST, "invariant: unroll is on the update nest");
+                unroll.push(loop_name);
+            }
+        }
+    }
+    let order = order.expect("invariant: a space candidate has a reorder");
+    let first_inner = order
+        .iter()
+        .position(|name| is_inner_loop(name))
+        .unwrap_or(order.len());
+    let point = Point {
+        factor,
+        outer: order[..first_inner].to_vec(),
+        inner: order[first_inner..].to_vec(),
+        vectorize,
+        register: !unroll.is_empty(),
+    };
+    if vectorize {
+        let name = innermost(&point);
+        assert!(
+            name == "j" || name == "ji",
+            "invariant: vectorize is on j or ji, got {name} in {text}"
+        );
+    }
+    if point.register {
+        unroll.sort();
+        assert_eq!(
+            unroll,
+            ["ii", "ji"],
+            "invariant: unroll is the register-tile pair"
+        );
+    }
+    point
+}
+
+fn text_of(point: &Point) -> String {
+    let mut steps = Vec::new();
+    for (axis, factor) in AXES.iter().zip(point.factor) {
+        if let Some(factor) = factor {
+            steps.push(Step::Split {
+                nest: UPDATE_NEST,
+                loop_name: axis.name.to_string(),
+                outer: axis.outer.to_string(),
+                inner: axis.inner.to_string(),
+                factor,
+            });
+        }
+    }
+    let order = point.outer.iter().chain(&point.inner).cloned().collect();
+    steps.push(Step::Reorder {
+        nest: UPDATE_NEST,
+        order,
+    });
+    if point.vectorize {
+        steps.push(Step::Vectorize {
+            nest: UPDATE_NEST,
+            loop_name: innermost(point).to_string(),
+        });
+    }
+    if point.register {
+        for name in ["ii", "ji"] {
+            steps.push(Step::Unroll {
+                nest: UPDATE_NEST,
+                loop_name: name.to_string(),
+            });
+        }
+    }
+    Schedule { steps }.to_string()
+}
+
+fn push_unique(out: &mut Vec<Point>, point: Point) {
+    if !out.contains(&point) {
+        out.push(point);
+    }
+}
+
+/// `point.factor[axis]` replaced by the adjacent option `next`. Splitting inserts the new
+/// inner loop at every index of the inner block, so the step is the inverse of removing
+/// that loop wherever it sat. A result that would change the innermost loop while it is
+/// vectorized is dropped.
+fn retile(point: &Point, axis: usize, next: Option<usize>) -> Vec<Point> {
+    let old = point.factor[axis];
+    if point.register || old == next {
+        return Vec::new();
+    }
+    let single = AXES[axis].name;
+    let outer_name = AXES[axis].outer;
+    let inner_name = AXES[axis].inner;
+    let mut base = point.clone();
+    base.factor[axis] = next;
+    let moved = match (old, next) {
+        (None, Some(_)) => {
+            let Some(index) = base.outer.iter().position(|name| name == single) else {
+                return Vec::new();
+            };
+            base.outer[index] = outer_name.to_string();
+            (0..=base.inner.len())
+                .map(|slot| {
+                    let mut one = base.clone();
+                    one.inner.insert(slot, inner_name.to_string());
+                    one
+                })
+                .collect()
+        }
+        (Some(_), None) => {
+            let Some(index) = base.outer.iter().position(|name| name == outer_name) else {
+                return Vec::new();
+            };
+            base.outer[index] = single.to_string();
+            let Some(index) = base.inner.iter().position(|name| name == inner_name) else {
+                return Vec::new();
+            };
+            base.inner.remove(index);
+            vec![base]
+        }
+        (Some(_), Some(_)) => vec![base],
+        (None, None) => Vec::new(),
+    };
+    let innermost_before = innermost(point);
+    moved
+        .into_iter()
+        .filter(|one| !point.vectorize || innermost(one) == innermost_before)
+        .collect()
+}
+
+fn factor_moves(point: &Point, extents: [usize; 3]) -> Vec<Point> {
+    let mut out = Vec::new();
+    if point.register {
+        return out;
+    }
+    for (axis, &extent) in extents.iter().enumerate() {
+        let options = tile_options(extent);
+        let Some(pos) = options
+            .iter()
+            .position(|factor| *factor == point.factor[axis])
+        else {
+            continue;
+        };
+        for next_pos in [pos.checked_sub(1), pos.checked_add(1)] {
+            let Some(next_pos) = next_pos else {
+                continue;
+            };
+            let Some(&next) = options.get(next_pos) else {
+                continue;
+            };
+            for moved in retile(point, axis, next) {
+                push_unique(&mut out, moved);
+            }
+        }
+    }
+    out
+}
+
+fn swap_moves(point: &Point) -> Vec<Point> {
+    let mut out = Vec::new();
+    if point.register {
+        return out;
+    }
+    for i in 0..point.outer.len().saturating_sub(1) {
+        let mut moved = point.clone();
+        moved.outer.swap(i, i + 1);
+        if point.vectorize && innermost(&moved) != innermost(point) {
+            continue;
+        }
+        push_unique(&mut out, moved);
+    }
+    for i in 0..point.inner.len().saturating_sub(1) {
+        let mut moved = point.clone();
+        moved.inner.swap(i, i + 1);
+        if point.vectorize && innermost(&moved) != innermost(point) {
+            continue;
+        }
+        push_unique(&mut out, moved);
+    }
+    out
+}
+
+fn vectorize_move(point: &Point) -> Option<Point> {
+    if point.register {
+        return None;
+    }
+    let name = innermost(point);
+    if name != "j" && name != "ji" {
+        return None;
+    }
+    let mut moved = point.clone();
+    moved.vectorize = !moved.vectorize;
+    Some(moved)
+}
+
+fn is_register_twin(point: &Point) -> bool {
+    let (Some(ri), Some(rj), None) = (point.factor[0], point.factor[1], point.factor[2]) else {
+        return false;
+    };
+    !point.register
+        && point.vectorize
+        && REG_TILE_I.contains(&ri)
+        && REG_TILE_J.contains(&rj)
+        && names_eq(&point.outer, &["io", "jo", "k"])
+        && names_eq(&point.inner, &["ii", "ji"])
+}
+
+fn adjacent_values(values: &[usize], current: usize) -> impl Iterator<Item = usize> {
+    let pos = values.iter().position(|&value| value == current);
+    let earlier = pos
+        .and_then(|pos| pos.checked_sub(1))
+        .map(|pos| values[pos]);
+    let later = pos.and_then(|pos| values.get(pos + 1).copied());
+    earlier.into_iter().chain(later)
+}
+
+/// Register tiles step to an adjacent `ri` or `rj`, or drop both unrolls. The matching
+/// schedule without unrolls steps back. A tile the space does not contain is dropped
+/// later, by the lookup in `neighbors`.
+fn register_moves(point: &Point) -> Vec<Point> {
+    let mut out = Vec::new();
+    if point.register {
+        let mut twin = point.clone();
+        twin.register = false;
+        out.push(twin);
+        let ri = point.factor[0].expect("invariant: a register tile splits i");
+        let rj = point.factor[1].expect("invariant: a register tile splits j");
+        for next_ri in adjacent_values(&REG_TILE_I, ri) {
+            let mut moved = point.clone();
+            moved.factor[0] = Some(next_ri);
+            out.push(moved);
+        }
+        for next_rj in adjacent_values(&REG_TILE_J, rj) {
+            let mut moved = point.clone();
+            moved.factor[1] = Some(next_rj);
+            out.push(moved);
+        }
+    } else if is_register_twin(point) {
+        let mut tiled = point.clone();
+        tiled.register = true;
+        out.push(tiled);
+    }
+    out
+}
+
+fn moves_of(point: &Point, extents: [usize; 3]) -> Vec<Point> {
+    let mut out = factor_moves(point, extents);
+    out.extend(swap_moves(point));
+    if let Some(toggled) = vectorize_move(point) {
+        push_unique(&mut out, toggled);
+    }
+    for moved in register_moves(point) {
+        push_unique(&mut out, moved);
+    }
+    out
 }
 
 /// The report of `coffee-ten-bench space`: counts by class and the first `SHOWN` texts.
@@ -558,5 +926,147 @@ mod tests {
         assert!(parse(&["--n"]).is_err());
         assert!(parse(&["--n", "x"]).is_err());
         assert!(parse(&["--n", "8", "--kernel", "matmul"]).is_err());
+    }
+
+    fn texts_of(indexes: &[usize], space: &[Candidate]) -> Vec<String> {
+        let mut texts: Vec<String> = indexes
+            .iter()
+            .map(|&index| space[index].schedule.clone())
+            .collect();
+        texts.sort();
+        texts
+    }
+
+    #[test]
+    fn the_unsplit_ijk_schedule_has_its_six_hand_neighbors_at_n_16() {
+        // Factors of 16: none and 8. From `i, k, j` with nothing split and vectorize off:
+        // two adjacent outer swaps, vectorize on `j`, and one split of each axis.
+        let space = matmul_space(16, 16, 16);
+        let start = "reorder(1, i, k, j)";
+        let index = space
+            .iter()
+            .position(|c| c.schedule == start)
+            .expect("present");
+        let row = neighbors(&space, 16, 16, 16);
+        assert_eq!(
+            texts_of(&row[index], &space),
+            [
+                "reorder(1, i, j, k)",
+                "reorder(1, i, k, j); vectorize(1, j)",
+                "reorder(1, k, i, j)",
+                "split(1, i, io, ii, 8); reorder(1, io, k, j, ii)",
+                "split(1, j, jo, ji, 8); reorder(1, i, k, jo, ji)",
+                "split(1, k, ko, ki, 8); reorder(1, i, ko, j, ki)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vectorized_loop_does_not_step_to_a_different_innermost_loop() {
+        let space = matmul_space(16, 16, 16);
+        let row = neighbors(&space, 16, 16, 16);
+        let of = |text: &str| {
+            let index = space.iter().position(|c| c.schedule == text).expect(text);
+            texts_of(&row[index], &space)
+        };
+        let vectorized = "reorder(1, i, k, j); vectorize(1, j)";
+        // Splitting `i` would make `ii` the innermost loop, so the vectorized schedule
+        // does not step there. The same schedule with vectorize off does.
+        let split_i = "split(1, i, io, ii, 8); reorder(1, io, k, j, ii)";
+        assert!(!of(vectorized).iter().any(|text| text == split_i));
+        assert!(of("reorder(1, i, k, j)").iter().any(|text| text == split_i));
+
+        let tiled = "split(1, i, io, ii, 8); split(1, j, jo, ji, 8); \
+            reorder(1, io, jo, k, ii, ji); vectorize(1, ji)";
+        let swapped =
+            "split(1, i, io, ii, 8); split(1, j, jo, ji, 8); reorder(1, io, jo, k, ji, ii)";
+        assert!(!of(tiled).iter().any(|text| text == swapped));
+        let tiled_off =
+            "split(1, i, io, ii, 8); split(1, j, jo, ji, 8); reorder(1, io, jo, k, ii, ji)";
+        assert!(of(tiled_off).iter().any(|text| text == swapped));
+    }
+
+    #[test]
+    fn a_register_tile_steps_to_adjacent_tiles_and_to_its_twin_when_that_exists() {
+        // `ri` of 2 or 4 is not a `TILE_FACTORS` entry, so those tiles have no schedule
+        // without `unroll` in the space. `ri` = 8 does. At n = 16 the 8 x 16 tile needs 32
+        // accumulators and is absent, so 8 x 8 steps to 4 x 8 and to its twin only.
+        let twin = "split(1, i, io, ii, 8); split(1, j, jo, ji, 8); \
+            reorder(1, io, jo, k, ii, ji); vectorize(1, ji)";
+        let tile = format!("{twin}; unroll(1, ii); unroll(1, ji)");
+        let space = matmul_space(16, 16, 16);
+        let row = neighbors(&space, 16, 16, 16);
+        let of = |text: &str| {
+            let index = space.iter().position(|c| c.schedule == text).expect(text);
+            texts_of(&row[index], &space)
+        };
+        assert_eq!(
+            of(&tile),
+            [
+                "split(1, i, io, ii, 4); split(1, j, jo, ji, 8); reorder(1, io, jo, k, ii, ji); \
+                    vectorize(1, ji); unroll(1, ii); unroll(1, ji)"
+                    .to_string(),
+                twin.to_string(),
+            ]
+        );
+        assert!(of(twin).iter().any(|text| text == &tile));
+        let four_by_sixteen = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
+            reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
+        assert_eq!(
+            of(four_by_sixteen),
+            [
+                "split(1, i, io, ii, 2); split(1, j, jo, ji, 16); reorder(1, io, jo, k, ii, ji); \
+                    vectorize(1, ji); unroll(1, ii); unroll(1, ji)"
+                    .to_string(),
+                "split(1, i, io, ii, 4); split(1, j, jo, ji, 8); reorder(1, io, jo, k, ii, ji); \
+                    vectorize(1, ji); unroll(1, ii); unroll(1, ji)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_factor_steps_only_to_the_next_option_of_its_own_axis() {
+        // m = 48, k = 40, n = 24. `i` options: none, 8, 16. `j` options: none, 8.
+        // From `ii` = 8 the next `i` factor is 16, and `j` has no 16.
+        let space = matmul_space(48, 40, 24);
+        let row = neighbors(&space, 48, 40, 24);
+        let of = |text: &str| {
+            let index = space.iter().position(|c| c.schedule == text).expect(text);
+            texts_of(&row[index], &space)
+        };
+        let ii_8 = "split(1, i, io, ii, 8); reorder(1, io, k, j, ii)";
+        let ii_16 = "split(1, i, io, ii, 16); reorder(1, io, k, j, ii)";
+        let ji_8 = "split(1, j, jo, ji, 8); reorder(1, i, k, jo, ji)";
+        let ji_16 = "split(1, j, jo, ji, 16); reorder(1, i, k, jo, ji)";
+        assert!(of(ii_8).iter().any(|text| text == ii_16));
+        assert!(!space.iter().any(|c| c.schedule == ji_16));
+        assert!(!of(ji_8).iter().any(|text| text.contains("ji, 16")));
+    }
+
+    #[test]
+    fn every_neighbor_is_one_step_away_and_the_relation_is_symmetric() {
+        for (m, k, n) in [(16, 16, 16), (64, 64, 64), (48, 40, 24)] {
+            let space = matmul_space(m, k, n);
+            let row = neighbors(&space, m, k, n);
+            assert_eq!(row.len(), space.len(), "{m}x{k}x{n}");
+            for (index, neighbors_of) in row.iter().enumerate() {
+                assert!(!neighbors_of.contains(&index), "{m}x{k}x{n} {index}");
+                let mut sorted = neighbors_of.clone();
+                sorted.sort();
+                sorted.dedup();
+                assert_eq!(sorted.len(), neighbors_of.len(), "{m}x{k}x{n} {index}");
+                for &other in neighbors_of {
+                    assert!(
+                        row[other].contains(&index),
+                        "{m}x{k}x{n}: {} -> {} is one way\n  {}\n  {}",
+                        index,
+                        other,
+                        space[index].schedule,
+                        space[other].schedule
+                    );
+                }
+            }
+        }
     }
 }
