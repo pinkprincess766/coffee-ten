@@ -46,6 +46,7 @@ fn space_main(args: impl Iterator<Item = String>) -> ExitCode {
 }
 
 /// `coffee-ten-bench search --n <N> --budget <M>`: random search, one candidate at a time.
+/// `--local` spends the budget on the model's hill climb instead.
 fn search_main(args: impl Iterator<Item = String>) -> ExitCode {
     let config = match coffee_ten_bench::search::parse_search_args(args) {
         Ok(config) => config,
