@@ -14,7 +14,7 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 | Code | S1, S2: commit `ffce49d`; S3: commit `4928ffa` (adds `unroll` and row-pointer indexing, #42–#44); clean tree (`"dirty": false` in every record) |
 | Sessions | S1 2026-10-15, 60 s pauses between series; S2 2026-10-16 on a cold Mac, 180 s pauses; S3 2026-10-18 on a cold Mac, 60 s pauses |
 | Method | per (kernel, N): a warm-up (S1–S3 and run 1: one round of one 10 ms sample per variant; from #61: each variant runs 300 ms), then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
-| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58), `bench/results/2026-10-21-hypothesis-a-run2.jsonl` (hypothesis A, run 2, commit `702dcf1`) |
+| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58), `bench/results/2026-10-21-hypothesis-a-run2.jsonl` (hypothesis A, run 2, commit `702dcf1`), `bench/results/2026-10-22-hypothesis-a-run3.jsonl` (hypothesis A, run 3, commit `726cc1d`) |
 
 Every variant was checked against the naive kernel within the inner-product error bound
 before it was timed.
@@ -207,6 +207,38 @@ What this does and does not show:
 - **The model's fixes were found on run 1's data**, then frozen before run 2. Run 2's random
   sample is new (seed 2). The model's top 10 does not depend on the seed.
 - **Not tested:** other N, other seeds beyond 1 and 2, other machines.
+
+## Hypothesis A (spec §7.1), run 3: met, out of sample
+
+Run 3 (commit `726cc1d`, N = 256, seed 3, machine P3) repeats run 2's procedure with model
+v1.3 (#63). v1.3 knows which rolled loops clang fully unrolls, a rule found from the IR of
+run 2's schedules. Run 3's 1000 random candidates are a new sample, so this is the
+out-of-sample check of v1.3. Within-record spread p75/p25 = 1.004; no drift flags.
+
+| | schedule | median [p25–p75], GFLOP/s |
+|---|---|---|
+| best random (candidate 284 of 1000) | `split i 8, j 64, k 64; reorder ko, jo, io, ii, ki, ji; vectorize ji` | **86.32** [83.11–86.64] |
+| best of the model's top 10 (rank 1) | 4×16 register tile | **117.56** [113.12–118.02] |
+
+**Ratio 1.362: the criterion is met.** This time random search drew no register tile in 1000
+draws. Its best-so-far was 60.0 GFLOP/s after 16 candidates, 86.4 after 64 and 87.0 from 284
+on. The model's rank 1 gave 118 at the first measurement. The decision run's quartiles are wider than in run 2
+(p25 3–4% below the median), but the gap is far larger than that.
+
+**The model's precision holds out of sample.** Over the 1000 random candidates, model v1.3 vs
+measured:
+
+| | Spearman | median error |
+|---|---|---|
+| run 2 (v1.2, before the rule) | 0.571 | ×1.37 |
+| run 2 (v1.3, in sample) | 0.854 | ×1.24 |
+| **run 3 (v1.3, new sample)** | **0.853** | **×1.26** |
+
+By group (run 3, measured vs predicted median): scalar `ji` innermost 7.7 vs 8.4 (1.10);
+scalar `k`/`ki` innermost 7.1 vs 6.8 (0.91); vectorized `ji` = 128 42.2 vs 45.8 (1.08);
+"vectorized" `ji` ≤ 16, which is scalar code, 25.5 vs 19.4 (0.73); vectorized `ji` = 32/64 52.4 vs 65.3
+(1.49); scalar `ii` innermost 6.6 vs 8.4 (1.42). The same groups were off by about the same
+amount in run 2, so these are the model's stable errors, not noise of one sample.
 
 ## Validity
 
