@@ -7,12 +7,31 @@ random search.
 
 ## Status
 
-Pre-MVP. Python builder and reference interpreter (f32 and f64); `ct.compile` takes a
-graph through loop IR, a schedule (split, reorder, vectorize), C and clang to a kernel
-that matches the interpreter bit for bit when the schedule keeps the order of sums
-and within a derived bound otherwise. Measured on one Apple M5 core (BENCHMARKS.md):
-vectorizing the tiled matmul takes it from about 7 to 57–60 GFLOP/s, 47–50% of the
-measured FMA peak, for N up to 256. Not yet: the autotuner.
+Working: Python builder and reference interpreter (f32 and f64); `ct.compile` takes a
+graph through loop IR, a schedule (split, reorder, vectorize, unroll), C and clang to a
+kernel that matches the interpreter bit for bit when the schedule keeps the order of sums
+and within a derived bound otherwise. On one Apple M5 core, vectorizing the tiled matmul
+takes it from about 7 to 57–60 GFLOP/s, 47–50% of the measured FMA peak, for N up to 256.
+
+Hypothesis A (the model's top 10 holds a schedule within 90% of the best of 1000 random
+measurements), all at N = 256, numbers in BENCHMARKS.md:
+
+- Run 1 (#56): ratio 0.622, not met. Spearman 0.292 over the random candidates.
+- Model and harness fixes after run 1: short "vectorized" loops modelled as scalar (#57),
+  FMA latency ceilings (#58, #59, model v1.2), a 300 ms time-based warm-up (#61), loops
+  clang fully unrolls (#63, model v1.3).
+- Run 2 (#62): ratio 1.079, met (model v1.2, Spearman 0.571).
+- Run 3 (#64): ratio 1.362, met out of sample on a new seed (model v1.3, Spearman 0.853,
+  median error ×1.26).
+- Model-guided local search over one-step schedule neighbours (#65): code only, no
+  measured run yet.
+
+Known model errors, stable across runs 2 and 3 (#64): vectorized `ji` = 32/64
+over-predicted ×1.49, scalar `ii` innermost ×1.42, short "vectorized" loops (scalar code)
+under-predicted ×0.73.
+
+Not done yet: correcting those three errors in the model, and run 4 at N = 512. Only one
+size and one machine have been measured so far.
 
 ## Quickstart
 
