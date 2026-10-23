@@ -157,12 +157,14 @@ interpreter bit for bit).
 ### Loop tiling for matmul — [L3], [L7]
 
 `split` and `reorder` give cache tiles, `vectorize` widens the innermost `j` loop.
-Packing and register micro-kernels are out of scope for the MVP, which caps the
-reachable fraction of peak. Code: the matmul update nest is lowered in `i, k, j`
+Packing is not implemented. There is no separate micro-kernel either: a register tile
+is an ordinary schedule, `split` + `reorder` + `vectorize` + `unroll` (the 4×16 tile in
+`bench/run.sh`), and clang keeps that tile of C in vector registers across `k`. Code: the matmul update nest is lowered in `i, k, j`
 order (`crates/coffee-ten-loop/src/lower.rs`); tiles come from `split` and `reorder`,
 and the `j` loop is vectorized (`crates/coffee-ten-loop/src/apply.rs`). Checked by:
 `crates/coffee-ten-codegen-c/tests/vectorize.rs` (clang's `-Rpass=loop-vectorize`
-remarks) and `crates/coffee-ten-codegen-c/tests/reorder.rs`. Speed: measured by
+remarks), `crates/coffee-ten-codegen-c/tests/reorder.rs` and
+`crates/coffee-ten-codegen-c/tests/unroll.rs` (the register tile, in the optimized IR). Speed: measured by
 `crates/coffee-ten-bench` (variants interleaved over rounds, median and IQR), one run of
 all sizes with `bench/run.sh`;
 numbers in BENCHMARKS.md.
@@ -207,16 +209,23 @@ interpreter (`ct.run`) or compiled with a schedule (`ct.compile`). Code:
 `crates/coffee-ten-py/tests/test_diff_numpy.py`, `crates/coffee-ten-py/tests/test_compile.py`,
 `crates/coffee-ten-py/tests/test_loop_ir.py`.
 
-### Cost-model autotuning (research, after the MVP) — [L21], [L22]
+### Cost-model autotuning (research) — [L21], [L22]
 
 Hypothesis: the top 10 schedules by the model contain one within 90% of the best
-found by random search with 1000 measurements. Code: planned. Checked by: planned.
+found by random search with 1000 measurements. Results of the runs: BENCHMARKS.md.
+Code: `crates/coffee-ten-bench/src/space.rs` (the matmul schedule space),
+`crates/coffee-ten-bench/src/model.rs` (the analytic model and `model compare`),
+`crates/coffee-ten-bench/src/search.rs` (random search, the model's top 10, the
+interleaved decision run), `crates/coffee-ten-bench/src/local.rs` (model-guided local
+search). Checked by: unit tests in those files and
+`crates/coffee-ten-bench/tests/quick_run.rs`.
 
 ## Baseline / Results
 
-Pre-MVP baseline, two sessions on one Apple M5 core: see BENCHMARKS.md. Tiled +
-vectorized matmul runs at 47–50% of the measured FMA peak for N ≤ 256 and falls to
-37% at N = 512 and 20% at N = 1024; tiling alone gains at most 8%.
+Measured on one Apple M5 core: see BENCHMARKS.md. Tiled + vectorized matmul runs at
+47–50% of the measured FMA peak for N ≤ 256 and falls to 37% at N = 512 and 20% at
+N = 1024; tiling alone gains at most 8%. The 4×16 register tile reaches 94–96% of peak for matmul
+at N ≤ 512 and 81% at N = 1024 (fused relu(A @ B + bias): 78–91%; one session, S3).
 
 ## Non-goals
 
