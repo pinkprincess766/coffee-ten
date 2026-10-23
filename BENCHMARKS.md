@@ -19,6 +19,9 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 Every variant was checked against the naive kernel within the inner-product error bound
 before it was timed.
 
+Plot of S3 (all four schedules, median with p25–p75): [`docs/bench-gflops.png`](docs/bench-gflops.png),
+built from the committed raw data with `python3 bench/plot.py` (needs matplotlib; no new measurements).
+
 ## Ceilings (`bench/peak`, one core)
 
 | | S1 | S2 | S3 |
