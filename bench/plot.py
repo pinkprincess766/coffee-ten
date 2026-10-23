@@ -47,16 +47,16 @@ def main():
         sys.exit("bench/plot.py needs matplotlib: pip install matplotlib")
     series = load(a.results)
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for name in ORDER:
+    for i, name in enumerate(ORDER):
         if name not in series:
             continue
         n, med, lo, hi, drift = zip(*series[name])
-        line = ax.errorbar(n, med, yerr=[[m - l for m, l in zip(med, lo)], [h - m for m, h in zip(med, hi)]],
-                           marker="o", capsize=3, label=name)
+        ax.errorbar(n, med, yerr=[[m - l for m, l in zip(med, lo)], [h - m for m, h in zip(med, hi)]],
+                    marker="o", capsize=3, label=name, color=f"C{i}")
         dn = [x for x, d in zip(n, drift) if d]
         dm = [y for y, d in zip(med, drift) if d]
         if dn:
-            ax.plot(dn, dm, "o", mfc="white", mec=line[0].get_color(), mew=1.5, zorder=3)
+            ax.plot(dn, dm, "o", mfc="white", mec=f"C{i}", mew=1.5, zorder=3, label="_nolegend_")
     ax.set_xscale("log", base=2)
     ax.set_xticks([64, 128, 256, 512, 1024], ["64", "128", "256", "512", "1024"])
     ax.set_xlabel("N")
