@@ -22,6 +22,18 @@ before it was timed.
 Plot of S3 (all four schedules, median with p25–p75): [`docs/bench-gflops.png`](docs/bench-gflops.png),
 built from the committed raw data with `python3 bench/plot.py` (needs matplotlib; no new measurements).
 
+Roofline of S3: [`docs/bench-roofline.png`](docs/bench-roofline.png), `python3 bench/roofline.py`
+(same input, no new measurements; after Williams, Waterman, Patterson, CACM 2009, README [L2]).
+Ceilings are S3's own `bench/peak` medians from the same file: `fma_gflops` 129.2 GFLOP/s and
+`triad_gbs` 112.1 GB/s (ridge 1.15 FLOP/byte), not datasheet numbers. Arithmetic intensity
+of each point is counted on compulsory DRAM traffic, float32: A and B read once, C read and
+written once, so AI = 2·N³ / (4 · 4·N²) = N / 8 FLOP/byte (8 at N = 64 to 128 at N = 1024),
+the same for all four schedules. That is the minimum traffic, so it is an **upper bound** on
+the real AI (a lower bound on traffic): the naive and tiled nests can reload B and C and
+have a lower AI. The real per-variant traffic is not in the data (no counters), so the plot
+does not claim it. All points sit right of the ridge, which is why the compute ceiling is
+the one that applies.
+
 ## Ceilings (`bench/peak`, one core)
 
 | | S1 | S2 | S3 |
