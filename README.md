@@ -108,6 +108,19 @@ Vectorizing the tiled matmul takes it from about 7 to 57–60 GFLOP/s, 47–50% 
 reaches 94–96% of peak for matmul at N ≤ 512 and 81% at N = 1024 (fused
 relu(A @ B + bias): 78–91%; one session, S3).
 
+![Fig. 1](docs/bench-gflops.png)
+
+**Fig. 1.** Matmul GFLOP/s against N for the four schedules (naive, tiled, tiled + vec,
+4×16 register tile), session S3, median with p25–p75; hollow markers are variants flagged
+`drift`. Raw data `bench/results/2026-10-18-4928ffa.jsonl`; `python3 bench/plot.py`.
+
+![Fig. 2](docs/bench-roofline.png)
+
+**Fig. 2.** Roofline of the same S3 points. Ceilings are S3's own `bench/peak` medians,
+FMA 129.2 GFLOP/s and memory triad 112.1 GB/s (ridge 1.15 FLOP/byte). Arithmetic intensity
+is N / 8 FLOP/byte on compulsory DRAM traffic, an upper bound on the real AI of each variant
+([details](BENCHMARKS.md#benchmarks)); `python3 bench/roofline.py`.
+
 **Hypothesis A**, all at N = 256:
 
 - Run 1 (#56): ratio 0.622, not met. Spearman 0.292 over the random candidates, a
