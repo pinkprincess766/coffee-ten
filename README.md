@@ -1,39 +1,206 @@
 # coffee-ten
 
-A tiny tensor compiler: Python builder → graph IR → loop IR with a schedule →
-C → clang → a CPU kernel. The research question is whether an analytic cost model
-(cache traffic plus roofline) can rank schedules well enough to replace most of a
-random search.
+A tiny tensor compiler, and a test of whether an analytic cost model can replace most of a
+random schedule search.
 
-## Status
+## Abstract
 
-Working: Python builder and reference interpreter (f32 and f64); `ct.compile` takes a
-graph through loop IR, a schedule (split, reorder, vectorize, unroll), C and clang to a
-kernel that matches the interpreter bit for bit when the schedule keeps the order of sums
-and within a derived bound otherwise. On one Apple M5 core, vectorizing the tiled matmul
-takes it from about 7 to 57–60 GFLOP/s, 47–50% of the measured FMA peak, for N up to 256.
+coffee-ten compiles a small Python tensor graph through a graph IR and a loop IR with a
+textual schedule (split, reorder, vectorize, unroll) to C, which clang turns into a CPU
+kernel. We ask whether an analytic cost model (cache traffic from loop footprints plus a
+roofline with load/store and FMA-latency ceilings) ranks schedules well enough that its top
+10 contains a schedule within 90% of the best of 1000 random measurements (hypothesis A).
+On one Apple M5 core at N = 256, the first run failed (ratio 0.622); after fixes to the
+harness and the model, run 2 met the criterion (ratio 1.079) and run 3,
+on a new random sample, met it out of sample (ratio 1.362), with Spearman 0.853 and a
+median error of ×1.26 between model and measurement over 1000 random schedules
+([run 1](BENCHMARKS.md#hypothesis-a-spec-71-run-1-not-met),
+[run 2](BENCHMARKS.md#hypothesis-a-spec-71-run-2-met),
+[run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)). A hand-written 4×16
+register-tile schedule reaches 94–96% of the measured FMA peak for N ≤ 512
+([Register tile](BENCHMARKS.md#register-tile-s3)). One machine and one problem size have been
+tested.
 
-Hypothesis A (the model's top 10 holds a schedule within 90% of the best of 1000 random
-measurements), all at N = 256, numbers in BENCHMARKS.md:
+## 1. Introduction
 
-- Run 1 (#56): ratio 0.622, not met. Spearman 0.292 over the random candidates.
+Tensor compilers separate what to compute (a graph) from how to compute it (a schedule)
+[L4], [L6], and pick schedules by search, often guided by a learned cost model [L21], [L22].
+coffee-ten is a deliberately small compiler of this kind (single-thread CPU, static shapes,
+C backend) built to test one question: can an *analytic* model, with no training data,
+rank the schedules of a single-thread f32 matmul well enough to replace most of a random
+search? The criterion, fixed in advance (spec §7.1), is hypothesis A: the model's top 10
+holds a schedule within 90% of the best of 1000 random measurements.
+
+Contributions: a compiler whose kernels match a reference interpreter bit for bit when a
+schedule keeps the order of sums, and within a derived error bound [L29] otherwise
+([§2.1](#21-compiler)); an analytic cost model ([§2.3](#23-cost-model)); and three
+recorded runs of hypothesis A with the raw data committed ([§3](#3-results)).
+
+## 2. Method
+
+### 2.1 Compiler
+
+A Python `Tensor` records a graph (tracing, [L15], [L18]); the graph is a static-shape SSA
+DAG lowered to loop IR, where a chain of elementwise ops becomes one loop nest and `matmul`
+becomes an init nest and an `i, k, j` update nest. A schedule transforms the loop IR, the
+backend emits C, and clang compiles it into a kernel loaded with libloading. The reference
+interpreter (`ct.run`) is the oracle for every compiled kernel. Details and the code that
+checks each step: [Appendix B](#appendix-b-basis).
+
+### 2.2 Schedules
+
+A schedule is text: steps separated by `;`. A step names a nest by number and loops by
+name.
+
+- `split(nest, loop, outer, inner, factor)`: `loop` becomes `outer` and `inner`, with
+  `inner` of extent `factor`; a guard covers a remainder.
+- `reorder(nest, loop, ...)`: the new loop order of the nest, outermost first; it must
+  list every loop once.
+- `vectorize(nest, loop)`: `loop` must be the innermost loop, not a reduction loop, and
+  have stride 1 in the output.
+- `unroll(nest, loop)`: any loop, also the vectorized one, if its extent is at most 64 and
+  it is not unrolled yet. Like `vectorize` it is a request to clang (`unroll(full)`).
+
+Nests are numbered from 0 in `ct.loop_ir` order. In the example, nest 0 zero-fills the
+matmul result, nest 1 is the `i, k, j` update that `split` targets, and nest 2 is the
+relu. An illegal step raises `ValueError` with the step number.
+
+`Kernel.order_class` says what a schedule may change:
+
+- `preserving`: every output element gets its contributions in the same order, so the
+  result equals `ct.run` bit for bit.
+- `reordering`: the order of a float sum changes, so the result is equal only within the
+  bound in [L29] (see Basis).
+
+### 2.3 Cost model
+
+The model (`crates/coffee-ten-bench/src/model.rs`, v1.3) predicts GFLOP/s of the matmul
+update nest without running it. Cache traffic is computed from the footprint of each loop
+level; the compute ceiling is the lowest of the FMA peak, a load/store ceiling (accesses of
+`C` stay in memory unless held in registers) and a latency ceiling for dependent FMA chains;
+the prediction is the roofline [L2] minimum of compute and traffic. Machine numbers are
+inputs, read from a `bench/peak` line ([Ceilings](BENCHMARKS.md#ceilings-benchpeak-one-core)).
+Fixes after run 1, frozen before the next run: short "vectorized" loops modelled as scalar
+(#57), FMA latency ceilings (#58, #59, v1.2), loops clang fully unrolls (#63, v1.3).
+`coffee-ten-bench model compare --from <results.jsonl>` prints the model against
+measurements, with Spearman rank correlation and median error.
+
+### 2.4 Measurement
+
+`bench/run.sh` takes the numbers on an idle Mac, on AC power, from a clean commit; it
+runs `matmul` and `relu-matmul-bias` for N from 64 to 1024 and writes
+`bench/results/<date>-<commit>.jsonl`. Besides the naive kernel it measures the tiled
+schedule, the same vectorized, and a 4x16 register tile (`unroll` on `ii` and `ji`).
+The numbers so far are in BENCHMARKS.md.
+Every variant is checked against the naive kernel within the error bound before it is
+timed; each (kernel, N) gets a warm-up and 30 interleaved rounds, and the median and
+p25–p75 are reported ([Conditions](BENCHMARKS.md#conditions)).
+
+Hypothesis A (N = 256, 7334-schedule space): 1000 random candidates and the model's top 10
+are measured; the best of each group then runs in one interleaved decision run of 30
+rounds, and the ratio is model-best / random-best median GFLOP/s.
+
+## 3. Results
+
+**Single-schedule speed** ([Matmul](BENCHMARKS.md#matmul-a--b), [What the numbers say](BENCHMARKS.md#what-the-numbers-say)).
+Vectorizing the tiled matmul takes it from about 7 to 57–60 GFLOP/s, 47–50% of the measured FMA peak, for N ≤ 256; it falls to
+37% at N = 512 and 20% at N = 1024; tiling alone gains at most 8%. The 4×16 register tile
+reaches 94–96% of peak for matmul at N ≤ 512 and 81% at N = 1024 (fused
+relu(A @ B + bias): 78–91%; one session, S3).
+
+**Hypothesis A**, all at N = 256:
+
+- Run 1 (#56): ratio 0.622, not met. Spearman 0.292 over the random candidates, a
+  number later found biased by the harness ([run 1](BENCHMARKS.md#hypothesis-a-spec-71-run-1-not-met)).
 - Model and harness fixes after run 1: short "vectorized" loops modelled as scalar (#57),
   FMA latency ceilings (#58, #59, model v1.2), a 300 ms time-based warm-up (#61), loops
   clang fully unrolls (#63, model v1.3).
-- Run 2 (#62): ratio 1.079, met (model v1.2, Spearman 0.571).
+- Run 2 (#62): ratio 1.079, met (model v1.2, Spearman 0.571)
+  ([run 2](BENCHMARKS.md#hypothesis-a-spec-71-run-2-met)).
 - Run 3 (#64): ratio 1.362, met out of sample on a new seed (model v1.3, Spearman 0.853,
-  median error ×1.26).
+  median error ×1.26) ([run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)).
 - Model-guided local search over one-step schedule neighbours (#65): code only, no
   measured run yet.
 
 Known model errors, stable across runs 2 and 3 (#64): vectorized `ji` = 32/64
 over-predicted ×1.49, scalar `ii` innermost ×1.42, short "vectorized" loops (scalar code)
-under-predicted ×0.73.
+under-predicted ×0.73 ([run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)).
 
-Not done yet: correcting those three errors in the model, and run 4 at N = 512. Only one
-size and one machine have been measured so far.
+## 4. Limitations
 
-## Quickstart
+Scope of the evidence: one machine (Apple M5, one core), one size (N = 256) for hypothesis
+A, seeds 1–3. Not done yet: correcting the three model errors above, and run 4 at
+N = 512. Threats to validity of the measurements: [Validity](BENCHMARKS.md#validity).
+
+Compiler limitations:
+
+- `f32` only in Python. The interpreter has an f64 mode that the binding does not expose.
+- Static shapes: `ct.input` takes a fixed shape; nothing is dynamic.
+- Single thread: the generated C has no threads.
+- CPU only: the C backend is built with clang; there is no GPU path.
+- Python operators: `+ - * /`, unary `-`, `ct.relu`, `ct.maximum`, `ct.exp`, and `@` or
+  `ct.matmul` on 2-D tensors; `ct.softmax` is built from them.
+- Reductions are last-axis `ct.sum` and `ct.max` only, keeping the axis with size 1.
+- `exp` calls the platform libm (within 1 ulp, not correctly rounded), so graphs with
+  `exp` are checked against float64 within a derived bound, not bit for bit.
+- clang must be on `PATH` when `ct.compile` runs; without it, `ct.compile` raises
+  `RuntimeError`.
+- Tested on Linux (`ubuntu-latest`) and macOS (`macos-latest`, on pushes to `main` and
+  manual runs only); no Windows in CI.
+- Loop IR nests are perfect: one store under one loop chain. A relu or bias after a
+  matmul is its own nest; there is no epilogue fusion yet.
+
+### Non-goals
+
+Competing with BLAS, TVM, XLA or Inductor; training and autograd; sparse tensors;
+dynamic shapes; convolutions and attention; types other than `f32`; a custom
+language; ONNX or torch.fx import; MLIR and LLVM; threads and GPU in the MVP.
+
+## References
+
+- [L2] S. Williams, A. Waterman, D. Patterson. Roofline: an insightful visual
+  performance model for multicore architectures. *CACM* 52(4), 2009.
+  https://doi.org/10.1145/1498765.1498785
+- [L3] S. Boehm. Fast Multidimensional Matrix Multiplication on CPU from Scratch.
+  Blog post, 2022. https://siboehm.com/articles/22/Fast-MMM-on-CPU
+- [L4] J. Ragan-Kelley, C. Barnes, A. Adams, S. Paris, F. Durand, S. Amarasinghe.
+  Halide: A Language and Compiler for Optimizing Parallelism, Locality, and
+  Recomputation in Image Processing Pipelines. PLDI 2013.
+  https://doi.org/10.1145/2491956.2462176 (CACM version:
+  https://doi.org/10.1145/3150211)
+- [L5] T. Chen, T. Moreau, Z. Jiang, L. Zheng et al. TVM: An Automated End-to-End
+  Optimizing Compiler for Deep Learning. OSDI 2018. https://arxiv.org/abs/1802.04799
+- [L6] S. Feng, B. Hou, H. Jin, W. Lin et al. TensorIR: An Abstraction for
+  Automatic Tensorized Program Optimization. ASPLOS 2023.
+  https://arxiv.org/abs/2207.04296
+- [L7] K. Goto, R. A. van de Geijn. Anatomy of High-Performance Matrix
+  Multiplication. *ACM TOMS* 34(3), 2008. https://doi.org/10.1145/1356052.1356053
+- [L14] J. Ansel, E. Yang, H. He, N. Gimelshein et al. PyTorch 2: Faster Machine
+  Learning Through Dynamic Python Bytecode Transformation and Graph Compilation.
+  ASPLOS 2024. https://doi.org/10.1145/3620665.3640366
+- [L15] tinygrad. https://github.com/tinygrad/tinygrad
+- [L17] C. Lattner, M. Amini, U. Bondhugula, A. Cohen et al. MLIR: Scaling Compiler
+  Infrastructure for Domain Specific Computation. CGO 2021.
+  https://doi.org/10.1109/CGO51591.2021.9370308
+- [L18] R. Frostig, M. J. Johnson, C. Leary. Compiling machine learning programs
+  via high-level tracing. SysML 2018.
+  https://mlsys.org/Conferences/2019/doc/2018/146.pdf
+- [L21] T. Chen, L. Zheng, E. Yan, Z. Jiang et al. Learning to Optimize Tensor
+  Programs. NeurIPS 2018. https://arxiv.org/abs/1805.08166 ; L. Zheng, C. Jia,
+  M. Sun, Z. Wu et al. Ansor: Generating High-Performance Tensor Programs for Deep
+  Learning. OSDI 2020. https://arxiv.org/abs/2006.06762
+- [L22] A. Adams, K. Ma, L. Anderson, R. Baghdadi, T.-M. Li et al. Learning to
+  Optimize Halide with Tree Search and Random Programs. *ACM TOG* 38(4), 2019.
+  https://doi.org/10.1145/3306346.3322967
+- [L24] U. Bondhugula, A. Hartono, J. Ramanujam, P. Sadayappan. A practical
+  automatic polyhedral parallelizer and locality optimizer. PLDI 2008.
+  https://doi.org/10.1145/1375581.1375595
+- [L29] N. J. Higham. *Accuracy and Stability of Numerical Algorithms*, 2nd ed.
+  SIAM, 2002. https://doi.org/10.1137/1.9780898718027
+- [L30] T. Chen, T. Dettmers. CMU 10-414/714: Deep Learning Systems (Needle).
+  https://dlsyscourse.org/
+
+## Appendix A. Quickstart
 
 Needs Rust (the version in `rust-toolchain.toml`; `rustup` installs it), clang on
 `PATH`, and Python 3.9 or newer. pip pulls in NumPy.
@@ -76,58 +243,7 @@ for i in 0..4:
 match: preserving
 ```
 
-## Schedules
-
-A schedule is text: steps separated by `;`. A step names a nest by number and loops by
-name.
-
-- `split(nest, loop, outer, inner, factor)`: `loop` becomes `outer` and `inner`, with
-  `inner` of extent `factor`; a guard covers a remainder.
-- `reorder(nest, loop, ...)`: the new loop order of the nest, outermost first; it must
-  list every loop once.
-- `vectorize(nest, loop)`: `loop` must be the innermost loop, not a reduction loop, and
-  have stride 1 in the output.
-- `unroll(nest, loop)`: any loop, also the vectorized one, if its extent is at most 64 and
-  it is not unrolled yet. Like `vectorize` it is a request to clang (`unroll(full)`).
-
-Nests are numbered from 0 in `ct.loop_ir` order. In the example, nest 0 zero-fills the
-matmul result, nest 1 is the `i, k, j` update that `split` targets, and nest 2 is the
-relu. An illegal step raises `ValueError` with the step number.
-
-`Kernel.order_class` says what a schedule may change:
-
-- `preserving`: every output element gets its contributions in the same order, so the
-  result equals `ct.run` bit for bit.
-- `reordering`: the order of a float sum changes, so the result is equal only within the
-  bound in [L29] (see Basis).
-
-## Benchmarks
-
-`bench/run.sh` takes the numbers on an idle Mac, on AC power, from a clean commit; it
-runs `matmul` and `relu-matmul-bias` for N from 64 to 1024 and writes
-`bench/results/<date>-<commit>.jsonl`. Besides the naive kernel it measures the tiled
-schedule, the same vectorized, and a 4x16 register tile (`unroll` on `ii` and `ji`).
-The numbers so far are in BENCHMARKS.md.
-
-## Limitations
-
-- `f32` only in Python. The interpreter has an f64 mode that the binding does not expose.
-- Static shapes: `ct.input` takes a fixed shape; nothing is dynamic.
-- Single thread: the generated C has no threads.
-- CPU only: the C backend is built with clang; there is no GPU path.
-- Python operators: `+ - * /`, unary `-`, `ct.relu`, `ct.maximum`, `ct.exp`, and `@` or
-  `ct.matmul` on 2-D tensors; `ct.softmax` is built from them.
-- Reductions are last-axis `ct.sum` and `ct.max` only, keeping the axis with size 1.
-- `exp` calls the platform libm (within 1 ulp, not correctly rounded), so graphs with
-  `exp` are checked against float64 within a derived bound, not bit for bit.
-- clang must be on `PATH` when `ct.compile` runs; without it, `ct.compile` raises
-  `RuntimeError`.
-- Tested on Linux (`ubuntu-latest`) and macOS (`macos-latest`, on pushes to `main` and
-  manual runs only); no Windows in CI.
-- Loop IR nests are perfect: one store under one loop chain. A relu or bias after a
-  matmul is its own nest; there is no epilogue fusion yet.
-
-## Basis
+## Appendix B. Basis
 
 Each section names the idea the code rests on, where it lives and what checks it.
 `planned` means not implemented yet. References are numbered `[L#]`.
@@ -219,63 +335,6 @@ Code: `crates/coffee-ten-bench/src/space.rs` (the matmul schedule space),
 interleaved decision run), `crates/coffee-ten-bench/src/local.rs` (model-guided local
 search). Checked by: unit tests in those files and
 `crates/coffee-ten-bench/tests/quick_run.rs`.
-
-## Baseline / Results
-
-Measured on one Apple M5 core: see BENCHMARKS.md. Tiled + vectorized matmul runs at
-47–50% of the measured FMA peak for N ≤ 256 and falls to 37% at N = 512 and 20% at
-N = 1024; tiling alone gains at most 8%. The 4×16 register tile reaches 94–96% of peak for matmul
-at N ≤ 512 and 81% at N = 1024 (fused relu(A @ B + bias): 78–91%; one session, S3).
-
-## Non-goals
-
-Competing with BLAS, TVM, XLA or Inductor; training and autograd; sparse tensors;
-dynamic shapes; convolutions and attention; types other than `f32`; a custom
-language; ONNX or torch.fx import; MLIR and LLVM; threads and GPU in the MVP.
-
-## References
-
-- [L2] S. Williams, A. Waterman, D. Patterson. Roofline: an insightful visual
-  performance model for multicore architectures. *CACM* 52(4), 2009.
-  https://doi.org/10.1145/1498765.1498785
-- [L3] S. Boehm. Fast Multidimensional Matrix Multiplication on CPU from Scratch.
-  Blog post, 2022. https://siboehm.com/articles/22/Fast-MMM-on-CPU
-- [L4] J. Ragan-Kelley, C. Barnes, A. Adams, S. Paris, F. Durand, S. Amarasinghe.
-  Halide: A Language and Compiler for Optimizing Parallelism, Locality, and
-  Recomputation in Image Processing Pipelines. PLDI 2013.
-  https://doi.org/10.1145/2491956.2462176 (CACM version:
-  https://doi.org/10.1145/3150211)
-- [L5] T. Chen, T. Moreau, Z. Jiang, L. Zheng et al. TVM: An Automated End-to-End
-  Optimizing Compiler for Deep Learning. OSDI 2018. https://arxiv.org/abs/1802.04799
-- [L6] S. Feng, B. Hou, H. Jin, W. Lin et al. TensorIR: An Abstraction for
-  Automatic Tensorized Program Optimization. ASPLOS 2023.
-  https://arxiv.org/abs/2207.04296
-- [L7] K. Goto, R. A. van de Geijn. Anatomy of High-Performance Matrix
-  Multiplication. *ACM TOMS* 34(3), 2008. https://doi.org/10.1145/1356052.1356053
-- [L14] J. Ansel, E. Yang, H. He, N. Gimelshein et al. PyTorch 2: Faster Machine
-  Learning Through Dynamic Python Bytecode Transformation and Graph Compilation.
-  ASPLOS 2024. https://doi.org/10.1145/3620665.3640366
-- [L15] tinygrad. https://github.com/tinygrad/tinygrad
-- [L17] C. Lattner, M. Amini, U. Bondhugula, A. Cohen et al. MLIR: Scaling Compiler
-  Infrastructure for Domain Specific Computation. CGO 2021.
-  https://doi.org/10.1109/CGO51591.2021.9370308
-- [L18] R. Frostig, M. J. Johnson, C. Leary. Compiling machine learning programs
-  via high-level tracing. SysML 2018.
-  https://mlsys.org/Conferences/2019/doc/2018/146.pdf
-- [L21] T. Chen, L. Zheng, E. Yan, Z. Jiang et al. Learning to Optimize Tensor
-  Programs. NeurIPS 2018. https://arxiv.org/abs/1805.08166 ; L. Zheng, C. Jia,
-  M. Sun, Z. Wu et al. Ansor: Generating High-Performance Tensor Programs for Deep
-  Learning. OSDI 2020. https://arxiv.org/abs/2006.06762
-- [L22] A. Adams, K. Ma, L. Anderson, R. Baghdadi, T.-M. Li et al. Learning to
-  Optimize Halide with Tree Search and Random Programs. *ACM TOG* 38(4), 2019.
-  https://doi.org/10.1145/3306346.3322967
-- [L24] U. Bondhugula, A. Hartono, J. Ramanujam, P. Sadayappan. A practical
-  automatic polyhedral parallelizer and locality optimizer. PLDI 2008.
-  https://doi.org/10.1145/1375581.1375595
-- [L29] N. J. Higham. *Accuracy and Stability of Numerical Algorithms*, 2nd ed.
-  SIAM, 2002. https://doi.org/10.1137/1.9780898718027
-- [L30] T. Chen, T. Dettmers. CMU 10-414/714: Deep Learning Systems (Needle).
-  https://dlsyscourse.org/
 
 ## License
 
