@@ -23,7 +23,7 @@ Plot of S3 (all four schedules, median with p25–p75): [`docs/bench-gflops.png`
 built from the committed raw data with `python3 bench/plot.py` (needs matplotlib; no new measurements).
 
 Roofline of S3: [`docs/bench-roofline.png`](docs/bench-roofline.png), `python3 bench/roofline.py`
-(same input, no new measurements; after Williams, Waterman, Patterson, CACM 2009, README [L2]).
+(same input, no new measurements; after Williams, Waterman, Patterson, CACM 2009, README [1]).
 Ceilings are S3's own `bench/peak` medians from the same file: `fma_gflops` 129.2 GFLOP/s and
 `triad_gbs` 112.1 GB/s (ridge 1.15 FLOP/byte), not datasheet numbers. Arithmetic intensity
 of each point is counted on compulsory DRAM traffic, float32: A and B read once, C read and
