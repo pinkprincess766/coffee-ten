@@ -2221,4 +2221,60 @@ mod tests {
             .filter(|l| l.contains("ldst") || l.contains("l2"));
         assert_eq!(rows.count(), 13, "{report}");
     }
+
+    /// Pins the full-unroll rule of v1.3 (#63) on four schedules of hypothesis A run 3
+    /// (`bench/results/2026-10-22-hypothesis-a-run3.jsonl`, N = 256) in which clang fully
+    /// unrolls a loop the schedule did not unroll. Predictions on `Machine::assumed_m5`.
+    /// Without the rule (`fully_unrolled` = only the schedule's unrolls) the model predicts
+    /// 100 / 82.3 / 71.9 / 100 GFLOP/s for these rows and this test fails; the run-3 medians
+    /// are 23.3 / 26.7 / 9.7 / 19.9.
+    #[test]
+    fn run_3_schedules_with_a_full_unroll_keep_their_v1_3_predictions() {
+        let machine = Machine::assumed_m5();
+        // (schedule, loops clang unrolls, mem ops per FMA, GFLOP/s, bound)
+        let rows: [(&str, &[&str], f64, f64, &str); 4] = [
+            (
+                "split(1, i, io, ii, 16); split(1, j, jo, ji, 64); split(1, k, ko, ki, 8); \
+                 reorder(1, io, ko, jo, ii, ki, ji); vectorize(1, ji)",
+                &["ki"],
+                3.0625,
+                58.77551020408164,
+                "ldst",
+            ),
+            (
+                "split(1, i, io, ii, 8); split(1, j, jo, ji, 64); reorder(1, io, jo, k, ii, ji); \
+                 vectorize(1, ji)",
+                &["ii"],
+                3.0625,
+                58.77551020408164,
+                "ldst",
+            ),
+            (
+                "split(1, j, jo, ji, 8); reorder(1, k, jo, i, ji); vectorize(1, ji)",
+                &["ji"],
+                2.12890625,
+                21.137614678899084,
+                "ldst",
+            ),
+            (
+                "split(1, j, jo, ji, 8); split(1, k, ko, ki, 128); reorder(1, jo, ko, i, ki, ji); \
+                 vectorize(1, ji)",
+                &["ji"],
+                1.140625,
+                22.58,
+                "latency",
+            ),
+        ];
+        for (schedule, unrolled, m, gflops, bound) in rows {
+            assert_eq!(clang_unrolled(schedule), unrolled, "{schedule}");
+            assert_eq!(mem_ops(256, schedule), m, "{schedule}");
+            let p = predict_schedule(&machine, 256, schedule).expect("predicts");
+            assert!(
+                (p.gflops / gflops - 1.0).abs() < 1e-9,
+                "{schedule}: {}",
+                p.gflops
+            );
+            assert_eq!(p.bound, bound, "{schedule}");
+        }
+    }
 }
