@@ -139,6 +139,17 @@ Known model errors, stable across runs 2 and 3 (#64): vectorized `ji` = 32/64
 over-predicted ×1.49, scalar `ii` innermost ×1.42, short "vectorized" loops (scalar code)
 under-predicted ×0.73 ([run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)).
 
+![Fig. 3](docs/model-vs-measured.png)
+
+**Fig. 3.** Model v1.3 prediction against measurement for the 1000 random candidates of
+hypothesis A run 2 (blue) and run 3 (orange), matmul N = 256, log-log, line y = x. Run 2:
+Spearman 0.854, median error ×1.24 (in sample for v1.3); run 3: Spearman 0.853, median
+error ×1.26 (out of sample). Machine numbers from the P3 `bench/peak` line
+(`bench/results/2026-10-21-561ede3-peak.jsonl`), on which both runs were taken. Points and
+numbers are the output of `coffee-ten-bench model compare`, the same as in
+[BENCHMARKS.md](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample);
+`python3 bench/model_scatter.py`.
+
 ## 4. Limitations
 
 Scope of the evidence: one machine (Apple M5, one core), one size (N = 256) for hypothesis
