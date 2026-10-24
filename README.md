@@ -135,6 +135,15 @@ is N / 8 FLOP/byte on compulsory DRAM traffic, an upper bound on the real AI of 
 - Model-guided local search over one-step schedule neighbours (#65): code only, no
   measured run yet.
 
+![Fig. 4](docs/hypothesis-a-ratio.png)
+
+**Fig. 4.** Hypothesis A ratio per run: median GFLOP/s of the best of the model's top 10
+over that of the best of 1000 random candidates, both from the run's interleaved decision
+run (30 rounds); bars combine the p25–p75 of both. Run 1 0.622, run 2 1.079, run 3 1.362,
+as in [BENCHMARKS.md](BENCHMARKS.md#hypothesis-a-spec-71-run-1-not-met). Solid line 1.0
+(model best = random best), dashed 0.9 (the criterion). Raw data
+`bench/results/*hypothesis-a*.jsonl`; `python3 bench/hypothesis_ratio.py`.
+
 Known model errors, stable across runs 2 and 3 (#64): vectorized `ji` = 32/64
 over-predicted ×1.49, scalar `ii` innermost ×1.42, short "vectorized" loops (scalar code)
 under-predicted ×0.73 ([run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)).
