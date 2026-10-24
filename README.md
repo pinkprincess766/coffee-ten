@@ -1,3 +1,5 @@
+**English** | [Русский](README.ru.md)
+
 # coffee-ten
 
 A tiny tensor compiler, and a test of whether an analytic cost model can replace most of a
