@@ -31,8 +31,12 @@ written once, so AI = 2·N³ / (4 · 4·N²) = N / 8 FLOP/byte (8 at N = 64 to 1
 the same for all four schedules. That is the minimum traffic, so it is an **upper bound** on
 the real AI (a lower bound on traffic): the naive and tiled nests can reload B and C and
 have a lower AI. The real per-variant traffic is not in the data (no counters), so the plot
-does not claim it. All points sit right of the ridge, which is why the compute ceiling is
-the one that applies.
+does not claim it. The 4 bytes per element are the buffer type of every kernel: `float`,
+`EntryFn = unsafe extern "C" fn(*const *mut f32)` in `crates/coffee-ten-codegen-c/src/compile.rs`.
+At N ≤ 256 all three matrices fit in cache (48 KiB at N = 64), so DRAM is not the limit
+there and the L2 triad (`triad_l2_gbs`, 128.1 GB/s in the same peak line) would be the
+more accurate slope; it does not change the conclusion. All points sit right of the ridge,
+which is why the compute ceiling is the one that applies.
 
 ## Ceilings (`bench/peak`, one core)
 
