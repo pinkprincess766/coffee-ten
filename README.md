@@ -24,7 +24,7 @@ tested.
 ## 1. Introduction
 
 Tensor compilers separate what to compute (a graph) from how to compute it (a schedule)
-[L4], [L6], and pick schedules by search, often guided by a learned cost model [L21], [L22].
+[3], [5], and pick schedules by search, often guided by a learned cost model [11], [12].
 coffee-ten is a deliberately small compiler of this kind (single-thread CPU, static shapes,
 C backend) built to test one question: can an *analytic* model, with no training data,
 rank the schedules of a single-thread f32 matmul well enough to replace most of a random
@@ -32,7 +32,7 @@ search? The criterion, fixed in advance (spec §7.1), is hypothesis A: the model
 holds a schedule within 90% of the best of 1000 random measurements.
 
 Contributions: a compiler whose kernels match a reference interpreter bit for bit when a
-schedule keeps the order of sums, and within a derived error bound [L29] otherwise
+schedule keeps the order of sums, and within a derived error bound [14] otherwise
 ([§2.1](#21-compiler)); an analytic cost model ([§2.3](#23-cost-model)); and three
 recorded runs of hypothesis A with the raw data committed ([§3](#3-results)).
 
@@ -40,7 +40,7 @@ recorded runs of hypothesis A with the raw data committed ([§3](#3-results)).
 
 ### 2.1 Compiler
 
-A Python `Tensor` records a graph (tracing, [L15], [L18]); the graph is a static-shape SSA
+A Python `Tensor` records a graph (tracing, [8], [10]); the graph is a static-shape SSA
 DAG lowered to loop IR, where a chain of elementwise ops becomes one loop nest and `matmul`
 becomes an init nest and an `i, k, j` update nest. A schedule transforms the loop IR, the
 backend emits C, and clang compiles it into a kernel loaded with libloading. The reference
@@ -70,7 +70,7 @@ relu. An illegal step raises `ValueError` with the step number.
 - `preserving`: every output element gets its contributions in the same order, so the
   result equals `ct.run` bit for bit.
 - `reordering`: the order of a float sum changes, so the result is equal only within the
-  bound in [L29] (see Basis).
+  bound in [14] (see Basis).
 
 ### 2.3 Cost model
 
@@ -78,7 +78,7 @@ The model (`crates/coffee-ten-bench/src/model.rs`, v1.3) predicts GFLOP/s of the
 update nest without running it. Cache traffic is computed from the footprint of each loop
 level; the compute ceiling is the lowest of the FMA peak, a load/store ceiling (accesses of
 `C` stay in memory unless held in registers) and a latency ceiling for dependent FMA chains;
-the prediction is the roofline [L2] minimum of compute and traffic. Machine numbers are
+the prediction is the roofline [1] minimum of compute and traffic. Machine numbers are
 inputs, read from a `bench/peak` line ([Ceilings](BENCHMARKS.md#ceilings-benchpeak-one-core)).
 Fixes after run 1, frozen before the next run: short "vectorized" loops modelled as scalar
 (#57), FMA latency ceilings (#58, #59, v1.2), loops clang fully unrolls (#63, v1.3).
@@ -116,7 +116,7 @@ relu(A @ B + bias): 78–91%; one session, S3).
 
 ![Fig. 2](docs/bench-roofline.png)
 
-**Fig. 2.** Roofline of the same S3 points. Ceilings are S3's own `bench/peak` medians,
+**Fig. 2.** Roofline [1] of the same S3 points. Ceilings are S3's own `bench/peak` medians,
 FMA 129.2 GFLOP/s and memory triad 112.1 GB/s (ridge 1.15 FLOP/byte). Arithmetic intensity
 is N / 8 FLOP/byte on compulsory DRAM traffic, an upper bound on the real AI of each variant
 ([details](BENCHMARKS.md#benchmarks)); `python3 bench/roofline.py`.
@@ -191,46 +191,49 @@ language; ONNX or torch.fx import; MLIR and LLVM; threads and GPU in the MVP.
 
 ## References
 
-- [L2] S. Williams, A. Waterman, D. Patterson. Roofline: an insightful visual
+DOIs checked against Crossref (api.crossref.org) on 2026-10-24. Entries without a DOI
+(blog post, OSDI, NeurIPS and SysML papers, software, a course) link to the source instead.
+
+- [1] S. Williams, A. Waterman, D. Patterson. Roofline: an insightful visual
   performance model for multicore architectures. *CACM* 52(4), 2009.
   https://doi.org/10.1145/1498765.1498785
-- [L3] S. Boehm. Fast Multidimensional Matrix Multiplication on CPU from Scratch.
+- [2] S. Boehm. Fast Multidimensional Matrix Multiplication on CPU from Scratch.
   Blog post, 2022. https://siboehm.com/articles/22/Fast-MMM-on-CPU
-- [L4] J. Ragan-Kelley, C. Barnes, A. Adams, S. Paris, F. Durand, S. Amarasinghe.
+- [3] J. Ragan-Kelley, C. Barnes, A. Adams, S. Paris, F. Durand, S. Amarasinghe.
   Halide: A Language and Compiler for Optimizing Parallelism, Locality, and
   Recomputation in Image Processing Pipelines. PLDI 2013.
   https://doi.org/10.1145/2491956.2462176 (CACM version:
   https://doi.org/10.1145/3150211)
-- [L5] T. Chen, T. Moreau, Z. Jiang, L. Zheng et al. TVM: An Automated End-to-End
+- [4] T. Chen, T. Moreau, Z. Jiang, L. Zheng et al. TVM: An Automated End-to-End
   Optimizing Compiler for Deep Learning. OSDI 2018. https://arxiv.org/abs/1802.04799
-- [L6] S. Feng, B. Hou, H. Jin, W. Lin et al. TensorIR: An Abstraction for
+- [5] S. Feng, B. Hou, H. Jin, W. Lin et al. TensorIR: An Abstraction for
   Automatic Tensorized Program Optimization. ASPLOS 2023.
-  https://arxiv.org/abs/2207.04296
-- [L7] K. Goto, R. A. van de Geijn. Anatomy of High-Performance Matrix
+  https://doi.org/10.1145/3575693.3576933 (preprint: https://arxiv.org/abs/2207.04296)
+- [6] K. Goto, R. A. van de Geijn. Anatomy of High-Performance Matrix
   Multiplication. *ACM TOMS* 34(3), 2008. https://doi.org/10.1145/1356052.1356053
-- [L14] J. Ansel, E. Yang, H. He, N. Gimelshein et al. PyTorch 2: Faster Machine
+- [7] J. Ansel, E. Yang, H. He, N. Gimelshein et al. PyTorch 2: Faster Machine
   Learning Through Dynamic Python Bytecode Transformation and Graph Compilation.
   ASPLOS 2024. https://doi.org/10.1145/3620665.3640366
-- [L15] tinygrad. https://github.com/tinygrad/tinygrad
-- [L17] C. Lattner, M. Amini, U. Bondhugula, A. Cohen et al. MLIR: Scaling Compiler
+- [8] tinygrad. https://github.com/tinygrad/tinygrad
+- [9] C. Lattner, M. Amini, U. Bondhugula, A. Cohen et al. MLIR: Scaling Compiler
   Infrastructure for Domain Specific Computation. CGO 2021.
   https://doi.org/10.1109/CGO51591.2021.9370308
-- [L18] R. Frostig, M. J. Johnson, C. Leary. Compiling machine learning programs
+- [10] R. Frostig, M. J. Johnson, C. Leary. Compiling machine learning programs
   via high-level tracing. SysML 2018.
   https://mlsys.org/Conferences/2019/doc/2018/146.pdf
-- [L21] T. Chen, L. Zheng, E. Yan, Z. Jiang et al. Learning to Optimize Tensor
+- [11] T. Chen, L. Zheng, E. Yan, Z. Jiang et al. Learning to Optimize Tensor
   Programs. NeurIPS 2018. https://arxiv.org/abs/1805.08166 ; L. Zheng, C. Jia,
   M. Sun, Z. Wu et al. Ansor: Generating High-Performance Tensor Programs for Deep
   Learning. OSDI 2020. https://arxiv.org/abs/2006.06762
-- [L22] A. Adams, K. Ma, L. Anderson, R. Baghdadi, T.-M. Li et al. Learning to
+- [12] A. Adams, K. Ma, L. Anderson, R. Baghdadi, T.-M. Li et al. Learning to
   Optimize Halide with Tree Search and Random Programs. *ACM TOG* 38(4), 2019.
   https://doi.org/10.1145/3306346.3322967
-- [L24] U. Bondhugula, A. Hartono, J. Ramanujam, P. Sadayappan. A practical
+- [13] U. Bondhugula, A. Hartono, J. Ramanujam, P. Sadayappan. A practical
   automatic polyhedral parallelizer and locality optimizer. PLDI 2008.
   https://doi.org/10.1145/1375581.1375595
-- [L29] N. J. Higham. *Accuracy and Stability of Numerical Algorithms*, 2nd ed.
+- [14] N. J. Higham. *Accuracy and Stability of Numerical Algorithms*, 2nd ed.
   SIAM, 2002. https://doi.org/10.1137/1.9780898718027
-- [L30] T. Chen, T. Dettmers. CMU 10-414/714: Deep Learning Systems (Needle).
+- [15] T. Chen, T. Dettmers. CMU 10-414/714: Deep Learning Systems (Needle).
   https://dlsyscourse.org/
 
 ## Appendix A. Quickstart
@@ -279,20 +282,20 @@ match: preserving
 ## Appendix B. Basis
 
 Each section names the idea the code rests on, where it lives and what checks it.
-`planned` means not implemented yet. References are numbered `[L#]`.
+`planned` means not implemented yet. Numbers in brackets refer to [References](#references).
 
-### Algorithm vs schedule — [L4], [L6]
+### Algorithm vs schedule — [3], [5]
 
 What to compute is a graph; how to compute it is a schedule, a list of named
 loop-IR transformations (`split`, `reorder`, `vectorize`). Each step either keeps
-the program legal or returns an error. Loop indices are affine expressions [L17].
+the program legal or returns an error. Loop indices are affine expressions [9].
 Code: `crates/coffee-ten-loop/src/schedule.rs` (text form),
 `crates/coffee-ten-loop/src/apply.rs` (split, reorder, vectorize). Checked by:
 trace-equality proptests in `crates/coffee-ten-loop/src/apply.rs`;
 `crates/coffee-ten-codegen-c/tests/reorder.rs` and
 `crates/coffee-ten-codegen-c/tests/vectorize.rs`.
 
-### Graph IR and fusion — [L5], [L14]
+### Graph IR and fusion — [4], [7]
 
 A static-shape SSA DAG. A chain of elementwise ops lowers to one loop nest, so it
 is fused for free; `matmul` is its own node. The backend emits C source, not
@@ -303,7 +306,7 @@ libloading). Checked by: `lower.rs` tests;
 `crates/coffee-ten-codegen-c/tests/end_to_end.rs` (compiled kernels equal the
 interpreter bit for bit).
 
-### Loop tiling for matmul — [L3], [L7]
+### Loop tiling for matmul — [2], [6]
 
 `split` and `reorder` give cache tiles, `vectorize` widens the innermost `j` loop.
 Packing is not implemented. There is no separate micro-kernel either: a register tile
@@ -318,10 +321,10 @@ remarks), `crates/coffee-ten-codegen-c/tests/reorder.rs` and
 all sizes with `bench/run.sh`;
 numbers in BENCHMARKS.md.
 
-### Legality of loop reordering — [L24]
+### Legality of loop reordering — [13]
 
 `reorder` permutes the loops of one nest. It is legal when the store target is
-injective on the loops (a sufficient check, not the dependence analysis of [L24])
+injective on the loops (a sufficient check, not the dependence analysis of [13])
 and the body either reads no other element of the target buffer, or, when there are
 reduction loops, is a sum `target + e` into the same element with `e` not reading
 the target buffer. A schedule is order-preserving if every element receives its
@@ -332,23 +335,23 @@ Checked by: proptests in `crates/coffee-ten-loop/src/apply.rs` (per-element
 contribution order); `crates/coffee-ten-codegen-c/tests/reorder.rs` (bit for bit when
 order-preserving, within the bound otherwise).
 
-### Floating-point error bounds — [L29]
+### Floating-point error bounds — [14]
 
 Tolerances are derived, not tuned: `|fl(xᵀy) − xᵀy| ≤ γ_n Σ|x_i y_i|` with
 `γ_n = nu/(1 − nu)` and `u = 2⁻²⁴` for `f32`, plus an absolute term for subnormal
 products. Code: `crates/coffee-ten-interp` (f32 in canonical order, f64 mode;
-broadcasting by zero strides as in [L30]). Checked by:
+broadcasting by zero strides as in [15]). Checked by:
 `crates/coffee-ten-py/tests/test_diff_numpy.py` (Hypothesis against NumPy, bound with
 the bias as the (K+1)-th term); `crates/coffee-ten-codegen-c/tests/reorder.rs`.
 
-### Roofline — [L2]
+### Roofline — [1]
 
 Speed is reported as a fraction of `min(peak, AI · BW)`, with peak FLOP/s and
 memory bandwidth measured on the same machine. Code: `bench/peak/peak.c` (single-thread
 FMA peak and STREAM triads from memory and from L2). Checked by: its `--check` mode.
 Numbers: 122 GFLOP/s, 106 GB/s memory, 120 GB/s L2 (BENCHMARKS.md).
 
-### Tracing frontend — [L15], [L18]
+### Tracing frontend — [8], [10]
 
 A Python `Tensor` computes nothing; it records a graph that is run by the reference
 interpreter (`ct.run`) or compiled with a schedule (`ct.compile`). Code:
@@ -358,7 +361,7 @@ interpreter (`ct.run`) or compiled with a schedule (`ct.compile`). Code:
 `crates/coffee-ten-py/tests/test_diff_numpy.py`, `crates/coffee-ten-py/tests/test_compile.py`,
 `crates/coffee-ten-py/tests/test_loop_ir.py`.
 
-### Cost-model autotuning (research) — [L21], [L22]
+### Cost-model autotuning (research) — [11], [12]
 
 Hypothesis: the top 10 schedules by the model contain one within 90% of the best
 found by random search with 1000 measurements. Results of the runs: BENCHMARKS.md.

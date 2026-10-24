@@ -5,7 +5,7 @@
 
 Ceilings come from the `"kind":"peak"` line of the same file (`bench/peak`): FMA peak
 `fma_gflops` and memory bandwidth `triad_gbs`, both medians; not datasheet numbers.
-Roofline after Williams, Waterman, Patterson, CACM 2009 (README [L2]).
+Roofline after Williams, Waterman, Patterson, CACM 2009 (README [1]).
 
 AI (FLOP/byte) per point = 2·N³ / (16·N²) = N / 8: compulsory DRAM traffic only
 (A and B read once, C read and written once, float32). That is the minimum traffic, so it
