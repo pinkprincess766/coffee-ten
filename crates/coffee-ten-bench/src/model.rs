@@ -789,7 +789,9 @@ pub fn rank_matmul(machine: &Machine, n: usize) -> Result<Vec<Ranked>, BenchErro
 
 const USAGE: &str = "usage: coffee-ten-bench model --n <N> [--from <results.jsonl>] [--peak <GFLOPS>] \
      [--mem-gbs <GBS>] [--l2-gbs <GBS>]  (flags after --from override it)\n       \
-     coffee-ten-bench model compare --from <results.jsonl> [--peak <peak.jsonl>] [--group <name>]";
+     coffee-ten-bench model compare --from <results.jsonl> [--peak <peak.jsonl>] [--group <name>]\n       \
+       compare: --peak takes the machine from that file's peak line (for results files without \
+     one); --group keeps only records whose \"group\" field equals <name> (e.g. random)";
 
 /// The text after `"key":` in a JSON line. The log lines are flat, plus the `{"median":..}`
 /// objects of the peak line, so this finds the key and is not a JSON parser.
@@ -2401,6 +2403,22 @@ mod tests {
             assert_eq!(cols[0], n.to_string(), "{row}");
             assert_eq!(cols[3], error, "{row}");
         }
+        let sizes: usize = SCHEDULE_GROUPS
+            .iter()
+            .map(|g| {
+                let row = report
+                    .lines()
+                    .find(|l| l.starts_with(g))
+                    .expect("group row");
+                row[g.len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(sizes, 1000, "{report}");
         let all = compare_report("run 3", &text, None).expect("compares");
         assert!(
             all.contains("1013 records") && all.contains("correlation 0.858;"),
