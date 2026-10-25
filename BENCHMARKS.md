@@ -214,6 +214,9 @@ median error of ×1.37 (P3 machine, `model compare`). By group (measured vs pred
 | "vectorized", `ji` = 8 or 16 (scalar code) | 101 | 22–29 | 18–21 | 0.69 |
 | vectorized, `ji` = 32 or 64 | 98 | 55–60 | 76–106 | 1.43–1.50 |
 
+The last column is the median of the per-record ratios predicted / measured, not the ratio of
+the two medians next to it (the same metric as run 3 below).
+
 What this does and does not show:
 
 - **The criterion is met because of the register tiles.** The model ranks them first, and random
@@ -253,10 +256,22 @@ measured:
 | run 2 (v1.3, in sample) | 0.854 | ×1.24 |
 | **run 3 (v1.3, new sample)** | **0.853** | **×1.26** |
 
-By group (run 3, measured vs predicted median): scalar `ji` innermost 7.7 vs 8.4 (1.10);
-scalar `k`/`ki` innermost 7.1 vs 6.8 (0.91); vectorized `ji` = 128 42.2 vs 45.8 (1.08);
-"vectorized" `ji` ≤ 16, which is scalar code, 25.5 vs 19.4 (0.73); vectorized `ji` = 32/64 52.4 vs 65.3
-(1.49); scalar `ii` innermost 6.6 vs 8.4 (1.42). The same groups were off by about the same
+By group (run 3, 1000 random records, P3 machine). The error is the **median of the ratios**
+predicted / measured over the group's records, not the ratio of the two medians next to it:
+
+| group | n | measured median | predicted median | median of pred / meas |
+|---|---|---|---|---|
+| vectorized, `ji` = 128 | 37 | 42.2 | 45.8 | 1.083 |
+| vectorized, `ji` = 32/64 | 106 | 52.4 | 65.3 | 1.495 |
+| "vectorized", `ji` ≤ 16 (scalar code) | 100 | 25.5 | 19.4 | 0.734 |
+| scalar, `ji` innermost | 235 | 7.7 | 8.4 | 1.100 |
+| scalar, `ii` innermost | 263 | 6.6 | 8.4 | 1.416 |
+| scalar, `k`/`ki` innermost | 259 | 7.1 | 6.8 | 0.906 |
+
+The whole table and Spearman 0.853 come from one command:
+`coffee-ten-bench model compare --from bench/results/2026-10-22-hypothesis-a-run3.jsonl
+--peak bench/results/2026-10-21-561ede3-peak.jsonl --group random` (without `--group`, all
+1013 records: Spearman 0.858). The same groups were off by about the same
 amount in run 2, so these are the model's stable errors, not noise of one sample.
 
 ## Validity

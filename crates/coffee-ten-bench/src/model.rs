@@ -789,7 +789,9 @@ pub fn rank_matmul(machine: &Machine, n: usize) -> Result<Vec<Ranked>, BenchErro
 
 const USAGE: &str = "usage: coffee-ten-bench model --n <N> [--from <results.jsonl>] [--peak <GFLOPS>] \
      [--mem-gbs <GBS>] [--l2-gbs <GBS>]  (flags after --from override it)\n       \
-     coffee-ten-bench model compare --from <results.jsonl>";
+     coffee-ten-bench model compare --from <results.jsonl> [--peak <peak.jsonl>] [--group <name>]\n       \
+       compare: --peak takes the machine from that file's peak line (for results files without \
+     one); --group keeps only records whose \"group\" field equals <name> (e.g. random)";
 
 /// The text after `"key":` in a JSON line. The log lines are flat, plus the `{"median":..}`
 /// objects of the peak line, so this finds the key and is not a JSON parser.
@@ -1061,12 +1063,67 @@ fn short_schedule(schedule: &str) -> String {
         .replace(", ", ",")
 }
 
+/// The median with the two middle values averaged for an even count (unlike `summarize`,
+/// which takes the lower one). `None` for an empty slice.
+fn median(values: &[f64]) -> Option<f64> {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    match n {
+        0 => None,
+        _ if n % 2 == 1 => Some(sorted[n / 2]),
+        _ => Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0),
+    }
+}
+
+/// The schedule groups of the `model compare` breakdown (BENCHMARKS.md, hypothesis A), in
+/// print order.
+const SCHEDULE_GROUPS: [&str; 6] = [
+    "vectorized ji = 128",
+    "vectorized ji = 32/64",
+    "\"vectorized\" ji <= 16 (scalar code)",
+    "scalar, ji innermost",
+    "scalar, ii innermost",
+    "scalar, k/ki innermost",
+];
+
+/// The `SCHEDULE_GROUPS` index of a matmul schedule: vectorized by the `ji` split factor,
+/// scalar by the innermost loop of its `reorder` (the last name; `k` without a reorder).
+fn schedule_group(schedule: &str) -> usize {
+    if schedule.contains("vectorize(") {
+        let ji = schedule
+            .split("split(")
+            .find(|s| s.contains(", ji,"))
+            .and_then(|s| s.split([',', ')']).nth(4))
+            .and_then(|f| f.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        return match ji {
+            128.. => 0,
+            32..=127 => 1,
+            _ => 2,
+        };
+    }
+    let innermost = schedule
+        .split("reorder(")
+        .nth(1)
+        .and_then(|r| r.split(')').next())
+        .and_then(|r| r.split(',').next_back())
+        .map_or("k", str::trim);
+    match innermost {
+        "ji" | "j" => 3,
+        "ii" | "i" => 4,
+        _ => 5,
+    }
+}
+
 /// The report of `coffee-ten-bench model compare`: the model against the `matmul` records of
-/// the results file `text` (`source` is its name) that are not flagged `drift`.
-pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
+/// the results file `text` (`source` is its name) that are not flagged `drift`; with `group`,
+/// only the records whose `"group"` field equals it.
+pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<String, BenchError> {
     let (machine, mem_acc_measured, mem_acc_scalar_measured) = machine_from_results(text)?;
-    let (mut drifted, mut other_kernels) = (0, 0);
+    let (mut drifted, mut other_kernels, mut other_groups) = (0, 0, 0);
     let (mut measured, mut predicted, mut rows) = (Vec::new(), Vec::new(), String::new());
+    let mut by_group: [(Vec<f64>, Vec<f64>); 6] = Default::default();
     for (number, line) in text.lines().enumerate().map(|(i, line)| (i + 1, line)) {
         if line.trim().is_empty() || line.contains("\"kind\":\"peak\"") {
             continue;
@@ -1076,6 +1133,12 @@ pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
         // relu-matmul-bias has extra nests (the epilogue), which the model does not predict.
         if kernel != "matmul" {
             other_kernels += 1;
+            continue;
+        }
+        if let Some(want) = group
+            && string_after(line, "group").as_deref() != Some(want)
+        {
+            other_groups += 1;
             continue;
         }
         let drift = after_key(line, "drift").ok_or_else(|| bad("drift"))?;
@@ -1097,6 +1160,9 @@ pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
         );
         measured.push(median);
         predicted.push(prediction.gflops);
+        let (m, p) = &mut by_group[schedule_group(&schedule)];
+        m.push(median);
+        p.push(prediction.gflops);
     }
     let abs_log_ratios: Vec<f64> = predicted
         .iter()
@@ -1133,6 +1199,12 @@ pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
         "skipped: {drifted} matmul records flagged drift; {other_kernels} records of other \
          kernels (relu-matmul-bias: its extra nests are not modelled yet)"
     );
+    if let Some(want) = group {
+        let _ = writeln!(
+            out,
+            "group filter: \"{want}\" only; skipped {other_groups} matmul records of other groups"
+        );
+    }
     let _ = writeln!(
         out,
         "{:>5} {:>9} {:>9} {:>6} {:>7}  schedule (nest number dropped)",
@@ -1161,6 +1233,26 @@ pub fn compare_report(source: &str, text: &str) -> Result<String, BenchError> {
             );
         }
     }
+    let _ = writeln!(
+        out,
+        "by schedule group (error = median over the group's records of predicted / measured, \
+         not the ratio of the two medians):"
+    );
+    let _ = writeln!(
+        out,
+        "{:<38} {:>5} {:>9} {:>9} {:>7}",
+        "group", "n", "measured", "predicted", "error"
+    );
+    for (name, (m, p)) in SCHEDULE_GROUPS.iter().zip(&by_group) {
+        let ratios: Vec<f64> = p.iter().zip(m).map(|(p, m)| p / m).collect();
+        if let (Some(mm), Some(pm), Some(rm)) = (median(m), median(p), median(&ratios)) {
+            let _ = writeln!(
+                out,
+                "{name:<38} {:>5} {mm:>9.1} {pm:>9.1} {rm:>7.3}",
+                m.len()
+            );
+        }
+    }
     Ok(out)
 }
 
@@ -1174,12 +1266,42 @@ pub fn cli_main<I: IntoIterator<Item = String>>(args: I) -> std::process::ExitCo
     }
     let mut run = || -> Result<String, BenchError> {
         if compare {
-            return match args.by_ref().collect::<Vec<_>>().as_slice() {
-                [flag, path] if flag == "--from" => compare_report(path, &read_results(path)?),
-                _ => Err(BenchError::Usage(format!(
-                    "model compare needs exactly --from <results.jsonl>\n{USAGE}"
-                ))),
+            let rest: Vec<String> = args.by_ref().collect();
+            let (mut from, mut peak, mut group) = (None, None, None);
+            for pair in rest.chunks(2) {
+                match pair {
+                    [flag, value] if flag == "--from" => from = Some(value.clone()),
+                    [flag, value] if flag == "--peak" => peak = Some(value.clone()),
+                    [flag, value] if flag == "--group" => group = Some(value.clone()),
+                    _ => {
+                        return Err(BenchError::Usage(format!(
+                            "model compare takes --from <results.jsonl> [--peak <peak.jsonl>] \
+                             [--group <name>]\n{USAGE}"
+                        )));
+                    }
+                }
+            }
+            let Some(from) = from else {
+                return Err(BenchError::Usage(format!(
+                    "model compare needs --from <results.jsonl>\n{USAGE}"
+                )));
             };
+            // --peak: the machine comes from that file's peak line instead of --from's.
+            let mut text = String::new();
+            if let Some(peak) = &peak {
+                text.extend(
+                    read_results(peak)?
+                        .lines()
+                        .filter(|l| l.contains("\"kind\":\"peak\""))
+                        .map(|l| format!("{l}\n")),
+                );
+            }
+            text.push_str(&read_results(&from)?);
+            let source = match &peak {
+                Some(peak) => format!("{from} (peak line from {peak})"),
+                None => from,
+            };
+            return compare_report(&source, &text, group.as_deref());
         }
         let (n, machine, source) = parse_model_args(args.by_ref())?;
         Ok(report(n, &machine, &source, &rank_matmul(&machine, n)?))
@@ -2211,7 +2333,7 @@ mod tests {
     #[test]
     fn compare_on_the_committed_s2_file_prints_13_matmul_records() {
         let text = std::fs::read_to_string(S2).expect("the committed file");
-        let report = compare_report("S2", &text).expect("compares");
+        let report = compare_report("S2", &text, None).expect("compares");
         assert!(report.contains("13 records"), "{report}");
         assert!(report.contains("skipped: 2 matmul records flagged drift; 15 records"));
         assert!(report.contains("PLACEHOLDER"), "{report}");
@@ -2220,6 +2342,88 @@ mod tests {
             .lines()
             .filter(|l| l.contains("ldst") || l.contains("l2"));
         assert_eq!(rows.count(), 13, "{report}");
+    }
+
+    #[test]
+    fn schedule_groups_follow_the_vectorize_width_or_the_innermost_loop() {
+        let split = "split(1, i, io, ii, 8); split(1, j, jo, ji, 64); split(1, k, ko, ki, 8); ";
+        let vec64 = format!("{split}reorder(1, io, ko, jo, ii, ki, ji); vectorize(1, ji)");
+        assert_eq!(schedule_group(&vec64), 1);
+        assert_eq!(schedule_group(&vec64.replace("ji, 64", "ji, 128")), 0);
+        assert_eq!(schedule_group(&vec64.replace("ji, 64", "ji, 16")), 2);
+        assert_eq!(
+            schedule_group(&format!("{split}reorder(1, io, ko, jo, ii, ki, ji)")),
+            3
+        );
+        assert_eq!(
+            schedule_group(&format!("{split}reorder(1, io, ko, jo, ji, ki, ii)")),
+            4
+        );
+        assert_eq!(
+            schedule_group(&format!("{split}reorder(1, io, ko, jo, ji, ii, ki)")),
+            5
+        );
+        assert_eq!(schedule_group(""), 5);
+        assert_eq!(median(&[3.0, 1.0, 2.0, 10.0]), Some(2.5));
+        assert_eq!(median(&[]), None);
+    }
+
+    /// #64's numbers from one call: the 1000 random records of run 3 on the P3 peak line give
+    /// Spearman 0.853 and the group errors ×1.49 / ×1.42 / ×0.73 (medians of pred / meas).
+    #[test]
+    fn compare_by_group_reproduces_the_run_3_numbers_of_64() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/results/");
+        let read = |f: &str| std::fs::read_to_string(format!("{dir}{f}")).expect("committed");
+        let peak = read("2026-10-21-561ede3-peak.jsonl");
+        let peak = peak
+            .lines()
+            .find(|l| l.contains("\"kind\":\"peak\""))
+            .expect("peak");
+        let text = format!("{peak}\n{}", read("2026-10-22-hypothesis-a-run3.jsonl"));
+        let report = compare_report("run 3", &text, Some("random")).expect("compares");
+        assert!(report.contains("1000 records"), "{report}");
+        assert!(
+            report.contains("skipped 13 matmul records of other groups"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Spearman rank correlation 0.853;"),
+            "{report}"
+        );
+        for (group, n, error) in [
+            ("vectorized ji = 32/64", 106, "1.495"),
+            ("scalar, ii innermost", 263, "1.416"),
+            ("\"vectorized\" ji <= 16 (scalar code)", 100, "0.734"),
+        ] {
+            let row = report
+                .lines()
+                .find(|l| l.starts_with(group))
+                .expect("group row");
+            let cols: Vec<&str> = row[group.len()..].split_whitespace().collect();
+            assert_eq!(cols[0], n.to_string(), "{row}");
+            assert_eq!(cols[3], error, "{row}");
+        }
+        let sizes: usize = SCHEDULE_GROUPS
+            .iter()
+            .map(|g| {
+                let row = report
+                    .lines()
+                    .find(|l| l.starts_with(g))
+                    .expect("group row");
+                row[g.len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(sizes, 1000, "{report}");
+        let all = compare_report("run 3", &text, None).expect("compares");
+        assert!(
+            all.contains("1013 records") && all.contains("correlation 0.858;"),
+            "{all}"
+        );
     }
 
     /// Pins the full-unroll rule of v1.3 (#63) on four schedules of hypothesis A run 3

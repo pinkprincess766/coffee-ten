@@ -147,7 +147,7 @@ as in [BENCHMARKS.md](BENCHMARKS.md#hypothesis-a-spec-71-run-1-not-met). Solid l
 `bench/results/*hypothesis-a*.jsonl`; `python3 bench/hypothesis_ratio.py`.
 
 Known model errors, stable across runs 2 and 3 (#64): vectorized `ji` = 32/64
-over-predicted ×1.49, scalar `ii` innermost ×1.42, short "vectorized" loops (scalar code)
+over-predicted ×1.50, scalar `ii` innermost ×1.42, short "vectorized" loops (scalar code)
 under-predicted ×0.73 ([run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)).
 
 ![Fig. 3](docs/model-vs-measured.png)
