@@ -215,7 +215,8 @@ median error of ×1.37 (P3 machine, `model compare`). By group (measured vs pred
 | vectorized, `ji` = 32 or 64 | 98 | 55–60 | 76–106 | 1.43–1.50 |
 
 The last column is the median of the per-record ratios predicted / measured, not the ratio of
-the two medians next to it (the same metric as run 3 below).
+the two medians next to it (the same metric as run 3 below). Model v1.2; the method is
+reconstructed from the table's own numbers, not recomputed.
 
 What this does and does not show:
 
