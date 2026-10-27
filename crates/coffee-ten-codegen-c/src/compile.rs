@@ -6,6 +6,7 @@ use libloading::Library;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// Flags of every build, besides `-shared -fPIC -o <out> <src>`.
 /// No FMA contraction, so results match the f32 reference bit for bit; auto-vectorization
@@ -167,8 +168,7 @@ pub fn compile_with_flags(
         .map(|b| b.shape.iter().product())
         .collect();
 
-    let clang_version = clang_stdout(&["--version"])?;
-    let key = cache_key(&source, flags, &clang_version);
+    let key = cache_key(&source, flags, clang_version()?);
     let stem = format!("ct_{key:016x}");
     let source_path = cache_dir.join(format!("{stem}.c"));
     let library_path = cache_dir.join(format!("{stem}.{}", std::env::consts::DLL_EXTENSION));
@@ -248,6 +248,17 @@ fn load(path: &Path) -> Result<(Library, EntryFn), CompileError> {
 
 fn io_error(e: std::io::Error) -> CompileError {
     CompileError::Io(e.to_string())
+}
+
+/// `clang --version`, asked once per process: it is part of every cache key, and a process
+/// that compiles many kernels would otherwise spawn clang one extra time per kernel.
+fn clang_version() -> Result<&'static str, CompileError> {
+    static VERSION: OnceLock<Result<String, CompileError>> = OnceLock::new();
+    VERSION
+        .get_or_init(|| clang_stdout(&["--version"]))
+        .as_ref()
+        .map(String::as_str)
+        .map_err(Clone::clone)
 }
 
 /// Runs `clang args` and returns its stdout.
