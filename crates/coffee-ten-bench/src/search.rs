@@ -1,10 +1,11 @@
 //! Random search over the matmul schedule space: the research baseline (spec §7.1).
 //!
 //! Samples `budget` distinct candidates of `matmul_space(n, n, n)` uniformly without
-//! replacement and measures them one after another. The search is sequential by nature:
-//! each candidate is compiled, checked and timed alone (`run::run` with one variant) before
-//! the next one is measured, so the variants are not interleaved as in the harness. The
-//! naive kernel is measured first as the reference and is not counted in the budget.
+//! replacement and measures them one after another. All candidates of a group are compiled
+//! and checked first, in parallel, and then timed one at a time with no compilation in
+//! between, each alone (one variant per `Reference::time`), so the variants are not
+//! interleaved as in the harness. The naive kernel is measured first as the reference and is
+//! not counted in the budget.
 //!
 //! With `--model-top K --from <results.jsonl>` it is also the experiment of spec §7.1: after
 //! the random candidates it measures the analytic model's top K schedules the same way, then
@@ -27,7 +28,7 @@ use crate::local::local_search;
 use crate::log::append_lines;
 use crate::meta::Metadata;
 use crate::model::{Machine, Ranked, machine_from_results, rank_matmul, spearman};
-use crate::run::{Record, record_json, run};
+use crate::run::{Record, Reference, candidate_warmup, full_warmup, record_json, run};
 use crate::space::{Candidate, matmul_space, neighbors};
 use crate::stats::{Rng, Stats, summarize};
 use coffee_ten_loop::Schedule;
@@ -113,23 +114,57 @@ pub fn sample(space: Vec<Candidate>, budget: usize, seed: u64) -> Vec<Candidate>
     pool
 }
 
-/// Compiles, checks and times one schedule alone, through the harness's `run`.
-fn measure(config: &SearchConfig, text: &str) -> Result<Record, BenchError> {
-    let schedule = Schedule::parse(text).expect("invariant: candidate texts parse");
-    let run_config = Config {
+/// The harness config of the search's candidates; `variants` is filled per use.
+fn bench_config(config: &SearchConfig) -> Config {
+    Config {
         kernel: KernelKind::Matmul,
         n: config.n,
-        variants: vec![(text.to_string(), schedule)],
+        variants: Vec::new(),
         samples: config.samples,
         min_sample_ms: config.min_sample_ms,
         seed: config.seed,
         quick: config.quick,
         log: None,
-    };
-    let mut records = run(&run_config)?;
-    Ok(records
-        .pop()
-        .expect("invariant: run gives one record per variant"))
+    }
+}
+
+/// Compiles and checks all `texts` first, in parallel and before any timing, then times them
+/// one after another, each alone, and logs each record as soon as it is timed. No compilation
+/// happens between two timings, so the thread stays busy: only the first candidate gets the
+/// full warm-up, the others the short one (`run::CANDIDATE_WARMUP_MS`). A candidate that fails
+/// to compile or fails the check stops the search with its error after the earlier ones are
+/// logged.
+fn measure_group(
+    config: &SearchConfig,
+    metadata: &Metadata,
+    reference: &Reference,
+    group: &str,
+    texts: &[&str],
+) -> Result<Vec<Record>, BenchError> {
+    let candidates: Vec<(String, Schedule)> = texts
+        .iter()
+        .map(|&text| {
+            let schedule = Schedule::parse(text).expect("invariant: candidate texts parse");
+            (text.to_string(), schedule)
+        })
+        .collect();
+    let bench = bench_config(config);
+    let mut records = Vec::with_capacity(texts.len());
+    for (index, built) in reference.build_all(&candidates).into_iter().enumerate() {
+        let warmup = if index == 0 {
+            full_warmup(config.quick)
+        } else {
+            candidate_warmup(config.quick)
+        };
+        let mut variant = [built?];
+        let mut timed = reference.time(&bench, &mut variant, warmup)?;
+        let record = timed
+            .pop()
+            .expect("invariant: time gives one record per variant");
+        log_records(config, metadata, group, &[&record])?;
+        records.push(record);
+    }
+    Ok(records)
 }
 
 /// The log line of `record`: `record_json` plus the last field `"group"`.
@@ -159,16 +194,16 @@ fn log_records(
         .map_err(|e| BenchError::Setup(format!("cannot append to {}: {e}", path.display())))
 }
 
-/// `measure`, then appends the record to the log if there is one.
+/// One schedule alone, with the full warm-up: `measure_group` of one text.
 fn measure_and_log(
     config: &SearchConfig,
     metadata: &Metadata,
+    reference: &Reference,
     group: &str,
     text: &str,
 ) -> Result<Record, BenchError> {
-    let record = measure(config, text)?;
-    log_records(config, metadata, group, &[&record])?;
-    Ok(record)
+    let mut records = measure_group(config, metadata, reference, group, &[text])?;
+    Ok(records.pop().expect("invariant: one record per candidate"))
 }
 
 /// Index of the highest median among `records`; a tie keeps the earlier.
@@ -223,6 +258,7 @@ fn measure_final(
 fn measure_local(
     config: &SearchConfig,
     metadata: &Metadata,
+    reference: &Reference,
     space: &[Candidate],
     ranked: &[Ranked],
 ) -> Result<Vec<Record>, BenchError> {
@@ -259,7 +295,8 @@ fn measure_local(
     let steps = neighbors(space, config.n, config.n, config.n);
     let mut records = Vec::new();
     local_search(&steps, &rank_of, config.budget, |index| {
-        let record = measure_and_log(config, metadata, "local", &space[index].schedule)?;
+        // Each step depends on the last median, so the hill climb cannot compile ahead.
+        let record = measure_and_log(config, metadata, reference, "local", &space[index].schedule)?;
         let median = record.stats.median;
         records.push(record);
         Ok(median)
@@ -286,10 +323,12 @@ pub fn search(config: &SearchConfig, metadata: &Metadata) -> Result<Search, Benc
         }
         _ => None,
     };
-    let naive = measure_and_log(config, metadata, "naive", "")?;
+    // The naive output is computed once for the whole search.
+    let reference = Reference::new(&bench_config(config))?;
+    let naive = measure_and_log(config, metadata, &reference, "naive", "")?;
     if config.local {
         let (_, ranked) = model_input.expect("invariant: --local ranks before measuring");
-        let records = measure_local(config, metadata, &space, &ranked)?;
+        let records = measure_local(config, metadata, &reference, &space, &ranked)?;
         return Ok(Search {
             space_size,
             naive,
@@ -297,15 +336,9 @@ pub fn search(config: &SearchConfig, metadata: &Metadata) -> Result<Search, Benc
             model: None,
         });
     }
-    let mut records = Vec::new();
-    for candidate in sample(space, config.budget, config.seed) {
-        records.push(measure_and_log(
-            config,
-            metadata,
-            "random",
-            &candidate.schedule,
-        )?);
-    }
+    let sampled = sample(space, config.budget, config.seed);
+    let texts: Vec<&str> = sampled.iter().map(|c| c.schedule.as_str()).collect();
+    let records = measure_group(config, metadata, &reference, "random", &texts)?;
     let mut model = None;
     if let Some((machine, ranked)) = model_input {
         let top = config
@@ -324,10 +357,12 @@ pub fn search(config: &SearchConfig, metadata: &Metadata) -> Result<Search, Benc
                     .expect("invariant: the ranking covers the space, texts are canonical")
             })
             .collect();
-        let mut model_records = Vec::new();
-        for entry in ranked.iter().take(top) {
-            model_records.push(measure_and_log(config, metadata, "model", &entry.schedule)?);
-        }
+        let texts: Vec<&str> = ranked
+            .iter()
+            .take(top)
+            .map(|entry| entry.schedule.as_str())
+            .collect();
+        let model_records = measure_group(config, metadata, &reference, "model", &texts)?;
         let best_random = &records[best_of(&records)];
         let best_model = &model_records[best_of(&model_records)];
         let final_run = if best_random.schedule == best_model.schedule {
@@ -699,6 +734,11 @@ mod tests {
         }
     }
 
+    /// Naive references built on this test's thread so far.
+    fn references_built() -> usize {
+        crate::run::REFERENCES_BUILT.with(std::cell::Cell::get)
+    }
+
     fn texts(candidates: &[Candidate]) -> Vec<String> {
         candidates.iter().map(|c| c.schedule.clone()).collect()
     }
@@ -848,6 +888,8 @@ mod tests {
         // `run` aborts with `BenchError::Mismatch` before timing a wrong variant, so an `Ok`
         // means every measured variant passed the check.
         let result = search(&config, &metadata).unwrap();
+        // The naive reference for the check: once for the naive record and 3 candidates.
+        assert_eq!(references_built(), 1);
         let log_text = fs::read_to_string(&path).unwrap();
         fs::remove_file(&path).unwrap();
 
@@ -879,6 +921,46 @@ mod tests {
         for line in &lines[1..] {
             assert!(line.ends_with(",\"group\":\"random\"}"), "{line}");
         }
+    }
+
+    #[test]
+    fn a_failing_candidate_stops_the_group_after_the_earlier_ones_are_logged() {
+        let log = std::env::temp_dir().join(format!(
+            "coffee-ten-bench-search-failing-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&log);
+        let config = SearchConfig {
+            n: 8,
+            budget: 3,
+            seed: 1,
+            samples: QUICK_SAMPLES,
+            min_sample_ms: QUICK_MIN_SAMPLE_MS,
+            quick: true,
+            log: Some(log.clone()),
+            model_top: None,
+            from: None,
+            local: false,
+        };
+        let reference = Reference::new(&bench_config(&config)).unwrap();
+        // The third one is fine, but it comes after the failing one.
+        let texts = [
+            "vectorize(1, j)",
+            "vectorize(1, nope)",
+            "split(1, j, jo, ji, 4)",
+        ];
+        let err =
+            measure_group(&config, &test_metadata(1), &reference, "random", &texts).unwrap_err();
+        let message = err.to_string();
+        let log_text = fs::read_to_string(&log).unwrap();
+        fs::remove_file(&log).unwrap();
+        assert!(message.contains("cannot apply schedule"), "{message}");
+        assert!(message.contains("vectorize(1, nope)"), "{message}");
+        assert_eq!(log_text.lines().count(), 1, "{log_text}");
+        assert!(
+            log_text.contains("\"schedule\":\"vectorize(1, j)\""),
+            "{log_text}"
+        );
     }
 
     #[test]
@@ -1061,6 +1143,7 @@ mod tests {
         };
         let metadata = test_metadata(config.seed);
         let result = search(&config, &metadata).unwrap();
+        assert_eq!(references_built(), 1);
         let log_text = fs::read_to_string(&log).unwrap();
         fs::remove_file(&log).unwrap();
         fs::remove_file(&peak).unwrap();
@@ -1138,6 +1221,12 @@ mod tests {
         fs::remove_file(&peak).unwrap();
 
         let model = result.model.as_ref().unwrap();
+        // One reference for the naive record, the 3 random and the 2 model candidates, one more
+        // for the final run if there is one (it is a harness `run` of its own).
+        assert_eq!(
+            references_built(),
+            1 + usize::from(model.final_run.is_some())
+        );
         assert_eq!(result.records.len(), 3);
         assert_eq!(model.records.len(), 2);
         assert_eq!(model.random_predicted.len(), 3);
