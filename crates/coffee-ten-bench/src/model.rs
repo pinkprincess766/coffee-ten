@@ -1,6 +1,6 @@
-//! Analytic cost model, version 1.3 (spec §7.1): cache traffic from the loop footprints plus a
-//! roofline whose compute ceiling is the lowest of the FMA, the load/store and the latency
-//! ceiling (dependent FMA chains of a reduction held in registers, see `latency_gflops`).
+//! Analytic cost model, version 1.4 (spec §7.1): cache traffic from the loop footprints plus a
+//! roofline whose compute ceiling is the lowest of the FMA, the load, the store (vectorized
+//! nests; scalar nests have one combined load/store ceiling) and the latency ceiling (dependent FMA chains of a reduction held in registers, see `latency_gflops`).
 //! Deterministic; the machine numbers are inputs (assumed, or read from a results file).
 //!
 //! Only the update nest (nest 1) of a matmul kernel is modelled; the init nest is ignored.
@@ -94,8 +94,17 @@ pub const PLACEHOLDER_FMA_CHAIN_GFLOPS: f64 = 2.6;
 pub const PLACEHOLDER_FMA_CHAIN256_GFLOPS: f64 = 3.49;
 /// Chain length at which `fma_chain256_gflops` is measured, and so the window `W` is calibrated.
 const CHAIN_CALIBRATION_LENGTH: f64 = 256.0;
+/// PLACEHOLDER, not measured in a quiet run: GFLOP/s of vector FMAs that each store one result
+/// and load nothing (the `fma_store` kernel of `bench/peak`). The value is the `--quick` smoke
+/// run of that kernel on an Apple M5 (58.0 / 58.4 / 58.5), not a median of a full run. Replace
+/// by the `fma_store_gflops` median.
+pub const PLACEHOLDER_STORE_GFLOPS: f64 = 58.0;
 /// Memory ops per FMA of the `fma_mem_acc` kernels: load b, load c, store c.
 const MEM_ACC_KERNEL_MEM_OPS: f64 = 3.0;
+/// Loads per FMA of the `fma_mem_acc` kernel (load b, load c): what its rate is a load rate of.
+const MEM_ACC_KERNEL_LOADS: f64 = 2.0;
+/// Stores per FMA of the store kernel behind `store_gflops`.
+const STORE_KERNEL_STORES: f64 = 1.0;
 
 /// The machine the model predicts for. All fields are inputs, none is detected.
 #[derive(Clone, Debug, PartialEq)]
@@ -114,6 +123,9 @@ pub struct Machine {
     /// instruction shape of the naive inner loop): the load/store calibration point of scalar
     /// nests.
     pub mem_acc_scalar_gflops: f64,
+    /// GFLOP/s of vector FMAs that each store one result and load nothing (`STORE_KERNEL_STORES`
+    /// store per FMA): the store calibration point of vectorized nests.
+    pub store_gflops: f64,
     /// GFLOP/s of one dependent scalar FMA chain (the `fma_chain` kernel): the latency
     /// calibration point, see `latency_gflops`.
     pub fma_chain_gflops: f64,
@@ -141,6 +153,7 @@ impl Machine {
             l2_gbs: PLACEHOLDER_L2_GBS,
             mem_acc_gflops: PLACEHOLDER_MEM_ACC_GFLOPS,
             mem_acc_scalar_gflops: PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS,
+            store_gflops: PLACEHOLDER_STORE_GFLOPS,
             fma_chain_gflops: PLACEHOLDER_FMA_CHAIN_GFLOPS,
             fma_chain256_gflops: PLACEHOLDER_FMA_CHAIN256_GFLOPS,
             l1_bytes: 128 * 1024,
@@ -163,6 +176,7 @@ impl Machine {
             self.l2_gbs,
             self.mem_acc_gflops,
             self.mem_acc_scalar_gflops,
+            self.store_gflops,
             self.fma_chain_gflops,
             self.fma_chain256_gflops,
         ];
@@ -192,12 +206,18 @@ pub struct Prediction {
     pub mem_bytes: usize,
     /// Bytes moved from L2 into L1 (traffic past L1).
     pub l2_bytes: usize,
-    /// The roofline term that sets `time_s`: "compute" (FMA issue), "ldst" (loads and stores
-    /// per FMA), "latency" (dependent FMA chains), "memory" or "l2". A tie goes to the first of
-    /// "compute"/"ldst"/"latency", then "memory".
+    /// The roofline term that sets `time_s`: "compute" (FMA issue), "load" or "store" (vectorized
+    /// nests: loads per FMA, stores per FMA), "ldst" (scalar nests: loads and stores in one
+    /// pool), "latency" (dependent FMA chains), "memory" or "l2". A tie goes to the first of
+    /// "compute"/"load"/"store"/"ldst"/"latency", then "memory".
     pub bound: &'static str,
-    /// Memory ops per FMA op of the nest, see `mem_ops_per_fma`; breaks ties in `order`.
+    /// Memory ops per FMA op of the nest, see `mem_ops_per_fma`; breaks ties in `order`. The sum
+    /// of `loads_per_fma` and `stores_per_fma`.
     pub mem_ops_per_fma: f64,
+    /// Loads per FMA op of the nest, see `loads_stores_per_fma`.
+    pub loads_per_fma: f64,
+    /// Stores per FMA op of the nest, see `loads_stores_per_fma`.
+    pub stores_per_fma: f64,
 }
 
 /// A schedule text and its prediction.
@@ -510,10 +530,11 @@ fn total_ops(access: &Access, loops: &[Loop], lanes: usize) -> Result<f64, Bench
     Ok(ops)
 }
 
-/// `(memory ops, FMA ops)` over the whole update `nest`. FMA ops: the product of the extents,
-/// the vectorized loop as `extent / lanes` (rounded up) vector FMAs. Memory ops: `total_ops`
-/// of each distinct Load of the stored value plus of the store.
-fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
+/// `(loads, stores, FMA ops)` over the whole update `nest`. FMA ops: the product of the extents,
+/// the vectorized loop as `extent / lanes` (rounded up) vector FMAs. Loads: `total_ops` of each
+/// distinct Load of the stored value. Stores: `total_ops` of the store target (the same hoisting
+/// rules for both, see `held_across`).
+fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64, f64), BenchError> {
     if lanes == 0 {
         return Err(model_err("lanes must be positive".to_string()));
     }
@@ -522,9 +543,10 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
     }
     let mut all_loads = Vec::new();
     loads(&nest.body.value, &mut all_loads);
-    let mut mem_ops = total_ops(&nest.body.target, &nest.loops, lanes)?;
+    let stores = total_ops(&nest.body.target, &nest.loops, lanes)?;
+    let mut load_ops = 0.0;
     for load in distinct(all_loads) {
-        mem_ops += total_ops(load, &nest.loops, lanes)?;
+        load_ops += total_ops(load, &nest.loops, lanes)?;
     }
     let fma_ops = nest.loops.iter().fold(1.0, |acc, l| {
         acc * if l.vectorize {
@@ -533,7 +555,7 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
             l.extent as f64
         }
     });
-    Ok((mem_ops, fma_ops))
+    Ok((load_ops, stores, fma_ops))
 }
 
 /// Memory ops `m` per FMA op of the update `nest`: the total memory ops over the nest divided
@@ -574,19 +596,39 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
 /// `MAX_ACCUMULATORS` (24), which keeps the register tiles in registers. The `fma_mem_acc`
 /// calibration below is unchanged.
 ///
-/// Load/store ceiling, TWO calibration points, each for its own code shape, not a fit of the
-/// model. The `fma_mem_acc` kernel does vector FMAs with m = 3 (load b, load c, store c) at
-/// `mem_acc_gflops` = G. Its vector FMA rate is G / (2 * lanes), so the core retires
-/// 3 * G / (2 * lanes) memory ops per second, if memory ops are what limits it. A vectorized
-/// nest with m ops per FMA then runs `G / (2 * lanes) * 3 / m` FMAs per second, which is, at
-/// 2 * lanes FLOP per vector FMA, `G * 3 / m` GFLOP/s. A scalar nest (last loop not
-/// vectorized) uses the other point: the `fma_mem_acc_scalar` kernel, the same pattern in
-/// scalar code with the instruction shape of the naive inner loop, at `mem_acc_scalar_gflops`
-/// = S; at 2 FLOP per scalar FMA it gives `S * 3 / m` GFLOP/s. S is NOT G / lanes: measured on
-/// P2, G = 46.94 and S = 8.563, not 11.7. ASSUMED: loads and stores share one pool; for a
-/// vectorized nest nothing else (address arithmetic, the loop branch) limits; the scalar point
-/// already contains that overhead of the naive loop shape, and every scalar nest is assumed to
-/// pay the same.
+/// Load/store ceilings, v1.4. Three calibration points, each for its own code shape, not a fit
+/// of the model.
+///
+/// Vectorized nests have a load ceiling and a store ceiling. Hand microbenchmark, Apple M5,
+/// L1-resident vector FMA kernels (GFLOP/s): 2 loads + 1 store per FMA (the shape of
+/// `fma_mem_acc`) 45 to 47; 2 loads and no store about 49.5; 1 load and no store about 84; no
+/// load and 1 store about 58 (the `fma_store` kernel of `bench/peak`, `--quick`; an earlier hand
+/// kernel said 62 to 64, but clang hoisted 3 of its 4 FMAs, so its FLOPs were overcounted).
+/// Loads and stores do NOT share one pool: removing the store of `fma_mem_acc` gains only about
+/// 6%, so it is load-bound (and 1 load per FMA runs at about twice its rate), while stores have
+/// a limit of their own. v1.3 put them in one pool
+/// (`mem_acc * 3 / m`), which is wrong for a schedule that loads little and stores much or the
+/// reverse (it said 117 to 128 GFLOP/s for a `C` row held across `ki`, measured 62 to 90).
+/// - Load ceiling: `mem_acc_gflops * 2 / loads_per_fma`. The `fma_mem_acc` kernel does
+///   `MEM_ACC_KERNEL_LOADS` = 2 loads per FMA at `mem_acc_gflops` = G and is load-bound
+///   (evidence above), so a nest with `l` loads per FMA runs at `G * 2 / l`.
+/// - Store ceiling: `store_gflops * 1 / stores_per_fma`; the calibration kernel stores once per
+///   FMA (`STORE_KERNEL_STORES`). `store_gflops` is a PLACEHOLDER (58, the `--quick` value of the
+///   `fma_store` kernel) until the peak line has `fma_store_gflops`.
+///
+/// Hand values with the placeholders (G = 60, store 58): `tiled+vectorize` (loads 1.09375,
+/// stores 1 per FMA, N = 64) has a load ceiling 60 * 2 / 1.09375 = 109.7 and a store ceiling 58:
+/// store-bound at 58, which UNDER-predicts the measured 60 to 64 by 3 to 10%. A `C` row held across `ki` (loads 1.09375, stores
+/// 0.03125, see `a_c_row_held_across_ki_is_load_bound`) is load-bound at 109.7 (v1.3 said 160).
+///
+/// Scalar nests (last loop not vectorized) are left as in v1.3: one combined ceiling
+/// `mem_acc_scalar_gflops * 3 / m` from the `fma_mem_acc_scalar` kernel (the same pattern in
+/// scalar code, with the instruction shape of the naive inner loop), at S; at 2 FLOP per scalar
+/// FMA it gives `S * 3 / m` GFLOP/s. That is ONE point with the naive body's shape and there is
+/// no evidence yet about the scalar load and store ports, so they stay one pool. S is NOT G /
+/// lanes: measured on P2, G = 46.94 and S = 8.563, not 11.7. ASSUMED: for a vectorized nest
+/// nothing else (address arithmetic, the loop branch) limits; the scalar point already contains
+/// that overhead of the naive loop, and every scalar nest is assumed to pay the same.
 ///
 /// A loop marked vectorized with at most `CLANG_FULL_UNROLL_LIMIT` iterations that the schedule
 /// does not unroll is counted as a scalar unrolled loop, see `as_compiled`. Hand value, N = 16:
@@ -594,8 +636,16 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
 /// per `i`, C 16 + 16, A 16, B 16 * 16: 304 / 256 FMAs = 1.1875 (4 vector registers and
 /// 1.375 if it were vectorized).
 pub fn mem_ops_per_fma(nest: &LoopNest, lanes: usize) -> Result<f64, BenchError> {
-    let (mem_ops, fma_ops) = nest_ops(&as_compiled(nest), lanes)?;
-    Ok(mem_ops / fma_ops)
+    let (loads, stores, fma_ops) = nest_ops(&as_compiled(nest), lanes)?;
+    Ok((loads + stores) / fma_ops)
+}
+
+/// `(loads, stores)` per FMA op of the update `nest`, counted as in `mem_ops_per_fma` (which is
+/// their sum). Stores: the store target; loads: every distinct load of the stored value, `C[i,
+/// j]` included.
+pub fn loads_stores_per_fma(nest: &LoopNest, lanes: usize) -> Result<(f64, f64), BenchError> {
+    let (loads, stores, fma_ops) = nest_ops(&as_compiled(nest), lanes)?;
+    Ok((loads / fma_ops, stores / fma_ops))
 }
 
 /// Latency ceiling in GFLOP/s of the update `nest` (as compiled, see `as_compiled`), `None` if
@@ -696,16 +746,27 @@ pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchEr
     let is_vectorized = as_compiled(nest).loops.last().is_some_and(|l| l.vectorize);
     let lanes = machine.lanes as f64;
     let mem_ops = mem_ops_per_fma(nest, machine.lanes)?;
-    let (fma_gflops, mem_acc_gflops) = if is_vectorized {
-        (machine.peak_gflops, machine.mem_acc_gflops)
+    let (loads, stores) = loads_stores_per_fma(nest, machine.lanes)?;
+    // Vectorized: separate load and store ceilings; scalar: one combined ceiling (see the doc of
+    // `mem_ops_per_fma`). A zero count of loads or stores gives an infinite ceiling.
+    let (fma_gflops, ldst_ceilings) = if is_vectorized {
+        let load_gflops = machine.mem_acc_gflops * MEM_ACC_KERNEL_LOADS / loads;
+        let store_gflops = machine.store_gflops * STORE_KERNEL_STORES / stores;
+        (
+            machine.peak_gflops,
+            vec![("load", load_gflops), ("store", store_gflops)],
+        )
     } else {
-        (machine.peak_gflops / lanes, machine.mem_acc_scalar_gflops)
+        let ldst_gflops = machine.mem_acc_scalar_gflops * MEM_ACC_KERNEL_MEM_OPS / mem_ops;
+        (machine.peak_gflops / lanes, vec![("ldst", ldst_gflops)])
     };
-    let ldst_gflops = mem_acc_gflops * MEM_ACC_KERNEL_MEM_OPS / mem_ops;
-    // The lowest compute ceiling; a tie goes to the first of compute, ldst, latency.
+    // The lowest compute ceiling; a tie goes to the first of compute, load, store, ldst,
+    // latency.
     let mut ceiling = ("compute", fma_gflops);
-    if ldst_gflops < ceiling.1 {
-        ceiling = ("ldst", ldst_gflops);
+    for ldst in ldst_ceilings {
+        if ldst.1 < ceiling.1 {
+            ceiling = ldst;
+        }
     }
     if let Some(latency) = latency_gflops(&as_compiled(nest), machine, is_vectorized)?
         && latency < ceiling.1
@@ -731,6 +792,8 @@ pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchEr
         l2_bytes,
         bound,
         mem_ops_per_fma: mem_ops,
+        loads_per_fma: loads,
+        stores_per_fma: stores,
     })
 }
 
@@ -861,6 +924,9 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
     let mem_acc_scalar = median_after(line, "fma_mem_acc_scalar_gflops");
     machine.mem_acc_scalar_gflops =
         mem_acc_scalar.unwrap_or(machine.mem_acc_gflops / machine.lanes as f64);
+    if let Some(gflops) = median_after(line, "fma_store_gflops") {
+        machine.store_gflops = gflops;
+    }
     if let Some(gflops) = median_after(line, "fma_chain_gflops") {
         machine.fma_chain_gflops = gflops;
     }
@@ -869,6 +935,13 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
     }
     machine.check()?;
     Ok((machine, mem_acc.is_some(), mem_acc_scalar.is_some()))
+}
+
+/// Whether the peak line of `text` has `fma_store_gflops`; without it `store_gflops` is
+/// `PLACEHOLDER_STORE_GFLOPS`.
+pub fn store_measured(text: &str) -> bool {
+    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    line.is_some_and(|line| median_after(line, "fma_store_gflops").is_some())
 }
 
 /// Whether the peak line of `text` has `fma_chain_gflops` and `fma_chain256_gflops`.
@@ -883,6 +956,7 @@ fn from_note(
     path: &str,
     mem_acc_measured: bool,
     mem_acc_scalar_measured: bool,
+    store_measured: bool,
     chain_measured: (bool, bool),
 ) -> String {
     let mut note = format!(
@@ -905,6 +979,13 @@ fn from_note(
         note.push_str(
             "; mem_acc_scalar is a PLACEHOLDER, mem_acc / lanes \
              (no fma_mem_acc_scalar_gflops in the peak line)",
+        );
+    }
+    if !store_measured {
+        let _ = write!(
+            note,
+            "; store {PLACEHOLDER_STORE_GFLOPS} is a PLACEHOLDER \
+             (no fma_store_gflops in the peak line)"
         );
     }
     for (measured, key) in [
@@ -954,7 +1035,13 @@ pub fn parse_model_args<I: IntoIterator<Item = String>>(
                 let text = read_results(&value)?;
                 let (from, vector, scalar) = machine_from_results(&text)?;
                 machine = from;
-                source = from_note(&value, vector, scalar, chain_measured(&text));
+                source = from_note(
+                    &value,
+                    vector,
+                    scalar,
+                    store_measured(&text),
+                    chain_measured(&text),
+                );
             }
             "--peak" => machine.peak_gflops = speed()?,
             "--mem-gbs" => machine.mem_gbs = speed()?,
@@ -974,7 +1061,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "PREDICTION by the analytic model v1.3, not a measurement"
+        "PREDICTION by the analytic model v1.4, not a measurement"
     );
     let _ = writeln!(
         text,
@@ -984,13 +1071,14 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let _ = writeln!(
         text,
         "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
-         mem_acc_scalar {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
+         mem_acc_scalar {} GFLOP/s, store {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
          FMAs) ({source}); L1 {} B, L2 {} B, line {} B, {} lanes (ASSUMED)",
         machine.peak_gflops,
         machine.mem_gbs,
         machine.l2_gbs,
         machine.mem_acc_gflops,
         machine.mem_acc_scalar_gflops,
+        machine.store_gflops,
         machine.fma_chain_gflops,
         machine.fma_chain256_gflops,
         machine.window_fmas(),
@@ -1172,18 +1260,19 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "analytic model v1.3 (PREDICTION) against the measurements in {source}"
+        "analytic model v1.4 (PREDICTION) against the measurements in {source}"
     );
     let _ = writeln!(
         out,
         "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
-         mem_acc_scalar {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
+         mem_acc_scalar {} GFLOP/s, store {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
          FMAs) ({})",
         machine.peak_gflops,
         machine.mem_gbs,
         machine.l2_gbs,
         machine.mem_acc_gflops,
         machine.mem_acc_scalar_gflops,
+        machine.store_gflops,
         machine.fma_chain_gflops,
         machine.fma_chain256_gflops,
         machine.window_fmas(),
@@ -1191,6 +1280,7 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
             source,
             mem_acc_measured,
             mem_acc_scalar_measured,
+            store_measured(text),
             chain_measured(text)
         )
     );
@@ -1820,7 +1910,9 @@ mod tests {
     /// 1.1875, the same as `unroll(1, j)`. Vectorized it would be C 4 + 4, A 16, B 64 = 88 over
     /// 64 vector FMAs = 1.375. Predicted at the scalar rates: the FMA ceiling 100 / 4 = 25
     /// (the scalar ld/st ceiling is 15 * 3 / 1.1875 = 37.9). One more iteration (N = 17, 5
-    /// vectors) and it is vectorized: 100, the peak.
+    /// vectors) and it is vectorized: per `i`, loads C 5 + A 17 + B 17 * 5 = 107 over 85 vector
+    /// FMAs = 1.2588, stores 5 / 85; the load ceiling is 60 * 2 / (107 / 85) = 95.33, below the
+    /// peak 100 (the store ceiling 58 / (5 / 85) is far above).
     #[test]
     fn a_short_vectorized_loop_is_predicted_as_scalar_unrolled_code() {
         assert_eq!(mem_ops(16, "vectorize(1, j)"), 1.1875);
@@ -1834,7 +1926,12 @@ mod tests {
         assert!((short.gflops - 25.0).abs() < 1e-9, "{}", short.gflops);
         assert_eq!(short.bound, "compute");
         let long = predict(&machine, &scheduled(17, "vectorize(1, j)")).expect("predicts");
-        assert!((long.gflops - 100.0).abs() < 1e-9, "{}", long.gflops);
+        assert!(
+            (long.gflops - 60.0 * 2.0 * 85.0 / 107.0).abs() < 1e-9,
+            "{}",
+            long.gflops
+        );
+        assert_eq!(long.bound, "load");
     }
 
     /// The register tile `ji` of 8 is vectorized AND unrolled: `codegen-c` emits
@@ -1959,13 +2056,14 @@ mod tests {
         assert_eq!(mem_ops(4, "unroll(1, i); unroll(1, k); unroll(1, j)"), 1.0);
     }
 
-    /// mem_acc = 60 and mem_acc_scalar = 60 / 4 = 15 (placeholders), vectorized at N = 256 and
-    /// scalar at N = 64 both have m = 3.015625: vectorized 60 * 3 / m = 59.689..., scalar
-    /// 15 * 3 / m = 14.922... Both are
-    /// below the FMA ceilings 100 and 100 / 4 = 25, so they are the ld/st bound. A register tile
-    /// (4x16, N = 64, m = 0.53125) has the ceiling 60 * 3 / m = 338.8, so the FMA peak binds.
+    /// mem_acc = 60, store = 58 and mem_acc_scalar = 60 / 4 = 15 (placeholders). Scalar at N = 64
+    /// has m = 3.015625, one combined ceiling 15 * 3 / m = 14.922. Vectorized at N = 256 has
+    /// loads 2.015625 (C, B, and A once per `j` loop) and 1 store per FMA: load ceiling 60 * 2 /
+    /// 2.015625 = 59.53, store ceiling 58 / 1 = 58: store-bound. With a fast store (1e9) the load
+    /// ceiling shows. Both are below the FMA ceilings 100 and 100 / 4 = 25. A register tile (4x16,
+    /// N = 64, loads 0.515625, stores 1/64) has the ceilings 232.7 and 3712, so the FMA peak binds.
     #[test]
-    fn the_ldst_ceiling_follows_the_one_point_calibration() {
+    fn the_ldst_ceilings_follow_the_calibration_points() {
         // Fast caches, so that at N = 256 the L2 traffic does not bind.
         let machine = Machine {
             mem_gbs: 1e6,
@@ -1980,12 +2078,19 @@ mod tests {
             "{}",
             scalar.gflops
         );
+        assert!((vector.gflops - 58.0).abs() < 1e-9, "{}", vector.gflops);
+        assert_eq!((scalar.bound, vector.bound), ("ldst", "store"));
+        let fast_store = Machine {
+            store_gflops: 1e9,
+            ..machine.clone()
+        };
+        let vector = predict(&fast_store, &scheduled(256, "vectorize(1, j)")).expect("predicts");
         assert!(
-            (vector.gflops - 60.0 * 3.0 / m).abs() < 1e-9,
+            (vector.gflops - 60.0 * 2.0 / 2.015625).abs() < 1e-9,
             "{}",
             vector.gflops
         );
-        assert_eq!((scalar.bound, vector.bound), ("ldst", "ldst"));
+        assert_eq!(vector.bound, "load");
         let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
                     reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
         let tiled = predict(&machine, &scheduled(64, tile)).expect("predicts");
@@ -1995,7 +2100,8 @@ mod tests {
     /// The measured P2 points: mem_acc 46.9387, mem_acc_scalar 8.563 (not 46.9387 / 4 = 11.73).
     /// The naive `i, k, j` at N = 64 is scalar with m = 3.015625, so its ceiling is
     /// 8.563 * 3 / 3.015625 = 8.5186..., below the scalar FMA ceiling 100 / 4. The vectorized
-    /// nest (N = 256, same m) uses mem_acc only: 46.9387 * 3 / 3.015625, whatever the scalar point.
+    /// nest (N = 256, loads 2.015625) uses mem_acc only: the load ceiling 46.9387 * 2 / 2.015625,
+    /// below the store ceiling 58, whatever the scalar point.
     #[test]
     fn a_scalar_nest_uses_the_scalar_calibration_point() {
         let machine = Machine {
@@ -2012,14 +2118,127 @@ mod tests {
         assert!((scalar.gflops - 8.5186).abs() < 1e-4, "{}", scalar.gflops);
         assert_eq!(scalar.bound, "ldst");
         let vector = predict(&machine, &scheduled(256, "vectorize(1, j)")).expect("predicts");
-        let expected = 46.9387 * 3.0 / m;
+        let expected = 46.9387 * 2.0 / 2.015625;
         assert!((vector.gflops - expected).abs() < 1e-9, "{}", vector.gflops);
+        assert_eq!(vector.bound, "load");
         let other = Machine {
             mem_acc_scalar_gflops: 1.0,
             ..machine
         };
         let again = predict(&other, &scheduled(256, "vectorize(1, j)")).expect("predicts");
         assert_eq!(again.gflops, vector.gflops);
+    }
+
+    /// Only the load and store ceilings can bind: FMA peak 1000, fast caches, no latency ceiling.
+    fn ports_only(mem_acc_gflops: f64, store_gflops: f64) -> Machine {
+        Machine {
+            peak_gflops: 1000.0,
+            mem_acc_gflops,
+            store_gflops,
+            ..without_latency(fast_caches())
+        }
+    }
+
+    const C_ROW_ACROSS_KI: &str = "split(1, i, io, ii, 16); split(1, j, jo, ji, 64); \
+         split(1, k, ko, ki, 32); reorder(1, io, jo, ko, ii, ki, ji); vectorize(1, ji)";
+
+    fn loads_stores(n: usize, text: &str) -> (f64, f64) {
+        let kernel = scheduled(n, text);
+        loads_stores_per_fma(update_nest(&kernel), Machine::assumed_m5().lanes).expect("counts")
+    }
+
+    /// Loads and stores per vector FMA, hand counts (the ones of the `mem_ops` tests, split):
+    /// - naive `i, k, j`, N = 256: C, B per FMA and A once per `j` loop (64 vectors): 2 + 1/64
+    ///   loads; the C store: 1.
+    /// - `tiled+vectorize`, N = 64: per `k` and `ii` (16 FMAs) C 16, A 1 and B 16 / 32 loads (B
+    ///   is held across `ii`): 17.5 / 16; C 16 stores: 1.
+    /// - `C_ROW_ACROSS_KI`, N = 128: per `ii` (16 * 32 = 512 FMAs) C 16 loads and 16 stores
+    ///   (held across `ki`), A 32, B 32 * 16: loads (16 + 32 + 512) / 512, stores 16 / 512.
+    #[test]
+    fn loads_and_stores_are_counted_apart_and_add_up_to_the_memory_ops() {
+        assert_eq!(loads_stores(256, "vectorize(1, j)"), (2.015625, 1.0));
+        assert_eq!(
+            loads_stores(64, &format!("{TILED}; vectorize(1, ji)")),
+            (1.09375, 1.0)
+        );
+        assert_eq!(loads_stores(128, C_ROW_ACROSS_KI), (1.09375, 0.03125));
+        for (n, text) in [
+            (256, "vectorize(1, j)"),
+            (64, C_ROW_ACROSS_KI),
+            (128, C_ROW_ACROSS_KI),
+            (64, ""),
+        ] {
+            let (loads, stores) = loads_stores(n, text);
+            assert_eq!(loads + stores, mem_ops(n, text), "{text}");
+        }
+        let p = predict_schedule(&Machine::assumed_m5(), 128, C_ROW_ACROSS_KI).expect("predicts");
+        assert_eq!(
+            (p.loads_per_fma, p.stores_per_fma, p.mem_ops_per_fma),
+            (1.09375, 0.03125, 1.125)
+        );
+    }
+
+    /// A `C` row held across `ki` (`C_ROW_ACROSS_KI`, N = 128: loads 1.09375, stores 0.03125 per
+    /// FMA) is nearly all loads. With mem_acc 46 and store 58: load ceiling 46 * 2 / 1.09375 =
+    /// 84.11, store ceiling 58 / 0.03125 = 1856. One pool (v1.3) said 46 * 3 / 1.125 = 122.7, a
+    /// factor 1.46 more: stores do not take load slots.
+    #[test]
+    fn a_c_row_held_across_ki_is_load_bound() {
+        let p = predict_schedule(&ports_only(46.0, 58.0), 128, C_ROW_ACROSS_KI).expect("predicts");
+        assert_eq!(p.bound, "load");
+        assert!((p.gflops - 92.0 / 1.09375).abs() < 1e-9, "{}", p.gflops);
+        let pooled = 46.0 * 3.0 / 1.125;
+        assert!(p.gflops * 1.4 < pooled, "{} vs {pooled}", p.gflops);
+    }
+
+    /// `tiled+vectorize` at N = 64 (loads 1.09375, stores 1 per FMA) with mem_acc 60: load
+    /// ceiling 60 * 2 / 1.09375 = 109.71; with store 58 the store ceiling 58 / 1 binds. A store
+    /// of 200 takes it out and the load ceiling shows.
+    #[test]
+    fn tiled_vectorized_is_store_bound_until_the_store_is_fast() {
+        let text = format!("{TILED}; vectorize(1, ji)");
+        let slow = predict_schedule(&ports_only(60.0, 58.0), 64, &text).expect("predicts");
+        assert_eq!(slow.bound, "store");
+        assert!((slow.gflops - 58.0).abs() < 1e-9, "{}", slow.gflops);
+        let fast = predict_schedule(&ports_only(60.0, 200.0), 64, &text).expect("predicts");
+        assert_eq!(fast.bound, "load");
+        assert!(
+            (fast.gflops - 120.0 / 1.09375).abs() < 1e-9,
+            "{}",
+            fast.gflops
+        );
+    }
+
+    /// `fma_store_gflops` of the peak line replaces the placeholder 58 (and the note stops
+    /// calling it one); without it the placeholder stays and the note and the header say so.
+    #[test]
+    fn store_gflops_is_read_from_the_peak_line_or_stays_the_placeholder() {
+        let measured = r#"{"kind":"peak","fma_gflops":{"median":100.5,"n":30},"triad_gbs":{"median":90.25,"n":30},"fma_store_gflops":{"median":55.5,"n":30},"triad_l2_gbs":{"median":110.0,"n":30}}"#;
+        let missing = measured.replace("fma_store_gflops", "x");
+        let (with, _, _) = machine_from_results(measured).expect("parses");
+        let (without, _, _) = machine_from_results(&missing).expect("parses");
+        assert_eq!(PLACEHOLDER_STORE_GFLOPS, 58.0);
+        assert_eq!((with.store_gflops, without.store_gflops), (55.5, 58.0));
+        assert!(store_measured(measured) && !store_measured(&missing));
+        let note = from_note("f", true, true, store_measured(measured), (true, true));
+        assert!(!note.contains("PLACEHOLDER"), "{note}");
+        let note = from_note("f", true, true, store_measured(&missing), (true, true));
+        assert!(note.contains("store 58 is a PLACEHOLDER"), "{note}");
+        assert!(report(8, &with, &note, &[]).contains("store 55.5 GFLOP/s"));
+        // The prediction follows it: tiled+vectorize is store-bound.
+        let text = format!("{TILED}; vectorize(1, ji)");
+        let gflops = |machine: Machine| {
+            let machine = Machine {
+                mem_gbs: 1e6,
+                l2_gbs: 1e6,
+                ..machine
+            };
+            predict_schedule(&machine, 64, &text)
+                .expect("predicts")
+                .gflops
+        };
+        assert!((gflops(with) - 55.5).abs() < 1e-9);
+        assert!((gflops(without) - 58.0).abs() < 1e-9);
     }
 
     /// With peak 40 the FMA ceilings are 40 (vectorized) and 40 / 4 = 10 (scalar), below the
@@ -2171,7 +2390,7 @@ mod tests {
             (2.5, 3.5)
         );
         assert!((machine.window_fmas() - 102.4).abs() < 1e-9);
-        let note = from_note("f", true, true, chain_measured(line));
+        let note = from_note("f", true, true, true, chain_measured(line));
         assert!(!note.contains("fma_chain"), "{note}");
         let line = line.replace("fma_chain256_gflops", "x");
         let (placeholder, _, _) = machine_from_results(&line).expect("parses");
@@ -2182,7 +2401,7 @@ mod tests {
             ),
             (2.5, PLACEHOLDER_FMA_CHAIN256_GFLOPS)
         );
-        let note = from_note("f", true, true, chain_measured(&line));
+        let note = from_note("f", true, true, true, chain_measured(&line));
         assert!(note.contains("fma_chain256 is a PLACEHOLDER"), "{note}");
         assert!(!note.contains("fma_chain is a PLACEHOLDER"), "{note}");
         let header = report(8, &placeholder, &note, &[]);
@@ -2202,9 +2421,12 @@ mod tests {
         "/../../bench/results/2026-10-18-4928ffa.jsonl"
     );
 
-    /// The S3 machine (mem_acc 31.1262 is from the old, loop-overhead-bound kernel), N = 256:
-    /// the 6 register tiles are the top 6 of the space; the next schedule has no unroll. The
-    /// 4x16 tile at N = 128 is bound by the FMA peak, not by loads and stores.
+    /// The S3 machine (mem_acc 31.1262 is from the old, loop-overhead-bound kernel, so the load
+    /// ceiling is low), N = 256: the 5 register tiles with the fewest loads per FMA are the top 5
+    /// of the space (v1.3 pooled loads and stores and had the 3 with 16 accumulators first, the
+    /// two with 8 behind the best non-unrolled schedules, latency-bound); the next schedule has
+    /// no unroll. The 4x16 tile at N = 128 has 0.5078 loads per FMA: load-bound at 31.1262 * 2 /
+    /// 0.5078 = 122.6, just below the FMA peak 129.2.
     #[test]
     fn register_tiles_rank_first_on_the_s3_machine() {
         let text = std::fs::read_to_string(S3).expect("the S3 file");
@@ -2215,12 +2437,10 @@ mod tests {
         // No scalar field: the scalar point stays the vector one over lanes, as before.
         assert_eq!(machine.mem_acc_scalar_gflops, 31.1262 / 4.0);
         let ranked = rank_matmul(&machine, 256).expect("ranks");
-        // The register tiles with at least 16 vector accumulators rank first (4x16, 8x8,
-        // 2x32). The ones with 8 (2x16, 4x8) are latency-bound: with the placeholder chain
-        // points 2.6 * (8 + W / 256) * 4 = 86.8 GFLOP/s, just below the best non-unrolled
-        // schedules (87.2).
-        assert!(ranked[..3].iter().all(|r| r.schedule.contains("unroll(")));
-        assert!(!ranked[3].schedule.contains("unroll("));
+        // The register tiles rank first: 4x16, 8x8, 2x32 (16 vector accumulators) and 2x16, 4x8
+        // (8 accumulators: the latency ceiling 86.8 is above their load ceiling).
+        assert!(ranked[..5].iter().all(|r| r.schedule.contains("unroll(")));
+        assert!(!ranked[5].schedule.contains("unroll("));
         let two_by_sixteen = ranked
             .iter()
             .find(|r| {
@@ -2228,17 +2448,14 @@ mod tests {
                     .contains("split(1, i, io, ii, 2); split(1, j, jo, ji, 16)")
             })
             .expect("the 2x16 tile is in the space");
-        assert_eq!(two_by_sixteen.prediction.bound, "latency");
+        assert_eq!(two_by_sixteen.prediction.bound, "load");
         let tile = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
                     reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); unroll(1, ji)";
         let p = predict_schedule(&machine, 128, tile).expect("predicts");
-        // flops / (flops / peak) rounds twice: a few ulp, far below 1e-9 relative.
-        assert!(
-            (p.gflops / machine.peak_gflops - 1.0).abs() < 1e-9,
-            "{}",
-            p.gflops
-        );
-        assert_eq!(p.bound, "compute");
+        // loads per tile: A 4 + B 4 per k, C 16: (8 * 128 + 16) / (16 * 128) = 0.5078125.
+        let want = 31.1262 * 2.0 / 0.5078125;
+        assert!((p.gflops / want - 1.0).abs() < 1e-9, "{}", p.gflops);
+        assert_eq!(p.bound, "load");
     }
 
     /// The peak line of the committed S2 file has no `fma_mem_acc_gflops`.
@@ -2290,9 +2507,9 @@ mod tests {
             (61.5, 8.5632)
         );
         assert!(mem_acc_measured && scalar_measured);
-        let note = from_note("f", mem_acc_measured, scalar_measured, (true, true));
+        let note = from_note("f", mem_acc_measured, scalar_measured, true, (true, true));
         assert!(!note.contains("PLACEHOLDER"), "{note}");
-        let note = from_note("f", true, false, (true, true));
+        let note = from_note("f", true, false, true, (true, true));
         assert!(note.contains("mem_acc_scalar is a PLACEHOLDER"), "{note}");
         // The report header carries the scalar point.
         let header = report(8, &machine, &note, &[]);
@@ -2338,9 +2555,11 @@ mod tests {
         assert!(report.contains("skipped: 2 matmul records flagged drift; 15 records"));
         assert!(report.contains("PLACEHOLDER"), "{report}");
         assert!(report.contains("Spearman rank correlation 0."), "{report}");
-        let rows = report
-            .lines()
-            .filter(|l| l.contains("ldst") || l.contains("l2"));
+        // The bound is the fifth column of a row.
+        let rows = report.lines().filter(|l| {
+            let bound = l.split_whitespace().nth(4);
+            bound.is_some_and(|b| ["ldst", "load", "store", "l2"].contains(&b))
+        });
         assert_eq!(rows.count(), 13, "{report}");
     }
 
@@ -2369,7 +2588,9 @@ mod tests {
     }
 
     /// #64's numbers from one call: the 1000 random records of run 3 on the P3 peak line give
-    /// Spearman 0.853 and the group errors ×1.49 / ×1.42 / ×0.73 (medians of pred / meas).
+    /// Spearman 0.853 and the group errors ×1.19 / ×1.42 / ×0.73 (medians of pred / meas). v1.3
+    /// had ×1.495 for `vectorized ji = 32/64`; the separate load and store ceilings (v1.4) bring
+    /// it into [0.83; 1.20]. The other two groups are scalar code and unchanged.
     #[test]
     fn compare_by_group_reproduces_the_run_3_numbers_of_64() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/results/");
@@ -2391,7 +2612,7 @@ mod tests {
             "{report}"
         );
         for (group, n, error) in [
-            ("vectorized ji = 32/64", 106, "1.495"),
+            ("vectorized ji = 32/64", 106, "1.193"),
             ("scalar, ii innermost", 263, "1.416"),
             ("\"vectorized\" ji <= 16 (scalar code)", 100, "0.734"),
         ] {
@@ -2431,9 +2652,11 @@ mod tests {
     /// unrolls a loop the schedule did not unroll. Predictions on `Machine::assumed_m5`.
     /// Without the rule (`fully_unrolled` = only the schedule's unrolls) the model predicts
     /// 100 / 82.3 / 71.9 / 100 GFLOP/s for these rows and this test fails; the run-3 medians
-    /// are 23.3 / 26.7 / 9.7 / 19.9.
+    /// are 23.3 / 26.7 / 9.7 / 19.9. The two vectorized rows have loads 2.0625 per FMA and 1
+    /// store: the load ceiling is 60 * 2 / 2.0625 = 58.18, the store ceiling 58 binds (v1.3, one
+    /// pool: 60 * 3 / 3.0625 = 58.78).
     #[test]
-    fn run_3_schedules_with_a_full_unroll_keep_their_v1_3_predictions() {
+    fn run_3_schedules_with_a_full_unroll_keep_their_unroll_rule() {
         let machine = Machine::assumed_m5();
         // (schedule, loops clang unrolls, mem ops per FMA, GFLOP/s, bound)
         let rows: [(&str, &[&str], f64, f64, &str); 4] = [
@@ -2442,16 +2665,16 @@ mod tests {
                  reorder(1, io, ko, jo, ii, ki, ji); vectorize(1, ji)",
                 &["ki"],
                 3.0625,
-                58.77551020408164,
-                "ldst",
+                58.0,
+                "store",
             ),
             (
                 "split(1, i, io, ii, 8); split(1, j, jo, ji, 64); reorder(1, io, jo, k, ii, ji); \
                  vectorize(1, ji)",
                 &["ii"],
                 3.0625,
-                58.77551020408164,
-                "ldst",
+                58.0,
+                "store",
             ),
             (
                 "split(1, j, jo, ji, 8); reorder(1, k, jo, i, ji); vectorize(1, ji)",
