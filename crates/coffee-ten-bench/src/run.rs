@@ -8,6 +8,7 @@ use coffee_ten_codegen_c::{BENCH_FLAGS, CompiledKernel, compile_with_flags};
 use coffee_ten_ir::{BinaryOp, Graph, Shape, UnaryOp};
 use coffee_ten_loop::{Kernel, OrderClass, Schedule, apply_classified, lower};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// u = 2^-24, the unit roundoff of f32.
@@ -129,11 +130,14 @@ fn build_kernel(kind: KernelKind, n: usize) -> Result<Kernel, BenchError> {
     lower(&g, output, "bench_kernel").map_err(|e| BenchError::Setup(format!("cannot lower: {e}")))
 }
 
-/// A variant ready to time: compiled, with its own buffers.
-struct Variant {
+/// A variant ready to time: compiled, with its own buffers. `Reference::build` frees the
+/// buffers after the check and `Reference::time` makes them again, so many built variants
+/// do not hold many matrices.
+pub struct Variant {
     text: String,
     schedule: Schedule,
     order_class: OrderClass,
+    kernel: Kernel,
     compiled: CompiledKernel,
     storage: Vec<Vec<f32>>,
 }
@@ -169,12 +173,14 @@ fn make_variant(
         apply_classified(naive, schedule).map_err(|e| setup("cannot apply schedule", &e))?;
     let compiled = compile_with_flags(&kernel, &cache_dir(), BENCH_FLAGS)
         .map_err(|e| setup("cannot compile", &e))?;
+    let storage = inputs.storage(&kernel);
     Ok(Variant {
         text: text.to_string(),
         schedule: schedule.clone(),
         order_class,
+        kernel,
         compiled,
-        storage: inputs.storage(&kernel),
+        storage,
     })
 }
 
@@ -204,6 +210,28 @@ fn time_sample(
 pub const WARMUP_MS: u64 = 300;
 /// The warm-up of a `--quick` run, which is not a measurement.
 pub const QUICK_WARMUP_MS: u64 = 5;
+/// The warm-up of a `search` candidate that is timed right after another one, so the thread has
+/// not been idle and the CPU is at its steady rate. Measured on an Apple M5 with `n = 256`
+/// (78 cached candidates in 2 runs): the first call of a newly loaded library ran at 0.95-1.05
+/// of its rate 80-150 ms later in 85% of the cases, and no slow ramp was seen; the others were
+/// single calls disturbed by other load. So it only has to make a call or two: one sample long.
+/// The first candidate of a timing phase has `WARMUP_MS`: after the parallel compilation the
+/// thread was idle, and its rate went from 9 to 29 GFLOP/s over 150 ms.
+pub const CANDIDATE_WARMUP_MS: u64 = 10;
+
+/// `WARMUP_MS`, or `QUICK_WARMUP_MS` for a `--quick` run.
+pub fn full_warmup(quick: bool) -> Duration {
+    Duration::from_millis(if quick { QUICK_WARMUP_MS } else { WARMUP_MS })
+}
+
+/// `CANDIDATE_WARMUP_MS`, or `QUICK_WARMUP_MS` for a `--quick` run.
+pub fn candidate_warmup(quick: bool) -> Duration {
+    Duration::from_millis(if quick {
+        QUICK_WARMUP_MS
+    } else {
+        CANDIDATE_WARMUP_MS
+    })
+}
 
 /// Calls `call` until `elapsed` (time since the warm-up began) reaches `warmup`; at least one
 /// call. Returns the number of calls.
@@ -367,69 +395,156 @@ pub fn record_json(record: &Record, metadata: &Metadata) -> String {
 /// Builds the naive kernel and every variant, checks each variant's output against the naive
 /// one, then times them. One record per variant, in `config.variants` order.
 pub fn run(config: &Config) -> Result<Vec<Record>, BenchError> {
-    let n = config.n;
-    let naive_kernel = build_kernel(config.kernel, n)?;
-    let info = RunInfo {
-        kernel: config.kernel.name(),
-        n,
-        graph_hash: fnv1a_64(naive_kernel.to_string().as_bytes()),
-        quick: config.quick,
-    };
-    let inputs = Inputs::new(n, config.seed);
-    let with_bias = config.kernel == KernelKind::ReluMatmulBias;
-    let scales = inputs.bound_scales(n, with_bias);
-
-    let mut reference = make_variant(&naive_kernel, "", &Schedule::default(), &inputs)?;
-    reference.run_once()?;
-
+    let reference = Reference::new(config)?;
     let mut variants = Vec::new();
     for (text, schedule) in &config.variants {
-        let mut variant = make_variant(&naive_kernel, text, schedule, &inputs)?;
-        variant.run_once()?;
-        check_outputs(text, variant.output(), reference.output(), &scales, n)?;
-        variants.push(variant);
+        variants.push(reference.build(text, schedule)?);
+    }
+    reference.time(config, &mut variants, full_warmup(config.quick))
+}
+
+/// What variants are checked against and timed with: the seeded inputs and the naive kernel's
+/// output, computed once per run (`config.variants` is not used).
+pub struct Reference {
+    naive_kernel: Kernel,
+    info: RunInfo,
+    inputs: Inputs,
+    scales: Vec<f64>,
+    output: Vec<f32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many references this thread has built; a test reads it.
+    pub(crate) static REFERENCES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Reference {
+    /// Builds the naive kernel, runs it once and keeps its output.
+    pub fn new(config: &Config) -> Result<Reference, BenchError> {
+        let n = config.n;
+        let naive_kernel = build_kernel(config.kernel, n)?;
+        let info = RunInfo {
+            kernel: config.kernel.name(),
+            n,
+            graph_hash: fnv1a_64(naive_kernel.to_string().as_bytes()),
+            quick: config.quick,
+        };
+        let inputs = Inputs::new(n, config.seed);
+        let with_bias = config.kernel == KernelKind::ReluMatmulBias;
+        let scales = inputs.bound_scales(n, with_bias);
+        let mut naive = make_variant(&naive_kernel, "", &Schedule::default(), &inputs)?;
+        naive.run_once()?;
+        #[cfg(test)]
+        REFERENCES_BUILT.with(|built| built.set(built.get() + 1));
+        Ok(Reference {
+            naive_kernel,
+            info,
+            inputs,
+            scales,
+            output: naive.output().to_vec(),
+        })
     }
 
-    let flop_per_call = 2.0 * (n as f64).powi(3);
-    let min_sample = Duration::from_millis(config.min_sample_ms);
-    let mut rng = Rng::new(config.seed);
-    let mut order: Vec<usize> = (0..variants.len()).collect();
-    let mut rates: Vec<Vec<f64>> = vec![Vec::with_capacity(config.samples); variants.len()];
-    // After the thread has been idle (waiting for clang, a pause) a kernel runs slow for ~100 ms
-    // (see `WARMUP_MS`): every variant warms up in the interleaved order before round 1, and the
-    // warm-up is not recorded.
-    let warmup = Duration::from_millis(if config.quick {
-        QUICK_WARMUP_MS
-    } else {
-        WARMUP_MS
-    });
-    rng.shuffle(&mut order);
-    for &index in &order {
-        let start = Instant::now();
-        warm_up(warmup, || variants[index].run_once(), || start.elapsed())?;
+    /// Compiles `schedule` and checks its output against the naive one. The buffers are freed.
+    pub fn build(&self, text: &str, schedule: &Schedule) -> Result<Variant, BenchError> {
+        let mut variant = make_variant(&self.naive_kernel, text, schedule, &self.inputs)?;
+        variant.run_once()?;
+        let n = self.info.n;
+        check_outputs(text, variant.output(), &self.output, &self.scales, n)?;
+        variant.storage = Vec::new();
+        Ok(variant)
     }
-    for _ in 0..config.samples {
+
+    /// `build` of each variant on all cores; one result per variant, in the order given.
+    pub fn build_all(&self, variants: &[(String, Schedule)]) -> Vec<Result<Variant, BenchError>> {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        parallel_map(variants, cores, |(text, schedule)| {
+            self.build(text, schedule)
+        })
+    }
+
+    /// Warms every variant up for `warmup` in a random order, then takes `config.samples`
+    /// rounds of one sample per variant in random order. One record per variant, in the order
+    /// given.
+    pub fn time(
+        &self,
+        config: &Config,
+        variants: &mut [Variant],
+        warmup: Duration,
+    ) -> Result<Vec<Record>, BenchError> {
+        for variant in variants.iter_mut() {
+            variant.storage = self.inputs.storage(&variant.kernel);
+        }
+        let flop_per_call = 2.0 * (self.info.n as f64).powi(3);
+        let min_sample = Duration::from_millis(config.min_sample_ms);
+        let mut rng = Rng::new(config.seed);
+        let mut order: Vec<usize> = (0..variants.len()).collect();
+        let mut rates: Vec<Vec<f64>> = vec![Vec::with_capacity(config.samples); variants.len()];
+        // After the thread has been idle (waiting for clang, a pause) a kernel runs slow for
+        // ~100 ms (see `WARMUP_MS`): every variant warms up in the interleaved order before
+        // round 1, and the warm-up is not recorded.
         rng.shuffle(&mut order);
         for &index in &order {
-            let rate = time_sample(&mut variants[index], flop_per_call, min_sample)?;
-            rates[index].push(rate);
+            let start = Instant::now();
+            warm_up(warmup, || variants[index].run_once(), || start.elapsed())?;
         }
-    }
+        for _ in 0..config.samples {
+            rng.shuffle(&mut order);
+            for &index in &order {
+                let rate = time_sample(&mut variants[index], flop_per_call, min_sample)?;
+                rates[index].push(rate);
+            }
+        }
 
-    variants
-        .iter()
-        .zip(&rates)
-        .map(|(variant, rates)| {
-            make_record(
-                &info,
-                &variant.text,
-                &variant.schedule,
-                variant.order_class,
-                rates,
-            )
-            .ok_or_else(|| BenchError::Setup("no samples".to_string()))
-        })
-        .collect()
+        variants
+            .iter()
+            .zip(&rates)
+            .map(|(variant, rates)| {
+                make_record(
+                    &self.info,
+                    &variant.text,
+                    &variant.schedule,
+                    variant.order_class,
+                    rates,
+                )
+                .ok_or_else(|| BenchError::Setup("no samples".to_string()))
+            })
+            .collect()
+    }
+}
+
+/// `f` of every item on `threads` threads (at least one); results in the order of `items`.
+fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let worker = || {
+        let mut done = Vec::new();
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(item) = items.get(index) else {
+                return done;
+            };
+            done.push((index, f(item)));
+        }
+    };
+    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads.clamp(1, items.len().max(1)))
+            .map(|_| scope.spawn(worker))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| {
+                w.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    done.sort_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, result)| result).collect()
 }
 
 #[cfg(test)]
@@ -610,6 +725,66 @@ mod tests {
         assert_eq!(
             record_json(&record, &metadata),
             r#"{"kernel":"matmul","n":256,"graph_hash":"0123456789abcdef","schedule":"split(1, j, jo, ji, 8)","order_class":"preserving","verified":true,"quick":false,"samples":30,"median":12.5,"p25":12,"p75":13,"min":11.25,"drift":false,"unit":"GFLOP/s","seed":1,"commit":"abc1234","dirty":false,"clang":"Apple clang 17","flags":"-std=c99 -O2","machine":"Mac16,1","cpu":"Apple M4","os":"27.0","date":"2026-10-11T00:00:00Z"}"#
+        );
+    }
+
+    #[test]
+    fn parallel_map_keeps_the_order_and_uses_several_threads() {
+        // Item i sleeps (8 - i) * 5 ms, so with 4 threads the later items finish first.
+        let items: Vec<u64> = (0..8).collect();
+        let out = parallel_map(&items, 4, |&i| {
+            std::thread::sleep(Duration::from_millis((8 - i) * 5));
+            (i * i, std::thread::current().id())
+        });
+        let squares: Vec<u64> = out.iter().map(|(square, _)| *square).collect();
+        assert_eq!(squares, [0, 1, 4, 9, 16, 25, 36, 49]);
+        let threads: std::collections::HashSet<_> = out.iter().map(|(_, id)| *id).collect();
+        assert!(threads.len() > 1, "{} thread(s)", threads.len());
+        // No threads asked for still runs everything, and nothing to do gives nothing.
+        assert_eq!(parallel_map(&items, 0, |&i| i), items);
+        assert_eq!(parallel_map(&[] as &[u64], 4, |&i| i), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn build_all_gives_one_result_per_variant_in_order_and_errors_as_build_does() {
+        let config = Config {
+            kernel: KernelKind::Matmul,
+            n: 8,
+            variants: Vec::new(),
+            samples: 1,
+            min_sample_ms: 1,
+            seed: 1,
+            quick: true,
+            log: None,
+        };
+        let reference = Reference::new(&config).unwrap();
+        let parse = |text: &str| (text.to_string(), Schedule::parse(text).unwrap());
+        let texts = [
+            "",
+            "vectorize(1, nope)",
+            "vectorize(1, j)",
+            "split(1, j, jo, ji, 4)",
+        ];
+        let variants: Vec<_> = texts.iter().map(|text| parse(text)).collect();
+        let built = reference.build_all(&variants);
+        assert_eq!(built.len(), 4);
+        for ((text, schedule), result) in variants.iter().zip(&built) {
+            match (result, reference.build(text, schedule)) {
+                (Ok(got), Ok(want)) => {
+                    assert_eq!(got.text, *text);
+                    assert_eq!(got.text, want.text);
+                    assert!(got.storage.is_empty(), "the buffers are made when timing");
+                }
+                (Err(got), Err(want)) => {
+                    assert_eq!(*got, want);
+                    assert!(got.to_string().contains("cannot apply schedule"), "{got}");
+                }
+                (got, want) => panic!("{text:?}: {:?} against {:?}", got.is_ok(), want.is_ok()),
+            }
+        }
+        assert_eq!(
+            built.iter().map(Result::is_ok).collect::<Vec<_>>(),
+            [true, false, true, true]
         );
     }
 
