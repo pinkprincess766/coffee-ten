@@ -1,6 +1,7 @@
 /*
  * peak: single-thread f32 peak FLOP/s (FMA loop), FMA rate with the accumulator
- * in memory (vector and scalar), the latency-bound rate of one dependent scalar FMA
+ * in memory (vector and scalar), FMA rate with every result stored and nothing
+ * loaded, the latency-bound rate of one dependent scalar FMA
  * chain and of independent chains of length 256, single-thread memory bandwidth and
  * L2 bandwidth (STREAM triad).
  * See README.md.
@@ -154,6 +155,31 @@ __attribute__((noinline)) static void fma_mem_acc_pass(float a, const v4f *restr
 }
 
 /*
+ * One pass of the store-only kernel: every vector FMA result is stored, nothing is
+ * loaded (the loop body has no ldr). Four vectors per iteration, as fma_mem_acc_pass.
+ * c[j + q] = fma(a, s, y_q) with y_q = q, and s = x, x + a, x + 2a, ... advanced by one
+ * fadd per iteration. The common operand s changes every iteration, so no FMA is loop
+ * invariant: with a fixed s the compiler computes three of the four once outside the
+ * loop and the loop only stores. The four FMAs are independent of each other; the only
+ * chain is the fadd on s, shorter than the iteration. x changes from pass to pass.
+ */
+__attribute__((noinline)) static void fma_store_pass(float a, float x, v4f *restrict c) {
+    v4f va = {a, a, a, a};
+    v4f s = {x, x, x, x};
+    const v4f y0 = {0.0f, 0.0f, 0.0f, 0.0f};
+    const v4f y1 = {1.0f, 1.0f, 1.0f, 1.0f};
+    const v4f y2 = {2.0f, 2.0f, 2.0f, 2.0f};
+    const v4f y3 = {3.0f, 3.0f, 3.0f, 3.0f};
+    for (long j = 0; j < MEM_ACC_N / 4; j += 4) {
+        c[j] = __builtin_elementwise_fma(va, s, y0);
+        c[j + 1] = __builtin_elementwise_fma(va, s, y1);
+        c[j + 2] = __builtin_elementwise_fma(va, s, y2);
+        c[j + 3] = __builtin_elementwise_fma(va, s, y3);
+        s += va;
+    }
+}
+
+/*
  * Scalar twin of fma_mem_acc_pass: per element, load b, load c, fmaf, store c,
  * one float per iteration. That is the shape clang gives the inner loop of the
  * naive matmul under the benchmark flags (ldr s, ldr s, fmadd s, str s, add,
@@ -205,6 +231,10 @@ static double fma_flop_per_call(void) {
 }
 
 static double fma_mem_acc_flop_per_pass(void) {
+    return 2.0 * MEM_ACC_N;
+}
+
+static double fma_store_flop_per_pass(void) {
     return 2.0 * MEM_ACC_N;
 }
 
@@ -267,6 +297,22 @@ static double fma_mem_acc_scalar_sample(float a, const float *b, float *c) {
     } while (t1 - t0 < MIN_SAMPLE_NS);
     g_sink += c[0];
     return (double)passes * fma_mem_acc_flop_per_pass() / (double)(t1 - t0);
+}
+
+/* Returns GFLOP/s (FLOP per ns). x = b + p differs from pass to pass. */
+static double fma_store_sample(float a, float b, v4f *c) {
+    long long t0 = now_ns();
+    long long t1;
+    long passes = 0;
+    do {
+        for (int p = 0; p < MEM_ACC_BATCH; p++) {
+            fma_store_pass(a, b + (float)p, c);
+        }
+        passes += MEM_ACC_BATCH;
+        t1 = now_ns();
+    } while (t1 - t0 < MIN_SAMPLE_NS);
+    g_sink += c[0][0] + c[MEM_ACC_N / 4 - 1][0];
+    return (double)passes * fma_store_flop_per_pass() / (double)(t1 - t0);
 }
 
 /* Returns GFLOP/s (FLOP per ns). */
@@ -428,6 +474,32 @@ static int run_check(float a, float b) {
         }
     }
 
+    /*
+     * Store-only kernel vs a plain C loop with fmaf, same operation order (s += a per
+     * iteration, y_q = q). a = 1, b = 0.5, x = b + p: every value is a multiple of 0.5
+     * below 2^24, so the results are exact; compared bit for bit, every pass.
+     */
+    v4f st_c[MEM_ACC_N / 4];
+    for (int p = 0; p < 3; p++) {
+        float st_x = b + (float)p;
+        fma_store_pass(a, st_x, st_c);
+        float st_s = st_x;
+        for (int j = 0; j < MEM_ACC_N / 4; j += 4) {
+            for (int q = 0; q < 4; q++) {
+                float want = __builtin_fmaf(a, st_s, (float)q);
+                for (int l = 0; l < 4; l++) {
+                    float got = st_c[j + q][l];
+                    if (memcmp(&got, &want, sizeof got) != 0) {
+                        printf("check FAILED: fma_store pass %d vec %d lane %d: got %.9g, want %.9g\n",
+                               p, j + q, l, (double)got, (double)want);
+                        return 1;
+                    }
+                }
+            }
+            st_s = st_s + a;
+        }
+    }
+
     /* Dependent chain vs a plain loop of the same recurrence; benchmark constants, so every step rounds. */
     float chain_a = 1.0f * CHAIN_A_SCALE;
     float chain_b = 0.5f * CHAIN_B_SCALE;
@@ -487,6 +559,7 @@ static double g_triad_rate[SAMPLES];
 static double g_triad_l2_rate[SAMPLES];
 static double g_mem_acc_rate[SAMPLES];
 static double g_mem_acc_scalar_rate[SAMPLES];
+static double g_fma_store_rate[SAMPLES];
 static double g_chain_rate[SAMPLES];
 static double g_chain256_rate[SAMPLES];
 
@@ -516,6 +589,20 @@ static void run_mem_acc_scalar(float a, int samples, int warmup, double *rate) {
     }
     for (int s = 0; s < warmup + samples; s++) {
         double r = fma_mem_acc_scalar_sample(a, b, c);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+}
+
+/* Fills rate[0..samples-1] with store-only GFLOP/s; a, b from fma_operands. */
+static void run_fma_store(float a, float b, int samples, int warmup, double *rate) {
+    v4f c[MEM_ACC_N / 4];
+    for (int j = 0; j < MEM_ACC_N / 4; j++) {
+        c[j] = (v4f){0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = fma_store_sample(a, b, c);
         if (s >= warmup) {
             rate[s - warmup] = r;
         }
@@ -627,6 +714,7 @@ int main(int argc, char **argv) {
 
     run_mem_acc(a, samples, warmup, g_mem_acc_rate);
     run_mem_acc_scalar(a, samples, warmup, g_mem_acc_scalar_rate);
+    run_fma_store(a, b, samples, warmup, g_fma_store_rate);
     run_chain(a, b, samples, warmup, g_chain_rate);
     if (run_chain256(a, samples, warmup, g_chain256_rate) != 0) {
         return 1;
@@ -641,6 +729,7 @@ int main(int argc, char **argv) {
     stats_t fma = summarize(g_fma_rate, samples);
     stats_t mem_acc = summarize(g_mem_acc_rate, samples);
     stats_t mem_acc_scalar = summarize(g_mem_acc_scalar_rate, samples);
+    stats_t fma_store = summarize(g_fma_store_rate, samples);
     stats_t chain = summarize(g_chain_rate, samples);
     stats_t chain256 = summarize(g_chain256_rate, samples);
     stats_t triad_st = summarize(g_triad_rate, samples);
@@ -649,6 +738,7 @@ int main(int argc, char **argv) {
     print_stats("fma", "GFLOP/s", fma, samples);
     print_stats("mem_acc", "GFLOP/s", mem_acc, samples);
     print_stats("mem_acc_s", "GFLOP/s", mem_acc_scalar, samples);
+    print_stats("fma_store", "GFLOP/s", fma_store, samples);
     print_stats("chain", "GFLOP/s", chain, samples);
     print_stats("chain256", "GFLOP/s", chain256, samples);
     print_stats("triad", "GB/s", triad_st, samples);
@@ -663,7 +753,8 @@ int main(int argc, char **argv) {
            "\"mem_acc_n\":%d,"
            "\"fma_mem_acc_scalar_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"fma_chain_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
-           "\"fma_chain256_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
+           "\"fma_chain256_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
+           "\"fma_store_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
            fma.median, fma.p25, fma.p75, fma.min, samples,
            triad_st.median, triad_st.p25, triad_st.p75, triad_st.min, samples,
            FMA_CHAINS, TRIAD_N,
@@ -674,6 +765,7 @@ int main(int argc, char **argv) {
            mem_acc_scalar.median, mem_acc_scalar.p25, mem_acc_scalar.p75, mem_acc_scalar.min,
            samples,
            chain.median, chain.p25, chain.p75, chain.min, samples,
-           chain256.median, chain256.p25, chain256.p75, chain256.min, samples);
+           chain256.median, chain256.p25, chain256.p75, chain256.min, samples,
+           fma_store.median, fma_store.p25, fma_store.p75, fma_store.min, samples);
     return 0;
 }
