@@ -14,7 +14,7 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 | Code | S1, S2: commit `ffce49d`; S3: commit `4928ffa` (adds `unroll` and row-pointer indexing, #42–#44); clean tree (`"dirty": false` in every record) |
 | Sessions | S1 2026-10-15, 60 s pauses between series; S2 2026-10-16 on a cold Mac, 180 s pauses; S3 2026-10-18 on a cold Mac, 60 s pauses |
 | Method | per (kernel, N): a warm-up (S1–S3 and run 1: one round of one 10 ms sample per variant; from #61: each variant runs 300 ms), then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
-| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58), `bench/results/2026-10-21-hypothesis-a-run2.jsonl` (hypothesis A, run 2, commit `702dcf1`), `bench/results/2026-10-22-hypothesis-a-run3.jsonl` (hypothesis A, run 3, commit `726cc1d`) |
+| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58), `bench/results/2026-10-21-hypothesis-a-run2.jsonl` (hypothesis A, run 2, commit `702dcf1`), `bench/results/2026-10-22-hypothesis-a-run3.jsonl` (hypothesis A, run 3, commit `726cc1d`), `bench/results/2026-10-27-6556e03-peak.jsonl` (P4: `bench/peak` alone, with the store kernel #80) |
 
 Every variant was checked against the naive kernel within the inner-product error bound
 before it was timed.
@@ -45,10 +45,11 @@ which is why the compute ceiling is the one that applies.
 | FMA peak, 16 chains of float32x4 | 122.9 GFLOP/s | 122.0 GFLOP/s | 129.2 GFLOP/s [117.7–130.9] |
 | Memory triad, 3 × 128 MiB | 105.3 GB/s | 107.9 GB/s | 112.1 GB/s |
 | L2 triad, 3 × 1 MiB | 119.6 GB/s | 120.4 GB/s | 128.1 GB/s |
-| FMA with the accumulator in memory (`fma_mem_acc`) | — | — | 31.1 GFLOP/s, old kernel, see below; P1: **46.0** [45.9–46.1]; P2: **46.9** [46.8–47.0] |
-| The same in scalar code (`fma_mem_acc_scalar`) | — | — | P2: **8.56** [8.54–8.58] GFLOP/s; P3: 8.47 [8.44–8.51] |
-| One dependent scalar FMA chain (`fma_chain`) | — | — | P3: **2.605** [2.599–2.612] GFLOP/s (0.77 ns per FMA) |
-| Independent chains of length 256, N = 256 matmul body (`fma_chain256`) | — | — | P3: **3.133** [3.124–3.144] GFLOP/s; overlap window W = 256 × (3.133 / 2.605 − 1) ≈ 52 FMAs |
+| FMA with the accumulator in memory (`fma_mem_acc`) | — | — | 31.1 GFLOP/s, old kernel, see below; P1: **46.0** [45.9–46.1]; P2: **46.9** [46.8–47.0]; P4: 46.3 [45.6–46.8] |
+| The same in scalar code (`fma_mem_acc_scalar`) | — | — | P2: **8.56** [8.54–8.58] GFLOP/s; P3: 8.47 [8.44–8.51]; P4: 8.55 [8.53–8.57] |
+| One dependent scalar FMA chain (`fma_chain`) | — | — | P3: **2.605** [2.599–2.612] GFLOP/s (0.77 ns per FMA); P4: 2.602 [2.598–2.605] |
+| Independent chains of length 256, N = 256 matmul body (`fma_chain256`) | — | — | P3: **3.133** [3.124–3.144] GFLOP/s; overlap window W = 256 × (3.133 / 2.605 − 1) ≈ 52 FMAs; P4: 3.241 [3.238–3.243], W ≈ 63 |
+| Every vector FMA result stored, nothing loaded (`fma_store`) | — | — | P4: **58.50** [58.30–58.61] GFLOP/s |
 
 The S1/S2 roofline columns below are S2's median over S2's FMA peak (122.0 GFLOP/s); the
 register-tile section uses S3's median over S3's peak (129.2 GFLOP/s). Matmul's
