@@ -1,6 +1,6 @@
 /*
  * peak: single-thread f32 peak FLOP/s (FMA loop), FMA rate with the accumulator
- * in memory (vector and scalar), FMA rate with every result stored and nothing
+ * in memory (vector, scalar, and scalar unrolled by 16), FMA rate with every result stored and nothing
  * loaded, the latency-bound rate of one dependent scalar FMA
  * chain and of independent chains of length 256, single-thread memory bandwidth and
  * L2 bandwidth (STREAM triad).
@@ -195,6 +195,39 @@ __attribute__((noinline)) static void fma_mem_acc_scalar_pass(float a, const flo
 }
 
 /*
+ * Keeps the SLP vectorizer from merging straight-line scalar FMAs into fmla.4s. An empty asm
+ * that "modifies" a float makes it an opaque value in a vector-register scalar (no instruction
+ * is emitted), and SLP does not build vectors from asm results. The loop pragmas do not reach
+ * SLP, and clang has no per-function attribute for it; this keeps the build command unchanged.
+ */
+#if defined(__aarch64__)
+#define OPAQUE_F32(x) __asm__("" : "+w"(x))
+#elif defined(__x86_64__)
+#define OPAQUE_F32(x) __asm__("" : "+x"(x))
+#else
+#define OPAQUE_F32(x) ((void)0)
+#endif
+
+/*
+ * Same as fma_mem_acc_scalar_pass with 16 floats per iteration as straight-line scalar code
+ * (16 fmadd, ldp s, stp s per iteration), the shape clang gives a fully unrolled short scalar
+ * loop. OPAQUE_F32 on each result keeps it scalar at -O2.
+ */
+__attribute__((noinline)) static void fma_mem_acc_scalar_unrolled_pass(float a,
+                                                                       const float *restrict b,
+                                                                       float *restrict c) {
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+    for (long j = 0; j < MEM_ACC_N; j += 16) {
+#pragma clang loop unroll(full)
+        for (int q = 0; q < 16; q++) {
+            float r = __builtin_fmaf(a, b[j + q], c[j + q]);
+            OPAQUE_F32(r);
+            c[j + q] = r;
+        }
+    }
+}
+
+/*
  * One endless dependent chain through the addend: x = fma(a, b, x), one fmadd per
  * iteration, each waiting for the previous one. a and b are runtime values, so the
  * loop cannot be folded; noinline keeps it a loop in its own function.
@@ -291,6 +324,22 @@ static double fma_mem_acc_scalar_sample(float a, const float *b, float *c) {
     do {
         for (int p = 0; p < MEM_ACC_BATCH; p++) {
             fma_mem_acc_scalar_pass(a, b, c);
+        }
+        passes += MEM_ACC_BATCH;
+        t1 = now_ns();
+    } while (t1 - t0 < MIN_SAMPLE_NS);
+    g_sink += c[0];
+    return (double)passes * fma_mem_acc_flop_per_pass() / (double)(t1 - t0);
+}
+
+/* Returns GFLOP/s (FLOP per ns). */
+static double fma_mem_acc_scalar_unrolled_sample(float a, const float *b, float *c) {
+    long long t0 = now_ns();
+    long long t1;
+    long passes = 0;
+    do {
+        for (int p = 0; p < MEM_ACC_BATCH; p++) {
+            fma_mem_acc_scalar_unrolled_pass(a, b, c);
         }
         passes += MEM_ACC_BATCH;
         t1 = now_ns();
@@ -475,6 +524,32 @@ static int run_check(float a, float b) {
     }
 
     /*
+     * Unrolled scalar accumulator vs a plain loop with fmaf, bit for bit. The values are
+     * not exact in f32, so every FMA rounds and a different operation order would show.
+     */
+    float un_b[MEM_ACC_N];
+    float un_c[MEM_ACC_N];
+    float un_ref[MEM_ACC_N];
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        un_b[j] = 0.1f * (float)(j % 5 + 1);
+        un_c[j] = (float)j;
+        un_ref[j] = (float)j;
+    }
+    for (int p = 0; p < 3; p++) {
+        fma_mem_acc_scalar_unrolled_pass(0.3f, un_b, un_c);
+        for (int j = 0; j < MEM_ACC_N; j++) {
+            un_ref[j] = __builtin_fmaf(0.3f, un_b[j], un_ref[j]);
+        }
+    }
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        if (memcmp(&un_c[j], &un_ref[j], sizeof un_c[j]) != 0) {
+            printf("check FAILED: mem_acc_scalar_unrolled j=%d: got %.9g, want %.9g\n", j,
+                   (double)un_c[j], (double)un_ref[j]);
+            return 1;
+        }
+    }
+
+    /*
      * Store-only kernel vs a plain C loop with fmaf, same operation order (s += a per
      * iteration, y_q = q). a = 1, b = 0.5, x = b + p: every value is a multiple of 0.5
      * below 2^24, so the results are exact; compared bit for bit, every pass.
@@ -559,6 +634,7 @@ static double g_triad_rate[SAMPLES];
 static double g_triad_l2_rate[SAMPLES];
 static double g_mem_acc_rate[SAMPLES];
 static double g_mem_acc_scalar_rate[SAMPLES];
+static double g_mem_acc_scalar_unrolled_rate[SAMPLES];
 static double g_fma_store_rate[SAMPLES];
 static double g_chain_rate[SAMPLES];
 static double g_chain256_rate[SAMPLES];
@@ -589,6 +665,22 @@ static void run_mem_acc_scalar(float a, int samples, int warmup, double *rate) {
     }
     for (int s = 0; s < warmup + samples; s++) {
         double r = fma_mem_acc_scalar_sample(a, b, c);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+}
+
+/* Fills rate[0..samples-1] with unrolled scalar accumulator-in-memory GFLOP/s; a from fma_operands, b[j] = 0.5. */
+static void run_mem_acc_scalar_unrolled(float a, int samples, int warmup, double *rate) {
+    float b[MEM_ACC_N];
+    float c[MEM_ACC_N];
+    for (int j = 0; j < MEM_ACC_N; j++) {
+        b[j] = 0.5f;
+        c[j] = 0.0f;
+    }
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = fma_mem_acc_scalar_unrolled_sample(a, b, c);
         if (s >= warmup) {
             rate[s - warmup] = r;
         }
@@ -714,6 +806,7 @@ int main(int argc, char **argv) {
 
     run_mem_acc(a, samples, warmup, g_mem_acc_rate);
     run_mem_acc_scalar(a, samples, warmup, g_mem_acc_scalar_rate);
+    run_mem_acc_scalar_unrolled(a, samples, warmup, g_mem_acc_scalar_unrolled_rate);
     run_fma_store(a, b, samples, warmup, g_fma_store_rate);
     run_chain(a, b, samples, warmup, g_chain_rate);
     if (run_chain256(a, samples, warmup, g_chain256_rate) != 0) {
@@ -729,6 +822,8 @@ int main(int argc, char **argv) {
     stats_t fma = summarize(g_fma_rate, samples);
     stats_t mem_acc = summarize(g_mem_acc_rate, samples);
     stats_t mem_acc_scalar = summarize(g_mem_acc_scalar_rate, samples);
+    stats_t mem_acc_scalar_unrolled =
+        summarize(g_mem_acc_scalar_unrolled_rate, samples);
     stats_t fma_store = summarize(g_fma_store_rate, samples);
     stats_t chain = summarize(g_chain_rate, samples);
     stats_t chain256 = summarize(g_chain256_rate, samples);
@@ -738,6 +833,7 @@ int main(int argc, char **argv) {
     print_stats("fma", "GFLOP/s", fma, samples);
     print_stats("mem_acc", "GFLOP/s", mem_acc, samples);
     print_stats("mem_acc_s", "GFLOP/s", mem_acc_scalar, samples);
+    print_stats("mem_acc_su", "GFLOP/s", mem_acc_scalar_unrolled, samples);
     print_stats("fma_store", "GFLOP/s", fma_store, samples);
     print_stats("chain", "GFLOP/s", chain, samples);
     print_stats("chain256", "GFLOP/s", chain256, samples);
@@ -754,7 +850,8 @@ int main(int argc, char **argv) {
            "\"fma_mem_acc_scalar_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"fma_chain_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"fma_chain256_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
-           "\"fma_store_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
+           "\"fma_store_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
+           "\"fma_mem_acc_scalar_unrolled_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
            fma.median, fma.p25, fma.p75, fma.min, samples,
            triad_st.median, triad_st.p25, triad_st.p75, triad_st.min, samples,
            FMA_CHAINS, TRIAD_N,
@@ -766,6 +863,8 @@ int main(int argc, char **argv) {
            samples,
            chain.median, chain.p25, chain.p75, chain.min, samples,
            chain256.median, chain256.p25, chain256.p75, chain256.min, samples,
-           fma_store.median, fma_store.p25, fma_store.p75, fma_store.min, samples);
+           fma_store.median, fma_store.p25, fma_store.p75, fma_store.min, samples,
+           mem_acc_scalar_unrolled.median, mem_acc_scalar_unrolled.p25,
+           mem_acc_scalar_unrolled.p75, mem_acc_scalar_unrolled.min, samples);
     return 0;
 }
