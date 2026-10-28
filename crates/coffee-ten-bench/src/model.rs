@@ -1,8 +1,9 @@
-//! Analytic cost model, version 1.6 (spec §7.1): cache traffic from the loop footprints plus a
+//! Analytic cost model, version 1.7 (spec §7.1): cache traffic from the loop footprints plus a
 //! roofline whose compute ceiling is the lowest of the FMA, the load, the store (vectorized
 //! nests; scalar nests have one combined load/store ceiling) and the latency ceiling (dependent FMA chains of a reduction held in registers, see `latency_gflops`).
-//! v1.6 adds one more scalar ceiling, "reload" (`column_reload`). Deterministic; the machine
-//! numbers are inputs (assumed, or read from a results file).
+//! v1.6 adds one more scalar ceiling, "reload" (`column_reload`), v1.7 another, "colload"
+//! (`column_load_unrolled`). Deterministic; the machine numbers are inputs (assumed, or read from
+//! a results file).
 //!
 //! Only the update nest (nest 1) of a matmul kernel is modelled; the init nest is ignored.
 //! Guards are ignored (the schedule space has none). Loop extents are exact, so the
@@ -161,8 +162,8 @@ pub struct Machine {
     /// nests for which `column_reload` holds.
     pub col_reload_gflops: f64,
     /// GFLOP/s of the `fma_col_unrolled` kernel (scalar, the innermost loop unrolled under a rolled
-    /// one, 17 loads per 16 FMA and no stores, 16 of the loads down a column): the calibration
-    /// point of scalar nests that load a column inside an unrolled loop.
+    /// one, 17 loads per 16 FMA and no stores, 16 of the loads down a column): the ceiling of
+    /// scalar nests for which `column_load_unrolled` holds.
     pub col_unrolled_gflops: f64,
     /// GFLOP/s of vector FMAs that each store one result and load nothing (`STORE_KERNEL_STORES`
     /// store per FMA): the store calibration point of vectorized nests.
@@ -256,8 +257,9 @@ pub struct Prediction {
     /// The roofline term that sets `time_s`: "compute" (FMA issue), "load" or "store" (vectorized
     /// nests: loads per FMA, stores per FMA), "ldst" (scalar nests: loads and stores in one
     /// pool), "reload" (scalar nests that reload a stored column, see `column_reload`),
-    /// "latency" (dependent FMA chains), "memory" or "l2". A tie goes to the first of
-    /// "compute"/"load"/"store"/"ldst"/"reload"/"latency", then "memory".
+    /// "colload" (scalar nests with an unrolled loop that loads a column, see
+    /// `column_load_unrolled`), "latency" (dependent FMA chains), "memory" or "l2". A tie goes to
+    /// the first of "compute"/"load"/"store"/"ldst"/"reload"/"colload"/"latency", then "memory".
     pub bound: &'static str,
     /// Memory ops per FMA op of the nest, see `mem_ops_per_fma`; breaks ties in `order`. The sum
     /// of `loads_per_fma` and `stores_per_fma`.
@@ -563,6 +565,60 @@ fn column_reload(compiled: &LoopNest, buffers: &[Buffer]) -> Result<bool, BenchE
     Ok(stride_bytes != 0 && stride_bytes % COL_RELOAD_STRIDE_BYTES == 0 && !parent_moves_target)
 }
 
+/// Whether `compiled` (a nest as `as_compiled` returns it) is the loop nest of the
+/// `fma_col_unrolled` calibration point: scalar code whose innermost loop is unrolled (by the
+/// schedule or by clang) directly inside a rolled loop, and one load of the body walks a column
+/// of the unrolled loop without being held in registers across the rolled one. All must hold:
+/// - the innermost loop is unrolled and the loop directly outside it is not (`as_compiled`);
+/// - the stored access moves along the innermost loop (nonzero byte stride): every unrolled copy
+///   updates its own element, so the FMAs are independent accumulators and there is no reduction
+///   chain through the unrolled loop (`ki` unrolled under `ji` adds into one `C` and is excluded);
+/// - some distinct load of the stored value, other than the stored access itself, is not held in
+///   registers across that rolled loop (`held_across` is false: it moves with the rolled loop's
+///   variable, like `A[ii, k]` with `ki`, so every iteration of the rolled loop loads it again;
+///   a load that does not move but does not fit `REG_BUDGET` registers is not held either);
+/// - the byte stride of that load along the innermost loop, see `access_stride_bytes`, is nonzero
+///   and a multiple of `COL_RELOAD_STRIDE_BYTES`: the unrolled copies load addresses equal modulo
+///   256 B.
+///
+/// The shapes the conditions exclude have no calibration: a column load of the stored array
+/// itself (`C` loaded and stored down a column, `ii` unrolled under `j` or `ji`) and a column
+/// load that feeds a reduction (`B[k, j]` with `ki` unrolled under `ji`).
+///
+/// Hardware reading (not proven): loads at addresses equal modulo 256 B conflict in L1.
+fn column_load_unrolled(
+    compiled: &LoopNest,
+    buffers: &[Buffer],
+    lanes: usize,
+) -> Result<bool, BenchError> {
+    let [.., parent, inner] = compiled.loops.as_slice() else {
+        return Ok(false);
+    };
+    if !inner.unroll || parent.unroll {
+        return Ok(false);
+    }
+    let target = &compiled.body.target;
+    if access_stride_bytes(target, buffers, &inner.name)? == 0 {
+        return Ok(false);
+    }
+    let parent_pos = compiled.loops.len() - 2;
+    let mut all_loads = Vec::new();
+    loads(&compiled.body.value, &mut all_loads);
+    for load in distinct(all_loads)
+        .into_iter()
+        .filter(|load| *load != target)
+    {
+        let stride_bytes = access_stride_bytes(load, buffers, &inner.name)?;
+        if stride_bytes != 0
+            && stride_bytes % COL_RELOAD_STRIDE_BYTES == 0
+            && !held_across(load, &compiled.loops, lanes)?[parent_pos]
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Vector registers an access needs to hold the elements it touches over the loops `from..`
 /// of `loops`: the distinct values over the loops that are not vectorized, times, if the
 /// vectorized (last) loop is inside, 1 if the access is invariant in it, `extent / lanes`
@@ -790,6 +846,27 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64, f64), BenchError
 /// depend on the extent of `ii` (measured only at 64 in the peak run; run 3 has 32 to 128) or on
 /// what else is in the body; the predicate is not proven, only the hand experiments say it.
 ///
+/// Unrolled column load, v1.7. Scalar nests for which `column_load_unrolled` holds (the innermost
+/// loop unrolled directly inside a rolled one, a load that moves with the rolled loop walks a
+/// column of the unrolled loop with a byte stride that is a multiple of 256 B; the stored access
+/// is not that load and moves along the unrolled loop) also get the ceiling "colload" = `col_unrolled_gflops` (L), the `fma_col_unrolled` kernel of `bench/peak`:
+/// N = 256, `io, j, ko, ki, ii`, `ii` = 16 unrolled by clang under `ki` = 64, `C` in registers,
+/// 17 loads and 16 FMA per iteration of `ki`, no stores: 15.624 GFLOP/s in the P7 peak run
+/// against 21.5 to 23.8 from the plain scalar point (8.38 * 3 / m, m about 1.06 to 1.18). The
+/// stride sweep behind the predicate is in the README of `bench/peak` (the same 256 B granule as
+/// `COL_RELOAD_STRIDE_BYTES`, which is reused). L is NOT scaled by `MEM_ACC_KERNEL_MEM_OPS /
+/// mem_ops`, for the reason of the reload point: the ceiling is set by the loads of the column,
+/// and the predicate gives every FMA of the body exactly one of them (the load depends on the
+/// innermost loop, which is the last one, so it is loaded once per FMA), whatever else the body
+/// loads. Scaling would also break the calibration: the kernel has m = 1.0703125 and 3 / m = 2.8
+/// would put its own nest at 44 GFLOP/s, 2.8 times its measurement. ASSUMED: L holds for any
+/// extent of the unrolled loop (measured at 16 and, by hand, 8: 15.8) and for any mix of other
+/// loads in the body; at most one stride class (1 KiB) was measured with A, as the loaded
+/// column. EXCLUDED, no calibration for them (they keep their v1.6 ceilings): `C` itself as the
+/// column (`ii` unrolled under `j` or `ji`: `C[ii, j]` is loaded and stored down a column) and a
+/// column load under a reduction (`ki` unrolled under `ji`: `B[k, j]` has stride 1 KiB along
+/// `ki`, but all FMAs add into one `C`, a dependent chain); see the tests.
+///
 /// A loop marked vectorized with at most `CLANG_FULL_UNROLL_LIMIT` iterations that the schedule
 /// does not unroll is counted as a scalar unrolled loop, see `as_compiled`. Hand value, N = 16:
 /// `vectorize(1, j)` is `unroll(1, j)`: `C` over `j` is 16 scalar registers, held across `k`:
@@ -930,10 +1007,13 @@ pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchEr
         if column_reload(&compiled, &kernel.buffers)? {
             ceilings.push(("reload", machine.col_reload_gflops));
         }
+        if column_load_unrolled(&compiled, &kernel.buffers, machine.lanes)? {
+            ceilings.push(("colload", machine.col_unrolled_gflops));
+        }
         (machine.peak_gflops / lanes, ceilings)
     };
     // The lowest compute ceiling; a tie goes to the first of compute, load, store, ldst, reload,
-    // latency.
+    // colload, latency.
     let mut ceiling = ("compute", fma_gflops);
     for ldst in ldst_ceilings {
         if ldst.1 < ceiling.1 {
@@ -1291,7 +1371,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "PREDICTION by the analytic model v1.6, not a measurement"
+        "PREDICTION by the analytic model v1.7, not a measurement"
     );
     let _ = writeln!(
         text,
@@ -1493,7 +1573,7 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "analytic model v1.6 (PREDICTION) against the measurements in {source}"
+        "analytic model v1.7 (PREDICTION) against the measurements in {source}"
     );
     let _ = writeln!(
         out,
@@ -2187,7 +2267,12 @@ mod tests {
 
     /// The loops of `text` (N = 256) that `as_compiled` unrolls and the schedule did not.
     fn clang_unrolled(text: &str) -> Vec<String> {
-        let kernel = scheduled(256, text);
+        clang_unrolled_at(256, text)
+    }
+
+    /// `clang_unrolled` at size `n`.
+    fn clang_unrolled_at(n: usize, text: &str) -> Vec<String> {
+        let kernel = scheduled(n, text);
         let nest = update_nest(&kernel);
         let compiled = as_compiled(nest);
         let pairs = nest.loops.iter().zip(&compiled.loops);
@@ -2497,6 +2582,125 @@ mod tests {
         }
     }
 
+    /// Machine for the unrolled-column-load tests: fast caches and the colload point 9.5 (not the
+    /// placeholder 15.7). The FMA ceiling is 100 / 4 = 25 and the scalar ld/st ceiling about 42,
+    /// both above it.
+    fn colload_machine() -> Machine {
+        Machine {
+            col_unrolled_gflops: 9.5,
+            ..fast_caches()
+        }
+    }
+
+    fn colload_bound(n: usize, text: &str) -> (&'static str, f64) {
+        let p = predict(&colload_machine(), &scheduled(n, text)).expect("predicts");
+        (p.bound, p.gflops)
+    }
+
+    /// The scalar matmul nest of `fma_col_unrolled` (`io, j, ko, ki, ii`, `ii` = 16 unrolled by
+    /// clang under a rolled `ki`, N = 256: `A[io*16+ii, k]` moves with `ki` and walks a column,
+    /// 1 KiB = 4 * 256 B apart) is capped at `col_unrolled_gflops`, taken as is, and so is the same
+    /// nest with `ii` = 8 and with `k` itself under `ii`. `C` is held across `ki` and `B[k, j]` is
+    /// invariant in `ii`. The ceiling is not scaled by 3 / m: the calibration kernel has 17 loads
+    /// per 16 FMA (m = 1.0703125 with the 16 + 16 `C` accesses once per `k` loop); scaling by 3 / m
+    /// would put its own nest at 9.5 * 3 / 1.0703125 = 26.6.
+    #[test]
+    fn a_scalar_unrolled_column_load_nest_is_capped_at_the_colload_point() {
+        let tile = |ii: usize| {
+            format!(
+                "split(1, i, io, ii, {ii}); split(1, k, ko, ki, 64); reorder(1, io, j, ko, ki, ii)"
+            )
+        };
+        assert_eq!(mem_ops(256, &tile(16)), 1.0703125);
+        assert_eq!(mem_ops(256, &tile(8)), 1.1328125);
+        for text in [
+            tile(16),
+            tile(8),
+            "split(1, i, io, ii, 16); reorder(1, io, j, k, ii)".to_string(),
+        ] {
+            assert_eq!(clang_unrolled(&text), ["ii"], "{text}");
+            assert_eq!(colload_bound(256, &text), ("colload", 9.5), "{text}");
+        }
+    }
+
+    /// No colload ceiling when
+    /// - `ii` = 32 is rolled (the reload rule applies instead: bound "reload", 2.1 here),
+    /// - the nest is vectorized,
+    /// - the unrolled loop walks unit stride (`ji` = 16 under `ki`: `A[i, k]` has stride 0 along
+    ///   it, `B` and `C` 4 B), or there is no unrolled loop (the naive nest).
+    #[test]
+    fn the_colload_ceiling_needs_an_unrolled_innermost_loop_under_a_rolled_one() {
+        let rolled =
+            "split(1, i, io, ii, 32); split(1, k, ko, ki, 64); reorder(1, io, j, ko, ki, ii)";
+        assert_eq!(clang_unrolled(rolled), ["ko"]);
+        assert_eq!(colload_bound(256, rolled), ("reload", 2.1));
+        let unit =
+            "split(1, j, jo, ji, 16); split(1, k, ko, ki, 64); reorder(1, i, jo, ko, ki, ji)";
+        assert_eq!(clang_unrolled(unit), ["ji"]);
+        for text in [
+            "split(1, j, jo, ji, 64); reorder(1, i, jo, k, ji); vectorize(1, ji)",
+            unit,
+            "",
+        ] {
+            let (bound, gflops) = colload_bound(256, text);
+            assert_ne!(bound, "colload", "{text}");
+            assert!(gflops > 9.5, "{text}: {gflops}");
+        }
+    }
+
+    /// Two shapes without a calibration do not get the ceiling, although a load moves with the
+    /// rolled loop and walks a column of the unrolled one:
+    /// - `ii` = 16 under `j` (`io, k, j, ii`): `A[io*16+ii, k]` is held across `j` (16 <= 24
+    ///   registers) and `B[k, j]` does not move along `ii`; the only column load is `C[io*16+ii,
+    ///   j]`, the stored access itself (condition: the load is not the stored access);
+    /// - `ki` = 16 unrolled under `j` or `ji` (`ko, i, j, ki`): `B[k, j]` has stride 1 KiB along
+    ///   `ki` and moves with `j`, but the stored `C[i, j]` does not move along `ki` (all FMAs add
+    ///   into one `C`, a dependent chain; condition: the stored access moves along the unrolled
+    ///   loop). The nest keeps its v1.6 bound: "latency" (see
+    ///   `a_split_reduction_follows_the_overlap_law_for_long_chains`).
+    #[test]
+    fn the_colload_ceiling_skips_c_as_the_column_and_a_reduction_over_the_unrolled_loop() {
+        for (text, unrolled) in [
+            ("split(1, i, io, ii, 16); reorder(1, io, k, j, ii)", "ii"),
+            ("split(1, k, ko, ki, 16); reorder(1, ko, i, j, ki)", "ki"),
+            (
+                "split(1, j, jo, ji, 8); split(1, k, ko, ki, 8); reorder(1, ko, i, jo, ji, ki)",
+                "ki",
+            ),
+        ] {
+            assert!(
+                clang_unrolled(text).contains(&unrolled.to_string()),
+                "{text}"
+            );
+            let (bound, gflops) = colload_bound(256, text);
+            assert_ne!(bound, "colload", "{text}");
+            assert!(gflops > 9.5, "{text}: {gflops}");
+        }
+        let (bound, _) = colload_bound(256, "split(1, k, ko, ki, 16); reorder(1, ko, i, j, ki)");
+        assert_eq!(bound, "latency");
+    }
+
+    /// The stride of `A` along `ii` is `4 * n` bytes. 256 B (n = 64) and its multiples (n = 128:
+    /// 512 B; 256: 1 KiB) fire; 384 B (n = 96, 128 mod 256) and 400 B (n = 100) do not. `ii` is
+    /// unrolled and `k` rolled directly outside it in all rows.
+    #[test]
+    fn the_colload_stride_is_a_multiple_of_256_bytes() {
+        let nest = |ii: usize| format!("split(1, i, io, ii, {ii}); reorder(1, io, j, k, ii)");
+        for (n, ii, fires) in [
+            (64, 16, true),
+            (128, 16, true),
+            (256, 16, true),
+            (96, 16, false),
+            (100, 10, false),
+        ] {
+            let text = nest(ii);
+            assert_eq!(clang_unrolled_at(n, &text), ["ii"], "n = {n}");
+            let (bound, gflops) = colload_bound(n, &text);
+            assert_eq!(bound == "colload", fires, "n = {n}: {bound} {gflops}");
+            assert_eq!(gflops == 9.5, fires, "n = {n}: {bound} {gflops}");
+        }
+    }
+
     /// `fma_col_unrolled_gflops` of the peak line replaces the placeholder 15.7 (the note stops
     /// calling it one and the header shows it); without it the placeholder stays and the note says
     /// so. The key is not confused with `fma_col_reload_gflops`.
@@ -2522,6 +2726,7 @@ mod tests {
         );
         let header = report(8, &with, &note, &[]);
         assert!(header.contains("col_unrolled 12.5 GFLOP/s"), "{header}");
+        assert!(header.contains("analytic model v1.7"), "{header}");
         let bad = Machine {
             col_unrolled_gflops: 0.0,
             ..with
@@ -3110,7 +3315,10 @@ mod tests {
     /// the group `"vectorized" ji <= 16 (scalar code)` moves from ×0.73 to ×1.16; the group
     /// `scalar, ii innermost` (strided, rolled point) stays at ×1.42. v1.6 (the column-reload
     /// ceiling, placeholder 2.1 here as this peak line has no `fma_col_reload_gflops`) moves the
-    /// Spearman to 0.920 (0.923 with the 13 other records) and that group to ×1.20.
+    /// Spearman to 0.920 (0.923 with the 13 other records) and that group to ×1.20. v1.7 (the
+    /// unrolled-column-load ceiling, placeholder 15.7 here as this peak line has no
+    /// `fma_col_unrolled_gflops`) moves the Spearman to 0.924 (0.926 with the 13 other records)
+    /// and that group to ×1.12.
     #[test]
     fn compare_by_group_reproduces_the_run_3_numbers_of_64() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/results/");
@@ -3128,12 +3336,12 @@ mod tests {
             "{report}"
         );
         assert!(
-            report.contains("Spearman rank correlation 0.920;"),
+            report.contains("Spearman rank correlation 0.924;"),
             "{report}"
         );
         for (group, n, error) in [
             ("vectorized ji = 32/64", 106, "1.193"),
-            ("scalar, ii innermost", 263, "1.203"),
+            ("scalar, ii innermost", 263, "1.119"),
             ("\"vectorized\" ji <= 16 (scalar code)", 100, "1.159"),
         ] {
             let row = report
@@ -3162,7 +3370,7 @@ mod tests {
         assert_eq!(sizes, 1000, "{report}");
         let all = compare_report("run 3", &text, None).expect("compares");
         assert!(
-            all.contains("1013 records") && all.contains("correlation 0.923;"),
+            all.contains("1013 records") && all.contains("correlation 0.926;"),
             "{all}"
         );
     }
