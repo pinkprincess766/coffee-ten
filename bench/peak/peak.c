@@ -2,8 +2,8 @@
  * peak: single-thread f32 peak FLOP/s (FMA loop), FMA rate with the accumulator
  * in memory (vector, scalar, and scalar unrolled by 16), FMA rate with every result stored and nothing
  * loaded, the latency-bound rate of one dependent scalar FMA
- * chain and of independent chains of length 256, single-thread memory bandwidth and
- * L2 bandwidth (STREAM triad).
+ * chain and of independent chains of length 256, the scalar matmul loop nest that reloads a
+ * column of C at a 1 KiB stride, single-thread memory bandwidth and L2 bandwidth (STREAM triad).
  * See README.md.
  *
  * Build (from the repo root):
@@ -75,6 +75,15 @@ typedef float v4f __attribute__((vector_size(16)));
 #define CHAIN256_K 256
 /* Passes between clock reads; one pass is 256 x 256 FMAs, about 20 us at 3.5 GFLOP/s. */
 #define CHAIN256_BATCH 64
+
+/*
+ * Column reload: the scalar matmul loop nest of run 3 at N = 256, f32, three arrays with row
+ * stride exactly 256 floats (1 KiB), no padding. See fma_col_reload_pass. COL_RELOAD_II is
+ * the extent of the innermost ii loop (the tile height), COL_RELOAD_IO the outer blocks.
+ */
+#define COL_RELOAD_N 256
+#define COL_RELOAD_II 64
+#define COL_RELOAD_IO (COL_RELOAD_N / COL_RELOAD_II)
 
 #define SAMPLES 30
 #define QUICK_SAMPLES 3
@@ -259,6 +268,32 @@ __attribute__((noinline)) static void fma_chain256_pass(const float *restrict a,
     }
 }
 
+/*
+ * Scalar matmul C += A * B, N = 256, loop order io, j, k, ii with ii innermost and rolled:
+ *   C[io * 64 + ii][j] += A[io * 64 + ii][k] * B[k][j].
+ * The inner loop is ldr s (A), ldr s (C), fmadd, str s (C), add, cmp, b.ne with a 1 KiB step.
+ * The load of C[ii][j] at k + 1 needs the value stored at k, and the other stores in flight go
+ * to addresses equal to it mod 256 B (row stride 1 KiB). A likely reading, not proven: the load
+ * is matched against the wrong store and waits. By hand on M5: 2.1 GFLOP/s at this stride, 7.8 with C's row stride padded
+ * to 272 floats; padding A or B changes nothing. The pragma keeps the ii loop rolled scalar
+ * code (no fmla, no unrolling) at -O2.
+ */
+__attribute__((noinline)) static void fma_col_reload_pass(float (*restrict a)[COL_RELOAD_N],
+                                                          float (*restrict b)[COL_RELOAD_N],
+                                                          float (*restrict c)[COL_RELOAD_N]) {
+    for (int io = 0; io < COL_RELOAD_IO; io++) {
+        for (int j = 0; j < COL_RELOAD_N; j++) {
+            for (int k = 0; k < COL_RELOAD_N; k++) {
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+                for (int ii = 0; ii < COL_RELOAD_II; ii++) {
+                    c[io * COL_RELOAD_II + ii][j] +=
+                        a[io * COL_RELOAD_II + ii][k] * b[k][j];
+                }
+            }
+        }
+    }
+}
+
 static double fma_flop_per_call(void) {
     return 2.0 * 4 * FMA_CHAINS * (double)FMA_ITERS;
 }
@@ -277,6 +312,10 @@ static double fma_chain_flop_per_call(void) {
 
 static double fma_chain256_flop_per_pass(void) {
     return 2.0 * CHAIN256_J * CHAIN256_K;
+}
+
+static double fma_col_reload_flop_per_pass(void) {
+    return 2.0 * COL_RELOAD_N * COL_RELOAD_N * COL_RELOAD_N;
 }
 
 static double triad_bytes_per_call(long n) {
@@ -394,6 +433,21 @@ static double fma_chain256_sample(const float *a, const float *b, float *c) {
     } while (t1 - t0 < MIN_SAMPLE_NS);
     g_sink += c[0];
     return (double)passes * fma_chain256_flop_per_pass() / (double)(t1 - t0);
+}
+
+/* Returns GFLOP/s (FLOP per ns). One pass is about 4-16 ms, so the clock is read every pass. */
+static double fma_col_reload_sample(float (*a)[COL_RELOAD_N], float (*b)[COL_RELOAD_N],
+                                    float (*c)[COL_RELOAD_N]) {
+    long long t0 = now_ns();
+    long long t1;
+    long passes = 0;
+    do {
+        fma_col_reload_pass(a, b, c);
+        passes++;
+        t1 = now_ns();
+    } while (t1 - t0 < MIN_SAMPLE_NS);
+    g_sink += c[0][0];
+    return (double)passes * fma_col_reload_flop_per_pass() / (double)(t1 - t0);
 }
 
 /* Returns GB/s (1e9 bytes per second, i.e. bytes per ns). */
@@ -625,6 +679,52 @@ static int run_check(float a, float b) {
     }
     free(ch_a);
     free(ch_b);
+
+    /*
+     * Column reload vs a plain loop in i, j, k order with fmaf, bit for bit, one call from a
+     * known C. Each C[i][j] sees the same k = 0..255 sequence of fmaf(a, b, c) in both, so
+     * the results must match exactly; the loop order io, j, k, ii only changes which
+     * element is updated next. The kernel's a * b + c is fused into the same fmadd by
+     * -ffp-contract=fast (the build command); the reference spells it as fmaf.
+     * The values are not exact in f32, so a different order or rounding would show.
+     */
+    float (*cr_a)[COL_RELOAD_N] = malloc(sizeof(float[COL_RELOAD_N][COL_RELOAD_N]));
+    float (*cr_b)[COL_RELOAD_N] = malloc(sizeof(float[COL_RELOAD_N][COL_RELOAD_N]));
+    float (*cr_c)[COL_RELOAD_N] = malloc(sizeof(float[COL_RELOAD_N][COL_RELOAD_N]));
+    float (*cr_ref)[COL_RELOAD_N] = malloc(sizeof(float[COL_RELOAD_N][COL_RELOAD_N]));
+    if (!cr_a || !cr_b || !cr_c || !cr_ref) {
+        printf("check FAILED: malloc\n");
+        return 1;
+    }
+    for (int i = 0; i < COL_RELOAD_N; i++) {
+        for (int j = 0; j < COL_RELOAD_N; j++) {
+            cr_a[i][j] = 0.01f * (float)((i + j) % 7 + 1);
+            cr_b[i][j] = 0.1f * (float)((i + j) % 5 + 1);
+            cr_c[i][j] = (float)((i + j) % 13);
+            cr_ref[i][j] = cr_c[i][j];
+        }
+    }
+    fma_col_reload_pass(cr_a, cr_b, cr_c);
+    for (int i = 0; i < COL_RELOAD_N; i++) {
+        for (int j = 0; j < COL_RELOAD_N; j++) {
+            for (int k = 0; k < COL_RELOAD_N; k++) {
+                cr_ref[i][j] = __builtin_fmaf(cr_a[i][k], cr_b[k][j], cr_ref[i][j]);
+            }
+        }
+    }
+    for (int i = 0; i < COL_RELOAD_N; i++) {
+        for (int j = 0; j < COL_RELOAD_N; j++) {
+            if (memcmp(&cr_c[i][j], &cr_ref[i][j], sizeof cr_c[i][j]) != 0) {
+                printf("check FAILED: fma_col_reload i=%d j=%d: got %.9g, want %.9g\n", i, j,
+                       (double)cr_c[i][j], (double)cr_ref[i][j]);
+                return 1;
+            }
+        }
+    }
+    free(cr_a);
+    free(cr_b);
+    free(cr_c);
+    free(cr_ref);
     printf("check ok\n");
     return 0;
 }
@@ -638,6 +738,7 @@ static double g_mem_acc_scalar_unrolled_rate[SAMPLES];
 static double g_fma_store_rate[SAMPLES];
 static double g_chain_rate[SAMPLES];
 static double g_chain256_rate[SAMPLES];
+static double g_col_reload_rate[SAMPLES];
 
 /* Fills rate[0..samples-1] with accumulator-in-memory GFLOP/s; a from fma_operands, b[j] = 0.5. */
 static void run_mem_acc(float a, int samples, int warmup, double *rate) {
@@ -740,6 +841,39 @@ static int run_chain256(float a, int samples, int warmup, double *rate) {
     return 0;
 }
 
+/*
+ * Fills rate[0..samples-1] with column-reload GFLOP/s. A = a, B = 0.5, C starts at 0 and
+ * grows by 128 * a per pass (N * 0.5 * a), far below overflow for the few hundred passes
+ * of a run. Returns 1 on malloc failure.
+ */
+static int run_col_reload(float a, int samples, int warmup, double *rate) {
+    size_t bytes = sizeof(float[COL_RELOAD_N][COL_RELOAD_N]);
+    float (*ca)[COL_RELOAD_N] = malloc(bytes);
+    float (*cb)[COL_RELOAD_N] = malloc(bytes);
+    float (*cc)[COL_RELOAD_N] = malloc(bytes);
+    if (!ca || !cb || !cc) {
+        fprintf(stderr, "malloc failed\n");
+        return 1;
+    }
+    for (int i = 0; i < COL_RELOAD_N; i++) {
+        for (int j = 0; j < COL_RELOAD_N; j++) {
+            ca[i][j] = a;
+            cb[i][j] = 0.5f;
+            cc[i][j] = 0.0f;
+        }
+    }
+    for (int s = 0; s < warmup + samples; s++) {
+        double r = fma_col_reload_sample(ca, cb, cc);
+        if (s >= warmup) {
+            rate[s - warmup] = r;
+        }
+    }
+    free(ca);
+    free(cb);
+    free(cc);
+    return 0;
+}
+
 /* Fills rate[0..samples-1] with triad GB/s over n floats. Returns 1 on malloc failure. */
 static int run_triad(long n, int samples, int warmup, double *rate) {
     float *x = malloc(n * sizeof *x);
@@ -812,6 +946,9 @@ int main(int argc, char **argv) {
     if (run_chain256(a, samples, warmup, g_chain256_rate) != 0) {
         return 1;
     }
+    if (run_col_reload(a, samples, warmup, g_col_reload_rate) != 0) {
+        return 1;
+    }
     if (run_triad(TRIAD_N, samples, warmup, g_triad_rate) != 0) {
         return 1;
     }
@@ -827,6 +964,7 @@ int main(int argc, char **argv) {
     stats_t fma_store = summarize(g_fma_store_rate, samples);
     stats_t chain = summarize(g_chain_rate, samples);
     stats_t chain256 = summarize(g_chain256_rate, samples);
+    stats_t col_reload = summarize(g_col_reload_rate, samples);
     stats_t triad_st = summarize(g_triad_rate, samples);
     stats_t triad_l2_st = summarize(g_triad_l2_rate, samples);
 
@@ -837,6 +975,7 @@ int main(int argc, char **argv) {
     print_stats("fma_store", "GFLOP/s", fma_store, samples);
     print_stats("chain", "GFLOP/s", chain, samples);
     print_stats("chain256", "GFLOP/s", chain256, samples);
+    print_stats("col_reload", "GFLOP/s", col_reload, samples);
     print_stats("triad", "GB/s", triad_st, samples);
     print_stats("triad_l2", "GB/s", triad_l2_st, samples);
     printf("checksum %g\n", g_sink);
@@ -851,7 +990,8 @@ int main(int argc, char **argv) {
            "\"fma_chain_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"fma_chain256_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
            "\"fma_store_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
-           "\"fma_mem_acc_scalar_unrolled_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
+           "\"fma_mem_acc_scalar_unrolled_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d},"
+           "\"fma_col_reload_gflops\":{\"median\":%.4f,\"p25\":%.4f,\"p75\":%.4f,\"min\":%.4f,\"n\":%d}}\n",
            fma.median, fma.p25, fma.p75, fma.min, samples,
            triad_st.median, triad_st.p25, triad_st.p75, triad_st.min, samples,
            FMA_CHAINS, TRIAD_N,
@@ -865,6 +1005,7 @@ int main(int argc, char **argv) {
            chain256.median, chain256.p25, chain256.p75, chain256.min, samples,
            fma_store.median, fma_store.p25, fma_store.p75, fma_store.min, samples,
            mem_acc_scalar_unrolled.median, mem_acc_scalar_unrolled.p25,
-           mem_acc_scalar_unrolled.p75, mem_acc_scalar_unrolled.min, samples);
+           mem_acc_scalar_unrolled.p75, mem_acc_scalar_unrolled.min, samples,
+           col_reload.median, col_reload.p25, col_reload.p75, col_reload.min, samples);
     return 0;
 }
