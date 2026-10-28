@@ -1,7 +1,8 @@
-//! Analytic cost model, version 1.5 (spec §7.1): cache traffic from the loop footprints plus a
+//! Analytic cost model, version 1.6 (spec §7.1): cache traffic from the loop footprints plus a
 //! roofline whose compute ceiling is the lowest of the FMA, the load, the store (vectorized
 //! nests; scalar nests have one combined load/store ceiling) and the latency ceiling (dependent FMA chains of a reduction held in registers, see `latency_gflops`).
-//! Deterministic; the machine numbers are inputs (assumed, or read from a results file).
+//! v1.6 adds one more scalar ceiling, "reload" (`column_reload`). Deterministic; the machine
+//! numbers are inputs (assumed, or read from a results file).
 //!
 //! Only the update nest (nest 1) of a matmul kernel is modelled; the init nest is ignored.
 //! Guards are ignored (the schedule space has none). Loop extents are exact, so the
@@ -34,7 +35,9 @@ use crate::cli::MAX_N;
 use crate::space::matmul_space;
 use crate::stats::summarize;
 use coffee_ten_ir::{Graph, Shape};
-use coffee_ten_loop::{Access, AffineExpr, Expr, Kernel, Loop, LoopNest, Schedule, apply, lower};
+use coffee_ten_loop::{
+    Access, AffineExpr, Buffer, Expr, Kernel, Loop, LoopNest, Schedule, apply, lower,
+};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 
@@ -91,6 +94,18 @@ pub const PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS: f64 = PLACEHOLDER_MEM_ACC_GFLOPS / 
 /// limited by its iterations, not by the load/store ports. Replace by the
 /// `fma_mem_acc_scalar_unrolled_gflops` median of the peak line.
 pub const PLACEHOLDER_MEM_ACC_SCALAR_UNROLLED_GFLOPS: f64 = 23.2;
+/// PLACEHOLDER, from a hand microbenchmark (Apple M5, `BENCH_FLAGS`): GFLOP/s of the
+/// `fma_col_reload` kernel of `bench/peak` (the scalar matmul nest `io, j, k, ii`, `ii` = 64
+/// innermost and rolled, `C[io*64+ii][j] += A[io*64+ii][k] * B[k][j]` at N = 256, all row strides
+/// 1 KiB): 2.1. The P6 peak run measured 2.121. Replace by the `fma_col_reload_gflops` median.
+pub const PLACEHOLDER_COL_RELOAD_GFLOPS: f64 = 2.1;
+/// Byte stride of the stored access along the innermost loop, in multiples of which the
+/// column-reload ceiling applies, see `column_reload`. A hardware observation of hand
+/// microbenchmarks (Apple M5, the `fma_col_reload` nest with `ii` = 32, N = 256, only the row
+/// stride of `C` varied; GFLOP/s): a stride that is a multiple of 256 B runs at 1.6 to 2.1; 128 B modulo 256 B at 3.2;
+/// 64 B at 4.7; 8 to 32 B at about 5; 272 floats (1088 B) at 7.7. Not fitted to the
+/// hypothesis A measurements.
+const COL_RELOAD_STRIDE_BYTES: i64 = 256;
 /// PLACEHOLDER: GFLOP/s of one dependent scalar FMA chain (the `fma_chain` kernel of
 /// `bench/peak`). Hand microbenchmark on an Apple M5: 0.76 ns per FMA. Replace by the
 /// `fma_chain_gflops` median.
@@ -135,6 +150,10 @@ pub struct Machine {
     /// calibration point of scalar nests whose innermost loop is unrolled, see
     /// `mem_ops_per_fma`.
     pub mem_acc_scalar_unrolled_gflops: f64,
+    /// GFLOP/s of the `fma_col_reload` kernel (scalar, rolled, 2 loads and a store per FMA, the
+    /// stored column reloaded at the next iteration of the loop outside): the ceiling of scalar
+    /// nests for which `column_reload` holds.
+    pub col_reload_gflops: f64,
     /// GFLOP/s of vector FMAs that each store one result and load nothing (`STORE_KERNEL_STORES`
     /// store per FMA): the store calibration point of vectorized nests.
     pub store_gflops: f64,
@@ -166,6 +185,7 @@ impl Machine {
             mem_acc_gflops: PLACEHOLDER_MEM_ACC_GFLOPS,
             mem_acc_scalar_gflops: PLACEHOLDER_MEM_ACC_SCALAR_GFLOPS,
             mem_acc_scalar_unrolled_gflops: PLACEHOLDER_MEM_ACC_SCALAR_UNROLLED_GFLOPS,
+            col_reload_gflops: PLACEHOLDER_COL_RELOAD_GFLOPS,
             store_gflops: PLACEHOLDER_STORE_GFLOPS,
             fma_chain_gflops: PLACEHOLDER_FMA_CHAIN_GFLOPS,
             fma_chain256_gflops: PLACEHOLDER_FMA_CHAIN256_GFLOPS,
@@ -190,6 +210,7 @@ impl Machine {
             self.mem_acc_gflops,
             self.mem_acc_scalar_gflops,
             self.mem_acc_scalar_unrolled_gflops,
+            self.col_reload_gflops,
             self.store_gflops,
             self.fma_chain_gflops,
             self.fma_chain256_gflops,
@@ -222,8 +243,9 @@ pub struct Prediction {
     pub l2_bytes: usize,
     /// The roofline term that sets `time_s`: "compute" (FMA issue), "load" or "store" (vectorized
     /// nests: loads per FMA, stores per FMA), "ldst" (scalar nests: loads and stores in one
-    /// pool), "latency" (dependent FMA chains), "memory" or "l2". A tie goes to the first of
-    /// "compute"/"load"/"store"/"ldst"/"latency", then "memory".
+    /// pool), "reload" (scalar nests that reload a stored column, see `column_reload`),
+    /// "latency" (dependent FMA chains), "memory" or "l2". A tie goes to the first of
+    /// "compute"/"load"/"store"/"ldst"/"reload"/"latency", then "memory".
     pub bound: &'static str,
     /// Memory ops per FMA op of the nest, see `mem_ops_per_fma`; breaks ties in `order`. The sum
     /// of `loads_per_fma` and `stores_per_fma`.
@@ -482,6 +504,48 @@ fn straight_line_body(compiled: &LoopNest) -> bool {
     })
 }
 
+/// Whether `compiled` (a nest as `as_compiled` returns it) is the loop nest of the
+/// `fma_col_reload` calibration point: scalar code whose innermost loop is rolled, in which the
+/// stored access (the update's output) walks a column and is reloaded at the next iteration of
+/// the loop outside. All three must hold:
+/// - the innermost loop is not unrolled (an unrolled one keeps the stored elements in registers
+///   or is straight-line code; a vectorized one cannot walk a column, `vectorize` needs stride 1);
+/// - the byte stride of the stored access along the innermost loop, `sum over dims of coeff *
+///   product of the later extents of its buffer * ELEMENT_BYTES`, is nonzero and a multiple of
+///   `COL_RELOAD_STRIDE_BYTES`;
+/// - the loop directly outside the innermost one has coefficient 0 in every index of the stored
+///   access: the same elements are loaded again at its next iteration, right after the stores of
+///   this one (with `j` or `ji` outside, `C[.., j]` moves on and nothing is reloaded).
+///
+/// Hardware reading (not proven): the load of `C` at the next iteration needs the store of the
+/// previous one, while the other stores in flight go to addresses equal to it modulo 256 B.
+fn column_reload(compiled: &LoopNest, buffers: &[Buffer]) -> Result<bool, BenchError> {
+    let [.., parent, inner] = compiled.loops.as_slice() else {
+        return Ok(false);
+    };
+    if inner.unroll {
+        return Ok(false);
+    }
+    let target = &compiled.body.target;
+    let buffer = buffers
+        .get(target.buffer)
+        .filter(|b| b.shape.len() == target.index.len())
+        .ok_or_else(|| model_err(format!("access to the unknown buffer {}", target.buffer)))?;
+    let mut stride_elements = 0_i64;
+    let mut later_elements = 1_i64;
+    for (index, &extent) in target.index.iter().zip(&buffer.shape).rev() {
+        let step_elements = coeff_of(index, &inner.name).saturating_mul(later_elements);
+        stride_elements = stride_elements.saturating_add(step_elements);
+        later_elements = later_elements.saturating_mul(i64::try_from(extent).unwrap_or(i64::MAX));
+    }
+    let stride_bytes = stride_elements.saturating_mul(ELEMENT_BYTES as i64);
+    let parent_moves_target = target
+        .index
+        .iter()
+        .any(|index| coeff_of(index, &parent.name) != 0);
+    Ok(stride_bytes != 0 && stride_bytes % COL_RELOAD_STRIDE_BYTES == 0 && !parent_moves_target)
+}
+
 /// Vector registers an access needs to hold the elements it touches over the loops `from..`
 /// of `loops`: the distinct values over the loops that are not vectorized, times, if the
 /// vectorized (last) loop is inside, 1 if the access is invariant in it, `extent / lanes`
@@ -695,6 +759,20 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64, f64), BenchError
 /// registers) does not change the rate; nothing is known about unrolled bodies with a different
 /// load/store mix.
 ///
+/// Column reload, v1.6. Scalar nests for which `column_reload` holds (rolled innermost loop, the
+/// stored access walks a column with a byte stride that is a multiple of 256 B, the loop outside
+/// does not move it) also get the ceiling "reload" = `col_reload_gflops` (R), the
+/// `fma_col_reload` kernel of `bench/peak`: N = 256, `io, j, k, ii`, `ii` = 64 rolled, 2.121
+/// GFLOP/s in the P6 peak run against 8.49 for the plain scalar point. The stride sweep behind
+/// the predicate is at `COL_RELOAD_STRIDE_BYTES`. R is NOT scaled by `MEM_ACC_KERNEL_MEM_OPS /
+/// mem_ops` as the "ldst" point is: that scaling says how many memory ops of a pool one FMA
+/// costs, while this ceiling is set by the `C` load that waits for the preceding store, which the
+/// predicate gives every FMA of the nest exactly once, whatever else the body loads. The
+/// calibration nest itself has m = 3 + 1 / 64 (the `B` load once per `ii` loop), so scaling by 3
+/// / m would make the model miss its own calibration point by 0.5%. ASSUMED: the ceiling does not
+/// depend on the extent of `ii` (measured only at 64 in the peak run; run 3 has 32 to 128) or on
+/// what else is in the body; the predicate is not proven, only the hand experiments say it.
+///
 /// A loop marked vectorized with at most `CLANG_FULL_UNROLL_LIMIT` iterations that the schedule
 /// does not unroll is counted as a scalar unrolled loop, see `as_compiled`. Hand value, N = 16:
 /// `vectorize(1, j)` is `unroll(1, j)`: `C` over `j` is 16 scalar registers, held across `k`:
@@ -830,9 +908,14 @@ pub fn predict(machine: &Machine, kernel: &Kernel) -> Result<Prediction, BenchEr
             machine.mem_acc_scalar_gflops
         };
         let ldst_gflops = point_gflops * MEM_ACC_KERNEL_MEM_OPS / mem_ops;
-        (machine.peak_gflops / lanes, vec![("ldst", ldst_gflops)])
+        let mut ceilings = vec![("ldst", ldst_gflops)];
+        // Not scaled by `mem_ops`, see the doc of `mem_ops_per_fma`.
+        if column_reload(&compiled, &kernel.buffers)? {
+            ceilings.push(("reload", machine.col_reload_gflops));
+        }
+        (machine.peak_gflops / lanes, ceilings)
     };
-    // The lowest compute ceiling; a tie goes to the first of compute, load, store, ldst,
+    // The lowest compute ceiling; a tie goes to the first of compute, load, store, ldst, reload,
     // latency.
     let mut ceiling = ("compute", fma_gflops);
     for ldst in ldst_ceilings {
@@ -973,8 +1056,9 @@ fn string_after(line: &str, key: &str) -> Option<String> {
 /// them (`chain_measured` says which), else they stay the placeholders. Without `fma_mem_acc_gflops` in the line, `mem_acc_gflops`
 /// stays the placeholder. Without `fma_mem_acc_scalar_gflops`, `mem_acc_scalar_gflops` is
 /// `mem_acc_gflops / lanes` (the placeholder, or the measured vector point over lanes, as the
-/// model did before the scalar point existed). `fma_mem_acc_scalar_unrolled_gflops` is read when
-/// present (`scalar_unrolled_measured` says so), else it stays the placeholder.
+/// model did before the scalar point existed). `fma_mem_acc_scalar_unrolled_gflops` and
+/// `fma_col_reload_gflops` are read when present (`scalar_unrolled_measured` and
+/// `col_reload_measured` say so), else they stay the placeholders.
 pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchError> {
     let line = text
         .lines()
@@ -1000,6 +1084,9 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
     if let Some(gflops) = median_after(line, "fma_mem_acc_scalar_unrolled_gflops") {
         machine.mem_acc_scalar_unrolled_gflops = gflops;
     }
+    if let Some(gflops) = median_after(line, "fma_col_reload_gflops") {
+        machine.col_reload_gflops = gflops;
+    }
     if let Some(gflops) = median_after(line, "fma_store_gflops") {
         machine.store_gflops = gflops;
     }
@@ -1018,6 +1105,13 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
 pub fn scalar_unrolled_measured(text: &str) -> bool {
     let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
     line.is_some_and(|line| median_after(line, "fma_mem_acc_scalar_unrolled_gflops").is_some())
+}
+
+/// Whether the peak line of `text` has `fma_col_reload_gflops`; without it `col_reload_gflops` is
+/// `PLACEHOLDER_COL_RELOAD_GFLOPS`.
+pub fn col_reload_measured(text: &str) -> bool {
+    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    line.is_some_and(|line| median_after(line, "fma_col_reload_gflops").is_some())
 }
 
 /// Whether the peak line of `text` has `fma_store_gflops`; without it `store_gflops` is
@@ -1040,6 +1134,7 @@ fn from_note(
     mem_acc_measured: bool,
     mem_acc_scalar_measured: bool,
     scalar_unrolled_measured: bool,
+    col_reload_measured: bool,
     store_measured: bool,
     chain_measured: (bool, bool),
 ) -> String {
@@ -1070,6 +1165,13 @@ fn from_note(
             note,
             "; mem_acc_scalar_unrolled {PLACEHOLDER_MEM_ACC_SCALAR_UNROLLED_GFLOPS} is a \
              PLACEHOLDER (no fma_mem_acc_scalar_unrolled_gflops in the peak line)"
+        );
+    }
+    if !col_reload_measured {
+        let _ = write!(
+            note,
+            "; col_reload {PLACEHOLDER_COL_RELOAD_GFLOPS} is a PLACEHOLDER \
+             (no fma_col_reload_gflops in the peak line)"
         );
     }
     if !store_measured {
@@ -1131,6 +1233,7 @@ pub fn parse_model_args<I: IntoIterator<Item = String>>(
                     vector,
                     scalar,
                     scalar_unrolled_measured(&text),
+                    col_reload_measured(&text),
                     store_measured(&text),
                     chain_measured(&text),
                 );
@@ -1153,7 +1256,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "PREDICTION by the analytic model v1.5, not a measurement"
+        "PREDICTION by the analytic model v1.6, not a measurement"
     );
     let _ = writeln!(
         text,
@@ -1163,7 +1266,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let _ = writeln!(
         text,
         "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
-         mem_acc_scalar {} GFLOP/s, mem_acc_scalar_unrolled {} GFLOP/s, store {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
+         mem_acc_scalar {} GFLOP/s, mem_acc_scalar_unrolled {} GFLOP/s, col_reload {} GFLOP/s, store {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
          FMAs) ({source}); L1 {} B, L2 {} B, line {} B, {} lanes (ASSUMED)",
         machine.peak_gflops,
         machine.mem_gbs,
@@ -1171,6 +1274,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
         machine.mem_acc_gflops,
         machine.mem_acc_scalar_gflops,
         machine.mem_acc_scalar_unrolled_gflops,
+        machine.col_reload_gflops,
         machine.store_gflops,
         machine.fma_chain_gflops,
         machine.fma_chain256_gflops,
@@ -1353,12 +1457,12 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "analytic model v1.5 (PREDICTION) against the measurements in {source}"
+        "analytic model v1.6 (PREDICTION) against the measurements in {source}"
     );
     let _ = writeln!(
         out,
         "machine: peak {} GFLOP/s, mem {} GB/s, L2 {} GB/s, mem_acc {} GFLOP/s, \
-         mem_acc_scalar {} GFLOP/s, mem_acc_scalar_unrolled {} GFLOP/s, store {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
+         mem_acc_scalar {} GFLOP/s, mem_acc_scalar_unrolled {} GFLOP/s, col_reload {} GFLOP/s, store {} GFLOP/s, fma_chain {} GFLOP/s, fma_chain256 {} GFLOP/s (window {:.1} \
          FMAs) ({})",
         machine.peak_gflops,
         machine.mem_gbs,
@@ -1366,6 +1470,7 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
         machine.mem_acc_gflops,
         machine.mem_acc_scalar_gflops,
         machine.mem_acc_scalar_unrolled_gflops,
+        machine.col_reload_gflops,
         machine.store_gflops,
         machine.fma_chain_gflops,
         machine.fma_chain256_gflops,
@@ -1375,6 +1480,7 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
             mem_acc_measured,
             mem_acc_scalar_measured,
             scalar_unrolled_measured(text),
+            col_reload_measured(text),
             store_measured(text),
             chain_measured(text)
         )
@@ -2276,6 +2382,84 @@ mod tests {
         }
     }
 
+    /// Machine for the column-reload tests: fast caches and the reload point 2.5 (not the
+    /// placeholder 2.1, so that the number is seen to come from the machine). The scalar ld/st
+    /// ceiling 15 * 3 / m is about 15, above it.
+    fn reload_machine() -> Machine {
+        Machine {
+            col_reload_gflops: 2.5,
+            ..fast_caches()
+        }
+    }
+
+    fn reload_bound(n: usize, text: &str) -> (&'static str, f64) {
+        let p = predict(&reload_machine(), &scheduled(n, text)).expect("predicts");
+        (p.bound, p.gflops)
+    }
+
+    /// The scalar matmul nest of `fma_col_reload` (`io, j, k, ii`, `ii` = 64 rolled and innermost,
+    /// N = 256, C's row stride 1 KiB = 4 * 256 B, `k` or `ki` directly outside `ii` with
+    /// coefficient 0 in `C[io*64+ii, j]`) is capped at `col_reload_gflops`, taken as is. Both
+    /// nests have m = 3.015625 (`C` 2, `A` 1, `B[k, j]` once per `ii` loop: 1 / 64); the point is
+    /// not scaled by 3 / m: the predicate guarantees one `C` load and one `C` store per FMA, which
+    /// is what the ceiling counts, and the calibration kernel has the same m (scaling would give
+    /// 2.5 * 3 / 3.015625 = 2.487 for its own nest). The ld/st ceiling 15 * 3 / 3.015625 = 14.92
+    /// is higher.
+    #[test]
+    fn a_scalar_column_reload_nest_is_capped_at_the_reload_point() {
+        for text in [
+            "split(1, i, io, ii, 64); reorder(1, io, j, k, ii)",
+            "split(1, i, io, ii, 64); split(1, k, ko, ki, 64); reorder(1, io, j, ko, ki, ii)",
+        ] {
+            assert_eq!(mem_ops(256, text), 3.015625, "{text}");
+            assert_eq!(reload_bound(256, text), ("reload", 2.5), "{text}");
+        }
+    }
+
+    /// The rule needs `C` reloaded at the next iteration of the loop outside `ii`: with `j` or
+    /// `ji` directly outside, `C[.., j]` moves with it and the ld/st ceiling (14.9 here) binds.
+    /// With `ii` fully unrolled (8 or 16 under `ki`, `C` stays in registers), a vectorized `ji`
+    /// (stride 4 B; `vectorize` of a column walk is illegal), or the stored access not moving
+    /// along the innermost loop (`ki` innermost: stride 0 although the parent `ko` has
+    /// coefficient 0 too), there is no reload ceiling either.
+    #[test]
+    fn the_reload_ceiling_needs_a_rolled_scalar_ii_and_a_parent_that_does_not_move_c() {
+        for text in [
+            "split(1, i, io, ii, 64); reorder(1, io, k, j, ii)",
+            "split(1, i, io, ii, 64); split(1, j, jo, ji, 8); reorder(1, io, jo, k, ji, ii)",
+            "split(1, i, io, ii, 8); split(1, k, ko, ki, 64); reorder(1, io, j, ko, ki, ii)",
+            "split(1, i, io, ii, 16); split(1, k, ko, ki, 64); reorder(1, io, j, ko, ki, ii)",
+            "split(1, j, jo, ji, 64); reorder(1, i, jo, k, ji); vectorize(1, ji)",
+            "split(1, k, ko, ki, 64); reorder(1, i, j, ko, ki)",
+        ] {
+            let (bound, gflops) = reload_bound(256, text);
+            assert_ne!(bound, "reload", "{text}");
+            assert!(gflops > 2.5, "{text}: {gflops}");
+        }
+        let unrolled =
+            "split(1, i, io, ii, 8); split(1, k, ko, ki, 64); reorder(1, io, j, ko, ki, ii)";
+        assert_eq!(clang_unrolled(unrolled), ["ii"]);
+    }
+
+    /// C's row stride is `4 * n` bytes. 256 B (n = 64) and its multiples (n = 128: 512 B; 256:
+    /// 1 KiB) fire; 384 B (n = 96, 128 mod 256) and 400 B (n = 100) do not. `ii` is rolled in all
+    /// rows (20 to 32 iterations are above the unroll limit 16).
+    #[test]
+    fn the_reload_stride_is_a_multiple_of_256_bytes() {
+        let nest = |ii: usize| format!("split(1, i, io, ii, {ii}); reorder(1, io, j, k, ii)");
+        for (n, ii, fires) in [
+            (64, 32, true),
+            (128, 32, true),
+            (256, 32, true),
+            (96, 24, false),
+            (100, 20, false),
+        ] {
+            let (bound, gflops) = reload_bound(n, &nest(ii));
+            assert_eq!(bound == "reload", fires, "n = {n}: {bound} {gflops}");
+            assert_eq!(gflops == 2.5, fires, "n = {n}: {bound} {gflops}");
+        }
+    }
+
     /// `fma_mem_acc_scalar_unrolled_gflops` of the peak line replaces the placeholder 23.2 (and
     /// the note stops calling it one); without it the placeholder stays, the note and the
     /// header say so, and the prediction of an unrolled scalar nest follows the point in use.
@@ -2296,9 +2480,9 @@ mod tests {
         assert!(scalar_unrolled_measured(measured) && !scalar_unrolled_measured(&missing));
         // The scalar point is not confused with the unrolled one: its key is a prefix.
         assert_eq!(with.mem_acc_scalar_gflops, with.mem_acc_gflops / 4.0);
-        let note = from_note("f", true, true, true, true, (true, true));
+        let note = from_note("f", true, true, true, true, true, (true, true));
         assert!(!note.contains("PLACEHOLDER"), "{note}");
-        let note = from_note("f", true, true, false, true, (true, true));
+        let note = from_note("f", true, true, false, true, true, (true, true));
         assert!(
             note.contains("mem_acc_scalar_unrolled 23.2 is a PLACEHOLDER"),
             "{note}"
@@ -2419,12 +2603,14 @@ mod tests {
             true,
             true,
             true,
+            true,
             store_measured(measured),
             (true, true),
         );
         assert!(!note.contains("PLACEHOLDER"), "{note}");
         let note = from_note(
             "f",
+            true,
             true,
             true,
             true,
@@ -2598,7 +2784,7 @@ mod tests {
             (2.5, 3.5)
         );
         assert!((machine.window_fmas() - 102.4).abs() < 1e-9);
-        let note = from_note("f", true, true, true, true, chain_measured(line));
+        let note = from_note("f", true, true, true, true, true, chain_measured(line));
         assert!(!note.contains("fma_chain"), "{note}");
         let line = line.replace("fma_chain256_gflops", "x");
         let (placeholder, _, _) = machine_from_results(&line).expect("parses");
@@ -2609,7 +2795,7 @@ mod tests {
             ),
             (2.5, PLACEHOLDER_FMA_CHAIN256_GFLOPS)
         );
-        let note = from_note("f", true, true, true, true, chain_measured(&line));
+        let note = from_note("f", true, true, true, true, true, chain_measured(&line));
         assert!(note.contains("fma_chain256 is a PLACEHOLDER"), "{note}");
         assert!(!note.contains("fma_chain is a PLACEHOLDER"), "{note}");
         let header = report(8, &placeholder, &note, &[]);
@@ -2721,14 +2907,43 @@ mod tests {
             scalar_measured,
             true,
             true,
+            true,
             (true, true),
         );
         assert!(!note.contains("PLACEHOLDER"), "{note}");
-        let note = from_note("f", true, false, true, true, (true, true));
+        let note = from_note("f", true, false, true, true, true, (true, true));
         assert!(note.contains("mem_acc_scalar is a PLACEHOLDER"), "{note}");
         // The report header carries the scalar point.
         let header = report(8, &machine, &note, &[]);
         assert!(header.contains("mem_acc_scalar 8.5632 GFLOP/s"), "{header}");
+    }
+
+    /// `fma_col_reload_gflops` of the peak line replaces the placeholder 2.1 (the note stops
+    /// calling it one and the header shows it); without it the placeholder stays and the note says
+    /// so.
+    #[test]
+    fn from_reads_col_reload_when_the_peak_line_has_it() {
+        let line = r#"{"kind":"peak","fma_gflops":{"median":100.5,"n":30},"triad_gbs":{"median":90.25,"n":30},"triad_l2_gbs":{"median":110.0,"n":30},"fma_col_reload_gflops":{"median":2.5,"n":30}}"#;
+        let missing = line.replace("fma_col_reload_gflops", "x");
+        let (with, _, _) = machine_from_results(line).expect("parses");
+        let (without, _, _) = machine_from_results(&missing).expect("parses");
+        assert_eq!(PLACEHOLDER_COL_RELOAD_GFLOPS, 2.1);
+        assert_eq!(
+            (with.col_reload_gflops, without.col_reload_gflops),
+            (2.5, 2.1)
+        );
+        assert!(col_reload_measured(line) && !col_reload_measured(&missing));
+        let note = from_note("f", true, true, true, true, true, (true, true));
+        assert!(!note.contains("PLACEHOLDER"), "{note}");
+        let note = from_note("f", true, true, true, false, true, (true, true));
+        assert!(note.contains("col_reload 2.1 is a PLACEHOLDER"), "{note}");
+        let header = report(8, &with, &note, &[]);
+        assert!(header.contains("col_reload 2.5 GFLOP/s"), "{header}");
+        let bad = Machine {
+            col_reload_gflops: 0.0,
+            ..with
+        };
+        assert!(predict(&bad, &naive(8)).is_err());
     }
 
     #[test]
@@ -2808,7 +3023,9 @@ mod tests {
     /// it into [0.83; 1.20]. With the unrolled scalar point (this peak line has no
     /// `fma_mem_acc_scalar_unrolled_gflops`, so the placeholder 23.2) the Spearman is 0.868 and
     /// the group `"vectorized" ji <= 16 (scalar code)` moves from ×0.73 to ×1.16; the group
-    /// `scalar, ii innermost` (strided, rolled point) stays at ×1.42.
+    /// `scalar, ii innermost` (strided, rolled point) stays at ×1.42. v1.6 (the column-reload
+    /// ceiling, placeholder 2.1 here as this peak line has no `fma_col_reload_gflops`) moves the
+    /// Spearman to 0.920 (0.923 with the 13 other records) and that group to ×1.20.
     #[test]
     fn compare_by_group_reproduces_the_run_3_numbers_of_64() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/results/");
@@ -2826,12 +3043,12 @@ mod tests {
             "{report}"
         );
         assert!(
-            report.contains("Spearman rank correlation 0.868;"),
+            report.contains("Spearman rank correlation 0.920;"),
             "{report}"
         );
         for (group, n, error) in [
             ("vectorized ji = 32/64", 106, "1.193"),
-            ("scalar, ii innermost", 263, "1.416"),
+            ("scalar, ii innermost", 263, "1.203"),
             ("\"vectorized\" ji <= 16 (scalar code)", 100, "1.159"),
         ] {
             let row = report
@@ -2860,7 +3077,7 @@ mod tests {
         assert_eq!(sizes, 1000, "{report}");
         let all = compare_report("run 3", &text, None).expect("compares");
         assert!(
-            all.contains("1013 records") && all.contains("correlation 0.873;"),
+            all.contains("1013 records") && all.contains("correlation 0.923;"),
             "{all}"
         );
     }
