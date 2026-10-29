@@ -202,18 +202,21 @@ fn clang_keeps_the_c_tile_in_registers_across_k_when_the_tile_is_unrolled() {
 
 /// AArch64 only: on x86-64 clang tiles this nest by itself. There it vectorizes `ji` at
 /// width 4, interleaves 4 vectors and unrolls `ii`, which gives 16 `<4 x float>`
-/// accumulators without any unroll step (ubuntu CI, clang 18.1.3). On AArch64 it unrolls
-/// `ji` before the vectorizer and keeps C in memory (clang 18-22).
+/// accumulators without any unroll step (ubuntu CI, clang 18.1.3). On AArch64 the answer
+/// depends on the hint on `ji`: with the plain `vectorize(enable)` clang unrolled the 16
+/// iterations before the vectorizer and kept C in memory (0 phis, clang 18-22; see
+/// `clang_fully_unrolls_a_loop_of_16_iterations_with_the_plain_hint`). `emit_c` now prints
+/// `vectorize_width(16) unroll(disable)` for it, `ji` is one vector iteration, and the 4 rows
+/// of the tile are held across `k` as with the unroll steps.
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn clang_keeps_nothing_in_registers_without_the_unroll_steps() {
-    // `TILE_UNROLLED` without the two unroll requests: C is loaded and stored on every
-    // iteration of `k`.
+fn clang_keeps_the_c_tile_in_registers_without_the_unroll_steps_on_aarch64() {
+    // `TILE_UNROLLED` without the two unroll requests.
     const TILE: &str = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
                         reorder(1, io, jo, k, ii, ji); vectorize(1, ji)";
     let (kernel, _) = scheduled(TILE);
     let (source, ir, count) = float_phis("phis-rolled", &kernel);
-    assert_eq!(count, 0, "{source}\n{ir}");
+    assert_eq!(count, 4, "{source}\n{ir}");
 }
 
 #[test]

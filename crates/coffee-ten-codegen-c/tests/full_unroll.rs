@@ -49,11 +49,20 @@ fn scheduled(n: usize, text: &str) -> Kernel {
 /// Runs clang on the C of `kernel` with `BENCH_FLAGS` and `extra`; returns the C source and
 /// stderr.
 fn clang(name: &str, kernel: &Kernel, extra: &[&str], out_name: &str) -> (String, String, String) {
-    let source = emit_c(kernel).unwrap();
+    clang_source(name, &emit_c(kernel).unwrap(), extra, out_name)
+}
+
+/// Like `clang`, on C `source`.
+fn clang_source(
+    name: &str,
+    source: &str,
+    extra: &[&str],
+    out_name: &str,
+) -> (String, String, String) {
     let dir = TempDir::new(name);
     let c_path = dir.0.join("k.c");
     let out_path = dir.0.join(out_name);
-    std::fs::write(&c_path, &source).expect("write C source");
+    std::fs::write(&c_path, source).expect("write C source");
     let output = Command::new("clang")
         .args(BENCH_FLAGS)
         .args(extra)
@@ -65,21 +74,27 @@ fn clang(name: &str, kernel: &Kernel, extra: &[&str], out_name: &str) -> (String
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(output.status.success(), "clang failed:\n{stderr}");
     let produced = std::fs::read_to_string(&out_path).unwrap_or_default();
-    (source, stderr, produced)
+    (source.to_string(), stderr, produced)
 }
 
-/// The "vectorized loop" remarks of clang for the update nest of the `n x n x n` matmul
+/// The C of the update nest of the `n x n x n` matmul
 /// `split(1, j, jo, ji, w); reorder(1, i, jo, k, ji); vectorize(1, ji)`: `ji` has `w`
 /// iterations.
-fn remarks_for_ji(n: usize, w: usize) -> Vec<String> {
+fn ji_source(n: usize, w: usize) -> String {
     let text = format!("split(1, j, jo, ji, {w}); reorder(1, i, jo, k, ji); vectorize(1, ji)");
-    let (source, stderr, _) = clang(
-        &format!("remark-{n}-{w}"),
-        &scheduled(n, &text),
+    let source = emit_c(&scheduled(n, &text)).unwrap();
+    assert!(source.contains("vectorize(enable)"), "{source}");
+    source
+}
+
+/// The "vectorized loop" remarks of clang for C `source` (`ji_source`, perhaps edited).
+fn remarks_of(name: &str, source: &str) -> Vec<String> {
+    let (_, stderr, _) = clang_source(
+        name,
+        source,
         &["-Rpass=loop-vectorize", "-S", "-emit-llvm"],
         "k.ll",
     );
-    assert!(source.contains("vectorize(enable)"), "{source}");
     stderr
         .lines()
         .filter(|line| line.contains("remark: vectorized loop"))
@@ -87,14 +102,33 @@ fn remarks_for_ji(n: usize, w: usize) -> Vec<String> {
         .collect()
 }
 
-/// `CLANG_FULL_UNROLL_LIMIT` = 16 of the model, AArch64 only: a marked loop of 16 iterations
-/// gets no vectorized-loop remark (clang unrolled it fully first). Apple clang 21. The model
-/// describes the M5; on x86-64 clang 18 (ubuntu CI) the same loop IS vectorized, width 4,
-/// checked with `zig cc -target x86_64-linux-gnu`, so the threshold is a property of the target.
+fn remarks_for_ji(n: usize, w: usize) -> Vec<String> {
+    remarks_of(&format!("remark-{n}-{w}"), &ji_source(n, w))
+}
+
+/// `CLANG_FULL_UNROLL_LIMIT` = 16 of the model, AArch64 only: a loop of 16 iterations marked
+/// with the plain `vectorize(enable)` gets no vectorized-loop remark (clang unrolled it fully
+/// first). Apple clang 21. The model describes the M5; on x86-64 clang 18 (ubuntu CI) the same
+/// loop IS vectorized, width 4, checked with `zig cc -target x86_64-linux-gnu`, so the
+/// threshold is a property of the target. `emit_c` no longer prints the plain hint for such a
+/// loop (see the next test), so the test removes the width and `unroll(disable)` from the C.
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn clang_fully_unrolls_a_marked_loop_of_16_iterations() {
-    assert_eq!(remarks_for_ji(64, 16), Vec::<String>::new());
+fn clang_fully_unrolls_a_loop_of_16_iterations_with_the_plain_hint() {
+    let width_hint = " vectorize_width(16) unroll(disable)";
+    let generated = ji_source(64, 16);
+    assert!(generated.contains(width_hint), "{generated}");
+    let plain = generated.replace(width_hint, "");
+    assert_eq!(remarks_of("remark-plain-16", &plain), Vec::<String>::new());
+}
+
+/// What `emit_c` prints for a marked loop of 16 iterations, `vectorize(enable)
+/// vectorize_width(16) unroll(disable)`, is vectorized by clang on every target (on AArch64 it
+/// is the one vector iteration; it got no remark with the plain hint, see the test above).
+#[test]
+fn clang_vectorizes_a_marked_loop_of_16_iterations() {
+    let remarks = remarks_for_ji(64, 16);
+    assert!(!remarks.is_empty(), "{remarks:?}");
 }
 
 /// Above the threshold the pragma vectorizes on every target: a marked loop of 17 and one of
