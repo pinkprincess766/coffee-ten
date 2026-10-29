@@ -230,6 +230,16 @@ fn indent(level: usize) -> String {
     "    ".repeat(level)
 }
 
+/// The longest loop (iterations) that clang fully unrolls before its loop vectorizer sees it,
+/// at `-O2` on AArch64: a `#pragma clang loop vectorize(enable)` on such a loop gets no
+/// vectorization remark, and with `-fno-slp-vectorize` the unrolled code stays scalar.
+/// By hand on Apple M5, `-O2 -ffp-contract=fast -fno-vectorize -fno-slp-vectorize`, N = 256
+/// matmul, `split(1, j, jo, ji, JI); reorder(1, i, jo, k, ji); vectorize(1, ji)`: JI = 8 / 16
+/// is 8 / 16 scalar `fmadd` at 19.3 / 29.4 GFLOP/s with `vectorize(enable)` alone, and 2 / 4
+/// `fmla.4s` at 23.4 / 39.1 with `vectorize_width(JI) unroll(disable)`. On x86 clang 18
+/// vectorizes a loop of 16 anyway, and the hint is harmless there.
+const CLANG_EARLY_UNROLL_LIMIT: usize = 16;
+
 fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
     for (depth, l) in nest.loops.iter().enumerate() {
         // A vectorized loop is unrolled by vectorizing it at a width equal to its extent (a
@@ -237,11 +247,16 @@ fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
         // on it would let clang unroll it completely before the loop vectorizer runs, and with
         // `-fno-slp-vectorize` that leaves scalar code (by hand, N = 256 register tile: 19
         // GFLOP/s, against 121 vectorized); `unroll(disable)` keeps the early unroll away.
+        // The same hint goes on a vectorized loop that is not unrolled but is a power of two
+        // of at most `CLANG_EARLY_UNROLL_LIMIT`: clang would unroll it the same way. Longer
+        // loops keep the plain hint: there `unroll(disable)` would also stop clang from
+        // interleaving (N = 256 tiled + vectorize, ji of 64: 58 against 27 GFLOP/s).
+        let early_unrolled = l.extent <= CLANG_EARLY_UNROLL_LIMIT && l.extent.is_power_of_two();
         let hints = match (l.vectorize, l.unroll) {
             (false, false) => None,
-            (true, false) => Some("vectorize(enable)".to_string()),
+            (true, false) if !early_unrolled => Some("vectorize(enable)".to_string()),
             (false, true) => Some("unroll(full)".to_string()),
-            (true, true) => Some(format!(
+            (true, _) => Some(format!(
                 "vectorize(enable) vectorize_width({}) unroll(disable)",
                 l.extent
             )),
@@ -532,9 +547,10 @@ mod tests {
             .collect();
         assert_eq!(pragmas.len(), 1, "{text}");
         let at = pragmas[0];
+        // `j` has 2 iterations: a power of two of at most 16, so the width hint.
         assert_eq!(
             lines[at],
-            "            #pragma clang loop vectorize(enable)"
+            "            #pragma clang loop vectorize(enable) vectorize_width(2) unroll(disable)"
         );
         assert_eq!(lines[at + 1], "            for (long j = 0; j < 2; j++) {");
         // Nest 0 also has a `j` loop; the marked one is the last in the text, in nest 1.
@@ -579,6 +595,42 @@ mod tests {
                 "            for (long j = 0; j < 2; j++) {".to_string()
             )]
         );
+    }
+
+    /// The hint on the vectorized (not unrolled) `ji` of `split(1, j, jo, ji, extent)`.
+    fn hint_for_ji(extent: usize) -> String {
+        let pragmas = pragma_lines(&format!("split(1, j, jo, ji, {extent}); vectorize(1, ji)"));
+        assert_eq!(pragmas.len(), 1, "{pragmas:?}");
+        let (pragma, for_line) = &pragmas[0];
+        assert_eq!(
+            for_line.trim(),
+            format!("for (long ji = 0; ji < {extent}; ji++) {{")
+        );
+        pragma.trim().to_string()
+    }
+
+    #[test]
+    fn a_vectorized_power_of_two_loop_up_to_16_gets_the_width_hint() {
+        for extent in [1, 2, 4, 8, 16] {
+            assert_eq!(
+                hint_for_ji(extent),
+                format!(
+                    "#pragma clang loop vectorize(enable) vectorize_width({extent}) unroll(disable)"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn other_vectorized_loops_keep_the_plain_hint() {
+        // Not a power of two (clang would ignore the width), or longer than 16.
+        for extent in [3, 6, 12, 17, 32, 64] {
+            assert_eq!(
+                hint_for_ji(extent),
+                "#pragma clang loop vectorize(enable)",
+                "extent {extent}"
+            );
+        }
     }
 
     #[test]
