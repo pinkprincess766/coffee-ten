@@ -3,13 +3,16 @@
 //! automatic vectorization off.
 
 use coffee_ten_codegen_c::{TEST_FLAGS, compile, emit_c};
+use coffee_ten_interp::{Tensor, run_f32};
 use coffee_ten_ir::{BinaryOp, Graph, NodeId, Shape, UnaryOp};
 use coffee_ten_loop::{Kernel, Schedule, apply, lower};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Large enough that clang does not unroll the `j` loop completely before it can vectorize
-/// it: with 16 the pragma gets no remark at all.
+/// Longer than 16, so the marked `j` loop keeps the plain `vectorize(enable)` hint, which
+/// clang can act on: it unrolls a loop of up to 16 completely before it can vectorize it
+/// (on AArch64), which is why such a loop gets `vectorize_width` and `unroll(disable)`
+/// instead (see the tests at the end).
 const N: usize = 32;
 
 /// A fresh directory, removed when dropped (also if the test panics).
@@ -158,5 +161,84 @@ fn vectorized_matmul_equals_the_plain_one_bit_for_bit() {
             plain.to_bits(),
             "C[{n}]: vectorized {vectorized:?}, plain {plain:?}"
         );
+    }
+}
+
+/// Lines of the vectorized-loop remarks for the `ji` loop of the `N x N` matmul with
+/// `split(1, j, jo, ji, w); reorder(1, i, jo, k, ji); vectorize(1, ji)`, and the line of
+/// that loop.
+fn ji_remarks(w: usize) -> (Vec<usize>, usize) {
+    let text = format!("split(1, j, jo, ji, {w}); reorder(1, i, jo, k, ji); vectorize(1, ji)");
+    let (g, prod) = matmul_graph();
+    let source = emit_c(&scheduled(&g, prod, &text)).unwrap();
+    let marked = line_of(&source, "for (long ji", 0);
+    let remarks = vectorized_loops(&format!("ji-{w}"), &source);
+    (remarks.iter().map(|(line, _)| *line).collect(), marked)
+}
+
+/// A marked `ji` of 8 or 16 is one vector iteration, not a scalar loop: clang vectorizes
+/// it. With the plain `vectorize(enable)` clang unrolled it completely before the loop
+/// vectorizer on AArch64 (no remark), and with the SLP vectorizer off that left scalar code.
+/// Every remark of the nest, also one for a copy clang makes of the `jo` loop, points at
+/// the `ji` line.
+#[test]
+fn clang_vectorizes_a_marked_ji_of_8_and_of_16() {
+    for w in [8, 16] {
+        let (lines, marked) = ji_remarks(w);
+        assert!(!lines.is_empty(), "ji = {w}: no remark");
+        assert!(
+            lines.iter().all(|&line| line == marked),
+            "ji = {w}: {lines:?}"
+        );
+    }
+}
+
+fn ramp(len: usize, seed: usize) -> Vec<f32> {
+    (0..len)
+        .map(|n| ((n * 37 + seed * 11) % 101) as f32 * 0.173 - 8.7)
+        .collect()
+}
+
+/// `A (3, 5) @ B (5, cols)` compiled with `text` and run on rounding data, against the
+/// interpreter bit for bit. Matmul vectorized over `j` keeps the order of the `k` sum of
+/// every element, and `TEST_FLAGS` do not contract, so the bits are the interpreter's.
+fn assert_matmul_equals_interpreter(cols: usize, text: &str) {
+    let mut g = Graph::new();
+    let a = g.input("A", shape(&[3, 5])).unwrap();
+    let b = g.input("B", shape(&[5, cols])).unwrap();
+    let prod = g.matmul(a, b).unwrap();
+    let (a_data, b_data) = (ramp(3 * 5, 1), ramp(5 * cols, 2));
+    let a_tensor = Tensor::new(shape(&[3, 5]), a_data.clone()).unwrap();
+    let b_tensor = Tensor::new(shape(&[5, cols]), b_data.clone()).unwrap();
+    let want = run_f32(&g, prod, &[("A", &a_tensor), ("B", &b_tensor)]).unwrap();
+
+    let dir = TempDir::new(&format!("short-{cols}-{}", text.len()));
+    let compiled = compile(&scheduled(&g, prod, text), &dir.0).unwrap();
+    let (mut a_run, mut b_run) = (a_data, b_data);
+    let mut got = vec![f32::NAN; 3 * cols];
+    compiled
+        .run(&mut [&mut a_run, &mut b_run, &mut got])
+        .unwrap();
+
+    assert!(want.data().iter().any(|x| x.fract() != 0.0));
+    for (n, (got, want)) in got.iter().zip(want.data()).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{text:?}, {cols} columns, C[{n}]: got {got:?}, expected {want:?}"
+        );
+    }
+}
+
+/// Every length of the vectorized loop from 1 to 16, power of two or not: the loop is `j`
+/// itself (`cols` = length), or the `ji` of a split of 20 columns, which has a guard when
+/// the length does not divide 20.
+#[test]
+fn vectorized_loops_of_1_to_16_iterations_equal_the_interpreter_bit_for_bit() {
+    for len in 1..=16 {
+        assert_matmul_equals_interpreter(len, "vectorize(1, j)");
+        let split =
+            format!("split(1, j, jo, ji, {len}); reorder(1, i, jo, k, ji); vectorize(1, ji)");
+        assert_matmul_equals_interpreter(20, &split);
     }
 }
