@@ -279,6 +279,47 @@ The whole table and Spearman 0.853 come from one command:
 1013 records: Spearman 0.858). The same groups were off by about the same
 amount in run 2, so these are the model's stable errors, not noise of one sample.
 
+## Model group errors after C4 (v1.4–v1.7)
+
+C4 asked for the median of predicted / measured to lie in [0.83, 1.20] for each of the three
+groups that were off in run 3, by fixing the model's formulas, not by fitting. Each fix is a
+measured `bench/peak` point for a code shape the model had wrong, plus a rule that recognizes
+that shape in the compiled nest:
+
+| version | PR | what it adds | peak point |
+|---|---|---|---|
+| v1.4 | #82 | separate load and store ceilings for vector code | `fma_store` (P4) |
+| v1.5 | #85 | a point for fully unrolled scalar bodies with unit stride | `fma_mem_acc_scalar_unrolled` (P5) |
+| v1.6 | #90 | "reload": a rolled scalar loop walks C at a stride that is a multiple of 256 B and the next loop out reloads it | `fma_col_reload` (P6) |
+| v1.7 | #93, #94 | "colload": an unrolled scalar body loads down a column at a stride that is a multiple of 256 B, one accumulator per copy | `fma_col_unrolled` (P7) |
+
+The 256 B granule of v1.6 and v1.7 comes from hand sweeps of one array's row stride with the
+code unchanged. A likely reading, not proven, is store-to-load matching and L1 bank conflicts
+on addresses equal mod 256 B.
+
+Model v1.7, 1000 random records, median of predicted / measured per group:
+
+| group | run 3, P7 line | run 3, P6 line | run 2, P7 line | run 3 at the start (v1.3, P3) |
+|---|---|---|---|---|
+| vectorized, `ji` = 128 | 1.074 | 1.076 | 0.995 | 1.083 |
+| **vectorized, `ji` = 32/64** | **1.171** | **1.191** | 1.031 | 1.495 |
+| **"vectorized", `ji` ≤ 16 (scalar code)** | **1.147** | **1.155** | 1.136 | 0.734 |
+| scalar, `ji` innermost | 1.150 | 1.165 | 1.112 | 1.100 |
+| **scalar, `ii` innermost** | **1.122** | **1.127** | 1.116 | 1.416 |
+| scalar, `k`/`ki` innermost | 0.910 | 0.886 | 0.877 | 0.906 |
+| Spearman | 0.924 | 0.924 | 0.921 | 0.853 |
+
+**C4 is met on run 3** with either peak line. The margin depends on which peak run calibrates
+the machine: the vectorized 32/64 group is 1.171 with P7 and 1.191 with P6. Two caveats.
+First, the rules were found on runs 2 and 3 and are checked on them, so this is in sample.
+A new hypothesis A run with a new seed would be the out-of-sample check. Second, every point
+is from one M5.
+
+Run 3 with the P7 line: `coffee-ten-bench model compare --from
+bench/results/2026-10-22-hypothesis-a-run3.jsonl --peak
+bench/results/2026-10-28-adcf09c-peak.jsonl --group random` (without `--group`, all 1013
+records: Spearman 0.927).
+
 ## Validity
 
 - **S1's second half is not usable.** In S1 most `relu(A @ B + bias)` series and matmul at
