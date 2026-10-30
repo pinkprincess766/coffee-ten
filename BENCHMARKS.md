@@ -359,7 +359,20 @@ in the 40 store-bound rows that have a rolled `ii` directly above the short vect
 of them `ii` is 16 to 128 with `k` or `ki` directly outside it, and they measure 12–40 GFLOP/s
 (median per `ii`) against a predicted store ceiling of 56.7. This is the
 column-reload shape of v1.6 (C's row is reloaded at the next `k` at a 1 KiB stride) in vector
-code. The v1.6 rule covers only scalar code. Not yet measured in isolation.
+code. The v1.6 rule covers only scalar code.
+
+A hand microbenchmark of that nest (`io, jo, k, ii, ji`, `ii` rolled, `ji` one vector
+iteration, measurement flags, M5) reproduces it, and padding only C's row to 272 floats
+removes most of it:
+
+| `ji` | `ii` = 16 / 32 / 64 / 128, C row 1 KiB | C row 272 floats | run 4 (median per `ii`) |
+|---|---|---|---|
+| 8 | 12.3 / 18.3 / 27.2 / 13.5 | 38.4 / 45.3 / 45.9 / 31.2 | 12.4 / 17.4 / 26.4 / 13.3 |
+| 16 | 33.5 / 40.3 / 38.3 / 27.3 | 54.2 / 56.0 / 56.8 / 34.1 | 33.2 / 40.0 / 37.1 / 25.4 |
+
+**Open, not modelled.** At `ji` = 8 the rate moves non-monotonically with `ii` (12 to 27), so
+one calibration point in the style of v1.6 would not describe it. Left open by decision
+(2026-10-30) in favour of the plan's next items.
 
 ## Validity
 
