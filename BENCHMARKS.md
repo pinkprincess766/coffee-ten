@@ -160,7 +160,7 @@ seed 1, machine P2):
 | best of the model's top 10 (rank 2) | `split i 128, j 64, k 128; reorder io, ko, jo, ii, ki, ji; vectorize ji` | **75.86** [75.71–76.39] |
 
 **Ratio 0.622: the criterion is not met.** Over the 1000 random candidates the model's
-Spearman correlation with the measurements is 0.292, and its median error is ×2.10 (on
+Spearman correlation with the measurements is 0.292 (model v1.1), and its median error is ×2.10 (on
 the 19 hand-picked S3 schedules it was 0.922 and ×1.07). Why, from the log:
 
 - **`vectorize` on a short loop does nothing.** Under the benchmark flags clang fully
@@ -353,8 +353,8 @@ bench/results/2026-10-28-adcf09c-peak.jsonl --group random`):
 | **scalar, `ii` innermost** | 249 | 7.3 | 8.4 | **1.091** |
 | scalar, `k`/`ki` innermost | 244 | 7.6 | 6.9 | 0.875 |
 
-Spearman 0.915 (median error ×1.13). Two of C4's three groups hold out of sample. The `ji` ≤ 16
-group misses at 1.227, and that is the group whose code changed with C5. Most of its error is
+Spearman 0.915 (model v1.8, median error ×1.13). Two of C4's three groups hold out of
+sample. The `ji` ≤ 16 group misses at 1.227, and that is the group whose code changed with C5. Most of its error is
 in the 40 store-bound rows that have a rolled `ii` directly above the short vector `ji`. In 33
 of them `ii` is 16 to 128 with `k` or `ki` directly outside it, and they measure 12–40 GFLOP/s
 (median per `ii`) against a predicted store ceiling of 56.7. This is the
@@ -373,6 +373,9 @@ removes most of it:
 **Open, not modelled.** At `ji` = 8 the rate moves non-monotonically with `ii` (12 to 27), so
 one calibration point in the style of v1.6 would not describe it. Left open by decision
 (2026-10-30) in favour of the plan's next items.
+
+The command above reproduces this table, Spearman 0.915 and the median error with model v1.8
+at commit `0b25b77` (checked on 2026-10-30).
 
 ## Validity
 
