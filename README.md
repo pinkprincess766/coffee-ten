@@ -18,8 +18,10 @@ on a new random sample, met it out of sample (ratio 1.362), with Spearman 0.853 
 median error of ×1.26 between model and measurement over 1000 random schedules
 ([run 1](BENCHMARKS.md#hypothesis-a-spec-71-run-1-not-met),
 [run 2](BENCHMARKS.md#hypothesis-a-spec-71-run-2-met),
-[run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)). A hand-written 4×16
-register-tile schedule reaches 94–96% of the measured FMA peak for N ≤ 512
+[run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)). Run 4, with model v1.8
+and a new sample, met it by a small margin (ratio 1.022; Spearman 0.915, median error ×1.13;
+[run 4](BENCHMARKS.md#hypothesis-a-spec-71-run-4-met-c4-out-of-sample-two-of-three-groups)).
+A hand-written 4×16 register-tile schedule reaches 94–96% of the measured FMA peak for N ≤ 512
 ([Register tile](BENCHMARKS.md#register-tile-s3)). One machine and one problem size have been
 tested.
 
@@ -35,7 +37,7 @@ holds a schedule within 90% of the best of 1000 random measurements.
 
 Contributions: a compiler whose kernels match a reference interpreter bit for bit when a
 schedule keeps the order of sums, and within a derived error bound [14] otherwise
-([§2.1](#21-compiler)); an analytic cost model ([§2.3](#23-cost-model)); and three
+([§2.1](#21-compiler)); an analytic cost model ([§2.3](#23-cost-model)); and four
 recorded runs of hypothesis A with the raw data committed ([§3](#3-results)).
 
 ## 2. Method
@@ -76,7 +78,7 @@ relu. An illegal step raises `ValueError` with the step number.
 
 ### 2.3 Cost model
 
-The model (`crates/coffee-ten-bench/src/model.rs`, v1.3) predicts GFLOP/s of the matmul
+The model (`crates/coffee-ten-bench/src/model.rs`, v1.8) predicts GFLOP/s of the matmul
 update nest without running it. Cache traffic is computed from the footprint of each loop
 level; the compute ceiling is the lowest of the FMA peak, a load/store ceiling (accesses of
 `C` stay in memory unless held in registers) and a latency ceiling for dependent FMA chains;
@@ -84,6 +86,11 @@ the prediction is the roofline [1] minimum of compute and traffic. Machine numbe
 inputs, read from a `bench/peak` line ([Ceilings](BENCHMARKS.md#ceilings-benchpeak-one-core)).
 Fixes after run 1, frozen before the next run: short "vectorized" loops modelled as scalar
 (#57), FMA latency ceilings (#58, #59, v1.2), loops clang fully unrolls (#63, v1.3).
+Fixes after run 3 (v1.4–v1.8): separate load and store ceilings (#82, `fma_store`),
+unrolled scalar bodies (#85, `fma_mem_acc_scalar_unrolled`),
+column reload (#90, `fma_col_reload`), unrolled column load (#93, #94, `fma_col_unrolled`),
+and a short vectorized loop as one vector iteration (#97, after the codegen of #96; no new
+point); see [Model group errors after C4](BENCHMARKS.md#model-group-errors-after-c4-v14v17).
 `coffee-ten-bench model compare --from <results.jsonl>` prints the model against
 measurements, with Spearman rank correlation and median error.
 
@@ -134,6 +141,11 @@ is N / 8 FLOP/byte on compulsory DRAM traffic, an upper bound on the real AI of 
   ([run 2](BENCHMARKS.md#hypothesis-a-spec-71-run-2-met)).
 - Run 3 (#64): ratio 1.362, met out of sample on a new seed (model v1.3, Spearman 0.853,
   median error ×1.26) ([run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)).
+- Run 4 (#98): ratio 1.022, met by a small margin (model v1.8, Spearman 0.915, median error
+  ×1.13). It is the first run with the short-loop codegen (#96): random search now meets
+  register tiles early. The top 10 was chosen by v1.7 (the run started from a checkout
+  before #97); v1.8 has the same rank 1
+  ([run 4](BENCHMARKS.md#hypothesis-a-spec-71-run-4-met-c4-out-of-sample-two-of-three-groups)).
 - Model-guided local search over one-step schedule neighbours (#65): code only, no
   measured run yet.
 
@@ -146,9 +158,24 @@ as in [BENCHMARKS.md](BENCHMARKS.md#hypothesis-a-spec-71-run-1-not-met). Solid l
 (model best = random best), dashed 0.9 (the criterion). Raw data
 `bench/results/*hypothesis-a*.jsonl`; `python3 bench/hypothesis_ratio.py`.
 
-Known model errors, stable across runs 2 and 3 (#64): vectorized `ji` = 32/64
-over-predicted ×1.50, scalar `ii` innermost ×1.42, short "vectorized" loops (scalar code)
-under-predicted ×0.73 ([run 3](BENCHMARKS.md#hypothesis-a-spec-71-run-3-met-out-of-sample)).
+C4 status: the three model errors of run 3 (vectorized `ji` = 32/64 ×1.50, scalar `ii`
+innermost ×1.42, short "vectorized" loops ×0.73) were to be brought into [0.83, 1.20]. In
+sample, on run 3 with v1.7, they are 1.171 / 1.147 / 1.122. Out of sample, on run 4 with
+v1.8, they are 1.109 / 1.227 / 1.091: the `ji` ≤ 16 group misses. The cause is the column
+reload of v1.6 in vector code, which the model does not cover; a hand microbenchmark
+reproduces run 4's rates (#99). Open
+([run 4](BENCHMARKS.md#hypothesis-a-spec-71-run-4-met-c4-out-of-sample-two-of-three-groups)).
+
+One command reproduces the run 4 numbers (model v1.8, P7 `bench/peak` line):
+
+```sh
+cargo run --release -p coffee-ten-bench -- model compare \
+  --from bench/results/2026-10-30-hypothesis-a-run4.jsonl \
+  --peak bench/results/2026-10-28-adcf09c-peak.jsonl --group random
+```
+
+It prints `Spearman rank correlation 0.915; median |ln(predicted/measured)| 0.125 (a factor
+1.13)` and the group table of BENCHMARKS.md, row for row.
 
 ![Fig. 3](docs/model-vs-measured.png)
 
@@ -164,8 +191,9 @@ numbers are the output of `coffee-ten-bench model compare`, the same as in
 ## 4. Limitations
 
 Scope of the evidence: one machine (Apple M5, one core), one size (N = 256) for hypothesis
-A, seeds 1–3. Not done yet: correcting the three model errors above, and run 4 at
-N = 512. Threats to validity of the measurements: [Validity](BENCHMARKS.md#validity).
+A, seeds 1, 2, 3 (runs 1–3) and 5 (run 4). Open: the vector column reload (the `ji` ≤ 16
+group above), and a run at another N. Threats to validity of the measurements:
+[Validity](BENCHMARKS.md#validity).
 
 Compiler limitations:
 
