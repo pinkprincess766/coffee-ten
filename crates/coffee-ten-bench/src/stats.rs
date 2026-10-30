@@ -121,6 +121,25 @@ mod tests {
         assert_eq!(summarize(&[]), None);
     }
 
+    #[test]
+    fn percentiles_with_ties_and_an_even_count() {
+        // Sorted 1, 2, 2, 2, 3, 5; n = 6: indices 0, 5/4 = 1, 5/2 = 2, 15/4 = 3, all inside
+        // the run of 2s, and the median is the lower of the two middle values (no averaging).
+        let s = summarize(&[3.0, 2.0, 5.0, 2.0, 1.0, 2.0]).unwrap();
+        assert_eq!(s.min, 1.0);
+        assert_eq!(s.p25, 2.0);
+        assert_eq!(s.median, 2.0);
+        assert_eq!(s.p75, 2.0);
+        // All equal: every statistic is that value.
+        let flat = summarize(&[4.5; 7]).unwrap();
+        assert_eq!(
+            (flat.min, flat.p25, flat.median, flat.p75),
+            (4.5, 4.5, 4.5, 4.5)
+        );
+        // Two values: the median is the lower one.
+        assert_eq!(summarize(&[9.0, 7.0]).unwrap().median, 7.0);
+    }
+
     /// 10 rounds: the first 5 have median 100, the last 5 have median `last`.
     fn rounds_with_last_median(last: f64) -> Vec<f64> {
         let mut rates = vec![100.0; DRIFT_ROUNDS];
