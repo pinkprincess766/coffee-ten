@@ -1,9 +1,10 @@
-//! Analytic cost model, version 1.7 (spec §7.1): cache traffic from the loop footprints plus a
+//! Analytic cost model, version 1.8 (spec §7.1): cache traffic from the loop footprints plus a
 //! roofline whose compute ceiling is the lowest of the FMA, the load, the store (vectorized
 //! nests; scalar nests have one combined load/store ceiling) and the latency ceiling (dependent FMA chains of a reduction held in registers, see `latency_gflops`).
 //! v1.6 adds one more scalar ceiling, "reload" (`column_reload`), v1.7 another, "colload"
-//! (`column_load_unrolled`). Deterministic; the machine numbers are inputs (assumed, or read from
-//! a results file).
+//! (`column_load_unrolled`). v1.8 follows the codegen of #96: a short power-of-two `vectorize`
+//! is one vector iteration, not scalar code (`one_vector_iteration`). Deterministic; the machine
+//! numbers are inputs (assumed, or read from a results file).
 //!
 //! Only the update nest (nest 1) of a matmul kernel is modelled; the init nest is ignored.
 //! Guards are ignored (the schedule space has none). Loop extents are exact, so the
@@ -52,7 +53,8 @@ const REG_BUDGET: usize = 24;
 /// unrolled by the schedule) before its loop vectorizer sees it, under `BENCH_FLAGS`: the pragma
 /// then gets no "vectorized loop" remark and the code is scalar. ASSUMED threshold, found with
 /// Apple clang 21: 16 iterations get no remark, 17 and 32 do. This MUST change together with
-/// `tests/full_unroll.rs` in `coffee-ten-codegen-c`, which pins it.
+/// `tests/full_unroll.rs` in `coffee-ten-codegen-c`, which pins it, and with
+/// `CLANG_EARLY_UNROLL_LIMIT` in its `lib.rs` (the same 16, #96), see `one_vector_iteration`.
 const CLANG_FULL_UNROLL_LIMIT: usize = 16;
 /// Size (in LLVM instruction units) up to which clang fully unrolls a loop whose trip count
 /// is known: its `unroll-threshold` at -O2. See `fully_unrolled`.
@@ -293,10 +295,13 @@ fn model_err(msg: String) -> BenchError {
 ///
 /// | loop (rolled, not unrolled by the schedule)      | r   | unrolled if extent <= |
 /// |--------------------------------------------------|-----|-----------------------|
-/// | innermost, scalar or marked vectorized           | 0   | 16                    |
+/// | innermost, scalar or marked vectorized (*)       | 0   | 16                    |
 /// | around the innermost loop (`ki` around `ji`)     | 1   | 10 (8)                |
 /// | `ii` or `ko` around `ki, ji`                     | 2   | 7 (4)                 |
 /// | around 3, 4, 5 rolled loops (`jo`, `io`, `ko`)   | 3-5 | 6, 5, 4 (4)           |
+///
+/// (*) Not a vectorized loop that is a power of two (all of them in the space): since v1.8 that is
+/// `one_vector_iteration`, which clang does not unroll.
 ///
 /// The extents in the space are 2 to 128 in powers of two, the value in brackets is what that
 /// means for them. An unrolled inner loop makes the next one bigger: `ki` = 8 around a scalar
@@ -304,9 +309,8 @@ fn model_err(msg: String) -> BenchError {
 /// still a loop for the unroller (the vectorizer runs later), so `ki` = 8 around a vectorized
 /// `ji` of 64 becomes 8 copies of that loop; `ki` = 16 stays rolled.
 /// A loop unrolled by the schedule is always unrolled and multiplies the body in the same way.
-/// A loop that is vectorized AND unrolled (a register tile) is emitted as `vectorize_width(
-/// extent) unroll(disable)` by `codegen-c`: one vector iteration, not unrolled, and IS
-/// vectorized, whatever its extent.
+/// A loop for which `one_vector_iteration` holds is emitted as `vectorize_width(extent)
+/// unroll(disable)` by `codegen-c`: one vector iteration, not unrolled, and IS vectorized.
 fn fully_unrolled(loops: &[Loop]) -> Vec<bool> {
     let mut unrolled = vec![false; loops.len()];
     let mut inside = 0_usize; // size of what the loop below contributes to the body of `p`
@@ -316,8 +320,7 @@ fn fully_unrolled(loops: &[Loop]) -> Vec<bool> {
         } else {
             LOOP_LEVEL_SIZE + inside
         };
-        let one_vector_iteration = l.vectorize && l.unroll;
-        unrolled[p] = !one_vector_iteration
+        unrolled[p] = !one_vector_iteration(l)
             && (l.unroll || l.extent.saturating_mul(size) <= CLANG_UNROLL_SIZE);
         inside = if unrolled[p] {
             l.extent.saturating_mul(size)
@@ -328,14 +331,30 @@ fn fully_unrolled(loops: &[Loop]) -> Vec<bool> {
     unrolled
 }
 
+/// Whether `codegen-c` emits `vectorize(enable) vectorize_width(extent) unroll(disable)` for
+/// `l`, so that clang compiles it as ONE vector iteration (the vectorizer widens it to the
+/// extent, `vectorize` stays on, no scalar unroll). `nest_c` does so for a vectorized loop
+/// (1) that the schedule unrolls (a register tile; its extent is a power of two, see `apply`),
+/// or (2) that is a power of two of at most `CLANG_EARLY_UNROLL_LIMIT` = `CLANG_FULL_UNROLL_LIMIT`
+/// (#96, 284577f): clang would otherwise unroll it before the vectorizer, into scalar code (rule
+/// K, v1.3 to v1.7, which the model keeps for the other short vectorized loops: an extent that is
+/// not a power of two, such as the unsplit `j` of N = 12, gets the plain hint). The pragma of (2)
+/// is the pragma of (1), so clang sees the same code and the model treats (2) as (1).
+fn one_vector_iteration(l: &Loop) -> bool {
+    l.vectorize && (l.unroll || (l.extent <= CLANG_FULL_UNROLL_LIMIT && l.extent.is_power_of_two()))
+}
+
 /// `nest` as clang compiles it: the loops of `fully_unrolled` become unrolled loops (a
-/// vectorized one becomes scalar: vectorize off, unroll on). Idempotent.
+/// vectorized one becomes scalar: vectorize off, unroll on); a loop of `one_vector_iteration`
+/// stays vectorized and is marked unrolled, as a register tile's `ji` is. Idempotent.
 fn as_compiled(nest: &LoopNest) -> LoopNest {
     let mut compiled = nest.clone();
     let unrolled = fully_unrolled(&nest.loops);
     for (l, &is_unrolled) in compiled.loops.iter_mut().zip(&unrolled) {
         if is_unrolled {
             l.vectorize = false;
+            l.unroll = true;
+        } else if one_vector_iteration(l) {
             l.unroll = true;
         }
     }
@@ -868,10 +887,11 @@ fn nest_ops(nest: &LoopNest, lanes: usize) -> Result<(f64, f64, f64), BenchError
 /// `ki`, but all FMAs add into one `C`, a dependent chain); see the tests.
 ///
 /// A loop marked vectorized with at most `CLANG_FULL_UNROLL_LIMIT` iterations that the schedule
-/// does not unroll is counted as a scalar unrolled loop, see `as_compiled`. Hand value, N = 16:
-/// `vectorize(1, j)` is `unroll(1, j)`: `C` over `j` is 16 scalar registers, held across `k`:
-/// per `i`, C 16 + 16, A 16, B 16 * 16: 304 / 256 FMAs = 1.1875 (4 vector registers and
-/// 1.375 if it were vectorized).
+/// does not unroll is, since v1.8, a vector loop if its extent is a power of two
+/// (`one_vector_iteration`) and a scalar unrolled loop otherwise (rule K), see `as_compiled`.
+/// Hand value, N = 12 (not a power of two): `vectorize(1, j)` is `unroll(1, j)`: `C` over `j` is
+/// 12 scalar registers, held across `k`: per `i`, C 12 + 12, A 12, B 12 * 12: 180 / 144 FMAs =
+/// 1.25. At N = 16 it is vectorized: C 4 + 4, A 16, B 16 * 4: 88 / 64 FMAs = 1.375.
 pub fn mem_ops_per_fma(nest: &LoopNest, lanes: usize) -> Result<f64, BenchError> {
     let (loads, stores, fma_ops) = nest_ops(&as_compiled(nest), lanes)?;
     Ok((loads + stores) / fma_ops)
@@ -1371,7 +1391,7 @@ pub fn report(n: usize, machine: &Machine, source: &str, ranked: &[Ranked]) -> S
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "PREDICTION by the analytic model v1.7, not a measurement"
+        "PREDICTION by the analytic model v1.8, not a measurement"
     );
     let _ = writeln!(
         text,
@@ -1573,7 +1593,7 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "analytic model v1.7 (PREDICTION) against the measurements in {source}"
+        "analytic model v1.8 (PREDICTION) against the measurements in {source}"
     );
     let _ = writeln!(
         out,
@@ -2193,9 +2213,11 @@ mod tests {
     /// - 16x32 (`ji` = 8 vectors), N = 64: C 8 + 8 per k and ii; A 1 per k and ii (held across
     ///   ji); B 8 per k (held across ii). Per k (16 * 8 = 128 FMAs): 16 * 17 + 8 = 280: 2.1875. IR:
     ///   the `ii` loop has 8 vector loads of C, 1 of A, 8 stores; the 8 loads of B are before it.
-    /// - 4x16: `ji` has 16 iterations, so it is scalar unrolled (`CLANG_FULL_UNROLL_LIMIT`), `ii`
-    ///   of 4 around it is 4 * (5 + 144) > 150 and stays a loop: C 4 * (16 + 16) per k, A 4, B 16
-    ///   (held across ii): 148 / 64 FMAs = 2.3125.
+    ///
+    /// The 4x16 tile is not here since v1.8: its `ji` of 16 is one vector iteration and the tile
+    /// holds C, see `the_c6_schedules_with_a_short_ji_are_predicted_as_vector_code`. (v1.7 had it
+    /// scalar unrolled: `ii` of 4 around 16 scalar copies is 4 * (5 + 144) > 150 and stays a
+    /// loop: C 4 * (16 + 16) per k, A 4, B 16 (held across ii): 148 / 64 FMAs = 2.3125.)
     #[test]
     fn a_tile_without_unroll_does_not_hold_c() {
         let rolled = |ri: usize, rj: usize| {
@@ -2205,7 +2227,6 @@ mod tests {
             )
         };
         assert_eq!(mem_ops(64, &rolled(16, 32)), 2.1875);
-        assert_eq!(mem_ops(64, &rolled(4, 16)), 2.3125);
     }
 
     /// The 4x32 tile without unroll steps: clang unrolls `ii` = 4 itself (4 * (5 + 9) = 56), and
@@ -2221,28 +2242,46 @@ mod tests {
         assert_eq!(mem_ops(64, tile), 3.125);
     }
 
-    /// A loop marked `vectorize` with at most `CLANG_FULL_UNROLL_LIMIT` = 16 iterations is
-    /// scalar and unrolled (clang unrolls it before the vectorizer, `tests/full_unroll.rs`).
-    /// Naive `i, k, j` at N = 16 with `vectorize(1, j)`: C over `j` is 16 scalar registers,
-    /// held across `k`; per `i`: C 16 + 16, A[i, k] 16, B 16 * 16 = 304 over 256 scalar FMAs =
-    /// 1.1875, the same as `unroll(1, j)`. Vectorized it would be C 4 + 4, A 16, B 64 = 88 over
-    /// 64 vector FMAs = 1.375. Predicted at the scalar rates: the FMA ceiling 100 / 4 = 25
-    /// (the scalar ld/st ceiling is 15 * 3 / 1.1875 = 37.9). One more iteration (N = 17, 5
-    /// vectors) and it is vectorized: per `i`, loads C 5 + A 17 + B 17 * 5 = 107 over 85 vector
-    /// FMAs = 1.2588, stores 5 / 85; the load ceiling is 60 * 2 / (107 / 85) = 95.33, below the
-    /// peak 100 (the store ceiling 58 / (5 / 85) is far above).
+    /// A loop marked `vectorize` with at most `CLANG_FULL_UNROLL_LIMIT` = 16 iterations that is
+    /// NOT a power of two is scalar and unrolled (rule K: clang unrolls it before the
+    /// vectorizer, `tests/full_unroll.rs`); a power of two is one vector iteration since v1.8
+    /// (`one_vector_iteration`, `codegen-c` emits the pragma of a register tile for it).
+    /// - N = 12 (the unsplit `j` of the naive `i, k, j`, the only way to a non-power of two in
+    ///   the space): C over `j` is 12 scalar registers, held across `k`; per `i`: C 12 + 12,
+    ///   A[i, k] 12, B 12 * 12 = 180 over 144 scalar FMAs = 1.25, the same as `unroll(1, j)`.
+    ///   Predicted at the scalar rates: the FMA ceiling 100 / 4 = 25 (the scalar ld/st ceiling
+    ///   is 23.2 * 3 / 1.25 = 55.68).
+    /// - N = 16: C over `j` is 4 vector registers: per `i`, loads C 4 + A 16 + B 16 * 4 = 84,
+    ///   stores 4, over 64 vector FMAs: 1.375 (1.3125 loads), the same as with `unroll(1, j)`
+    ///   added. Predicted: the load ceiling 60 * 2 / 1.3125 = 91.43; the latency ceiling (4
+    ///   chains of 16, 4 * 2.6 * (4 + 87.6 / 16) = 98.54) and the peak 100 are above it.
+    /// - N = 17 (5 vectors, not a power of two, over the limit) is vectorized as before: per
+    ///   `i`, loads C 5 + A 17 + B 17 * 5 = 107 over 85 vector FMAs = 1.2588, stores 5 / 85; the
+    ///   load ceiling is 60 * 2 / (107 / 85) = 95.33, below the peak 100 (the store ceiling 58 /
+    ///   (5 / 85) is far above).
     #[test]
-    fn a_short_vectorized_loop_is_predicted_as_scalar_unrolled_code() {
-        assert_eq!(mem_ops(16, "vectorize(1, j)"), 1.1875);
-        assert_eq!(mem_ops(16, "unroll(1, j)"), 1.1875);
+    fn a_short_vectorized_loop_is_scalar_unless_it_is_a_power_of_two() {
+        assert_eq!(mem_ops(12, "vectorize(1, j)"), 1.25);
+        assert_eq!(mem_ops(12, "unroll(1, j)"), 1.25);
+        assert_eq!(mem_ops(16, "vectorize(1, j)"), 1.375);
+        assert_eq!(mem_ops(16, "vectorize(1, j); unroll(1, j)"), 1.375);
         let machine = Machine {
             mem_gbs: 1e6,
             l2_gbs: 1e6,
             ..Machine::assumed_m5()
         };
+        let k = predict(&machine, &scheduled(12, "vectorize(1, j)")).expect("predicts");
+        assert!((k.gflops - 25.0).abs() < 1e-9, "{}", k.gflops);
+        assert_eq!(k.bound, "compute");
         let short = predict(&machine, &scheduled(16, "vectorize(1, j)")).expect("predicts");
-        assert!((short.gflops - 25.0).abs() < 1e-9, "{}", short.gflops);
-        assert_eq!(short.bound, "compute");
+        assert!(
+            (short.gflops - 60.0 * 2.0 / 1.3125).abs() < 1e-9,
+            "{}",
+            short.gflops
+        );
+        assert_eq!(short.bound, "load");
+        let tile = predict(&machine, &scheduled(16, "vectorize(1, j); unroll(1, j)"));
+        assert_eq!(short, tile.expect("predicts"));
         let long = predict(&machine, &scheduled(17, "vectorize(1, j)")).expect("predicts");
         assert!(
             (long.gflops - 60.0 * 2.0 * 85.0 / 107.0).abs() < 1e-9,
@@ -2265,7 +2304,73 @@ mod tests {
         assert_eq!((p.gflops, p.bound), (100.0, "compute"));
     }
 
-    /// The loops of `text` (N = 256) that `as_compiled` unrolls and the schedule did not.
+    /// C6: three schedules with `ji` <= 16 at N = 256 on `Machine::assumed_m5`, which clang
+    /// compiles to vector code since #96 (`one_vector_iteration`; before v1.8 the first two were
+    /// predicted as scalar unrolled code and the third did not hold C). Clang facts (Apple
+    /// clang 21, `BENCH_FLAGS`, by hand): 4, 2 and 16 `fmla.4s`, no `fmadd`, 1, 1 and 4 vector
+    /// phis of C for the three. The last one is the 4x16 tile without unroll steps: its
+    /// prediction is that of the same tile with them, whose pragma is identical.
+    /// - `i, jo, k, ji` with `ji` = 16: per `(i, jo)` C 4 vectors loaded and stored once (held
+    ///   across `k`), A 256, B 4 * 256 loads over 4 * 256 vector FMAs: m = (4 + 256 + 1024 + 4) /
+    ///   1024 = 1.2578125; loads 1.25390625 per FMA, load ceiling 60 * 2 / 1.25390625 = 95.70.
+    ///   The latency ceiling binds: 4 chains of 256, 4 * 2.6 * (4 + W / 256) = 4 * (3 * 2.6 +
+    ///   3.49) = 45.16.
+    /// - the same with `ji` = 8: C 2 vectors, B 2 * 256: m = (2 + 256 + 512 + 2) / 512 =
+    ///   1.5078125; load ceiling 79.79; latency, 2 chains: 4 * (2.6 + 3.49) = 24.36 binds.
+    /// - 4x16, `io, jo, k, ii, ji` (`ii` = 4 is unrolled by clang, 4 * (5 + 9) = 56): C 16
+    ///   vectors held across `k`, A 4 * 256, B 4 * 256 vectors:
+    ///   m = (16 + 1024 + 1024 + 16) / 4096 = 0.5078125; the load ceiling (238.1) and the
+    ///   latency ceiling (16 chains, 4 * (15 * 2.6 + 3.49) = 169.96) are above the peak 100.
+    #[test]
+    fn the_c6_schedules_with_a_short_ji_are_predicted_as_vector_code() {
+        let machine = Machine::assumed_m5();
+        // (schedule, loops clang unrolls, mem ops per FMA, GFLOP/s, bound)
+        let rows: [(&str, &[&str], f64, f64, &str); 3] = [
+            (
+                "split(1, j, jo, ji, 16); reorder(1, i, jo, k, ji); vectorize(1, ji)",
+                &[],
+                1.2578125,
+                4.0 * (3.0 * 2.6 + 3.49),
+                "latency",
+            ),
+            (
+                "split(1, j, jo, ji, 8); reorder(1, i, jo, k, ji); vectorize(1, ji)",
+                &[],
+                1.5078125,
+                4.0 * (2.6 + 3.49),
+                "latency",
+            ),
+            (
+                "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); reorder(1, io, jo, k, ii, ji); \
+                 vectorize(1, ji)",
+                &["ii"],
+                0.5078125,
+                100.0,
+                "compute",
+            ),
+        ];
+        for (schedule, unrolled, m, gflops, bound) in rows {
+            assert_eq!(clang_unrolled(schedule), unrolled, "{schedule}");
+            assert_eq!(mem_ops(256, schedule), m, "{schedule}");
+            let p = predict_schedule(&machine, 256, schedule).expect("predicts");
+            assert!(
+                (p.gflops / gflops - 1.0).abs() < 1e-9,
+                "{schedule}: {}",
+                p.gflops
+            );
+            assert_eq!(p.bound, bound, "{schedule}");
+        }
+        let unrolled = "split(1, i, io, ii, 4); split(1, j, jo, ji, 16); \
+                        reorder(1, io, jo, k, ii, ji); vectorize(1, ji); unroll(1, ii); \
+                        unroll(1, ji)";
+        assert_eq!(
+            predict_schedule(&machine, 256, rows[2].0),
+            predict_schedule(&machine, 256, unrolled)
+        );
+    }
+
+    /// The loops of `text` (N = 256) that `as_compiled` unrolls into scalar code and the schedule
+    /// did not (not the vectorized loops of `one_vector_iteration`, which stay vector code).
     fn clang_unrolled(text: &str) -> Vec<String> {
         clang_unrolled_at(256, text)
     }
@@ -2277,7 +2382,7 @@ mod tests {
         let compiled = as_compiled(nest);
         let pairs = nest.loops.iter().zip(&compiled.loops);
         pairs
-            .filter(|(before, after)| after.unroll && !before.unroll)
+            .filter(|(before, after)| after.unroll && !after.vectorize && !before.unroll)
             .map(|(before, _)| before.name.clone())
             .collect()
     }
@@ -2297,20 +2402,29 @@ mod tests {
         };
         let around = "io, jo, ko, ii, ki, ji";
         let inner_ji = "io, jo, ko, ii, ji, ki";
-        // Innermost loop: 16 iterations yes (16 * 9), 32 no; marked vectorized or not.
+        // Innermost loop: 16 iterations yes (16 * 9), 32 no. A loop marked vectorized with 16 is
+        // not: `codegen-c` makes it one vector iteration (v1.8), `unroll(disable)`.
         assert_eq!(
             clang_unrolled("split(1, k, ko, ki, 16); reorder(1, ko, i, j, ki)"),
             ["ki"]
         );
         assert!(clang_unrolled("split(1, k, ko, ki, 32); reorder(1, ko, i, j, ki)").is_empty());
+        assert!(
+            clang_unrolled("split(1, j, jo, ji, 16); reorder(1, i, jo, k, ji); vectorize(1, ji)")
+                .is_empty()
+        );
         assert_eq!(
-            clang_unrolled("split(1, j, jo, ji, 16); reorder(1, i, jo, k, ji); vectorize(1, ji)"),
+            clang_unrolled("split(1, j, jo, ji, 16); reorder(1, i, jo, k, ji)"),
             ["ji"]
         );
         // A loop around a vectorized innermost loop of 64: 8 yes (8 * 14), 16 no (16 * 14). Then
         // `jo` of 4 around four rolled loops (4 * 29) is unrolled in the second case.
         assert_eq!(clang_unrolled(&text(16, 64, 8, around, true)), ["ki"]);
         assert_eq!(clang_unrolled(&text(16, 64, 16, around, true)), ["jo"]);
+        // The same around a vectorized `ji` of 16, which is as rolled as one of 64 for the
+        // unroller (`ii` = 16 has 8 unrolled `ki` inside it: 16 * (5 + 112) > 150): 8 copies of
+        // the vectorized loop in the IR (clang remarks, Apple clang 21).
+        assert_eq!(clang_unrolled(&text(16, 16, 8, around, true)), ["ki"]);
         // Around a scalar innermost loop: `ki` of 8 around `ji` of 64 yes, `ji` of 8 around `ki`
         // of 32 yes; `ki` of 8 around an unrolled `ji` of 8 (8 * (5 + 72)) no.
         assert_eq!(
@@ -2455,10 +2569,11 @@ mod tests {
     /// Scalar nests with an unrolled innermost loop use `mem_acc_scalar_unrolled` (23.2 here),
     /// those with a rolled one `mem_acc_scalar` (8.563). FMA peak 1000 (scalar 250), fast caches
     /// and no latency ceiling, so only the ld/st ceiling `S * 3 / m` binds.
-    /// - `unroll(1, j)` at N = 16 (j unrolled by the schedule) and
-    ///   `vectorize(1, j)` at N = 16 (j unrolled by clang, scalar) have m = 1.1875 (see
-    ///   `a_short_vectorized_loop_is_predicted_as_scalar_unrolled_code`): 23.2 * 3 / 1.1875 =
-    ///   58.6105.
+    /// - `unroll(1, j)` at N = 16 (j unrolled by the schedule) has m = 1.1875: 23.2 * 3 /
+    ///   1.1875 = 58.6105. `vectorize(1, j)` at N = 12 (j unrolled by clang, scalar: not a
+    ///   power of two, see `a_short_vectorized_loop_is_scalar_unless_it_is_a_power_of_two`)
+    ///   has m = 1.25: 23.2 * 3 / 1.25 = 55.68. (Until v1.7 `vectorize(1, j)` at N = 16 was
+    ///   here, with the 58.6105 of `unroll(1, j)`; it is a vector loop now.)
     /// - `reorder(1, j, k, i)` at N = 16 has `i` unrolled by clang, `reorder(1, i, j, k);
     ///   unroll(1, k)` has `k` unrolled, both strided (m = 1.1875): 8.563 * 3 / 1.1875 = 21.633,
     ///   the rolled point.
@@ -2483,9 +2598,10 @@ mod tests {
         };
         let unrolled: f64 = 23.2 * 3.0 / 1.1875;
         assert!((unrolled - 58.6105).abs() < 1e-4, "{unrolled}");
-        for text in ["unroll(1, j)", "vectorize(1, j)"] {
-            assert!((gflops(16, text) - unrolled).abs() < 1e-9, "{text}");
-        }
+        assert!((gflops(16, "unroll(1, j)") - unrolled).abs() < 1e-9);
+        let clang_unrolled: f64 = 23.2 * 3.0 / 1.25;
+        assert!((clang_unrolled - 55.68).abs() < 1e-9, "{clang_unrolled}");
+        assert!((gflops(12, "vectorize(1, j)") - clang_unrolled).abs() < 1e-9);
         let rolled: f64 = 8.563 * 3.0 / 3.015625;
         assert!((rolled - 8.5186).abs() < 1e-4, "{rolled}");
         for text in ["", "unroll(1, k)"] {
@@ -2726,7 +2842,7 @@ mod tests {
         );
         let header = report(8, &with, &note, &[]);
         assert!(header.contains("col_unrolled 12.5 GFLOP/s"), "{header}");
-        assert!(header.contains("analytic model v1.7"), "{header}");
+        assert!(header.contains("analytic model v1.8"), "{header}");
         let bad = Machine {
             col_unrolled_gflops: 0.0,
             ..with
@@ -2766,19 +2882,20 @@ mod tests {
             header.contains("mem_acc_scalar_unrolled 24 GFLOP/s"),
             "{header}"
         );
-        // 1.1875 memory ops per FMA at N = 16, see `an_unrolled_scalar_nest_uses_the_unrolled_...`.
+        // 1.25 memory ops per FMA at N = 12 (a `j` that clang unrolls, scalar, since 12 is not a
+        // power of two), see `a_short_vectorized_loop_is_scalar_unless_it_is_a_power_of_two`.
         let gflops = |machine: Machine| {
             let machine = without_latency(Machine {
                 mem_gbs: 1e6,
                 l2_gbs: 1e6,
                 ..machine
             });
-            predict(&machine, &scheduled(16, "vectorize(1, j)"))
+            predict(&machine, &scheduled(12, "vectorize(1, j)"))
                 .expect("predicts")
                 .gflops
         };
-        assert!((gflops(with) - 24.0 * 3.0 / 1.1875).abs() < 1e-9);
-        assert!((gflops(without) - 23.2 * 3.0 / 1.1875).abs() < 1e-9);
+        assert!((gflops(with) - 24.0 * 3.0 / 1.25).abs() < 1e-9);
+        assert!((gflops(without) - 23.2 * 3.0 / 1.25).abs() < 1e-9);
     }
 
     /// Only the load and store ceilings can bind: FMA peak 1000, fast caches, no latency ceiling.
@@ -3106,11 +3223,16 @@ mod tests {
     );
 
     /// The S3 machine (mem_acc 31.1262 is from the old, loop-overhead-bound kernel, so the load
-    /// ceiling is low), N = 256: the 5 register tiles with the fewest loads per FMA are the top 5
-    /// of the space (v1.3 pooled loads and stores and had the 3 with 16 accumulators first, the
-    /// two with 8 behind the best non-unrolled schedules, latency-bound); the next schedule has
-    /// no unroll. The 4x16 tile at N = 128 has 0.5078 loads per FMA: load-bound at 31.1262 * 2 /
-    /// 0.5078 = 122.6, just below the FMA peak 129.2.
+    /// ceiling is low), N = 256: the register tiles with the fewest loads per FMA are at the top
+    /// of the space. Until v1.7 the top 5 were the 5 tiles with unroll steps (v1.3 pooled loads
+    /// and stores and had the 3 with 16 accumulators first, the two with 8 behind the best
+    /// non-unrolled schedules, latency-bound) and the next schedule had no unroll. Since v1.8 a
+    /// 4x16 tile is first (alone, 123.5, load-bound), and 26 schedules tie behind it at 98.985
+    /// (load-bound): the 2x32 and 8x8 tiles with unroll steps, and the schedules with `ii` = 8,
+    /// `ji` = 8 and no unroll steps that clang compiles to the same code (`one_vector_iteration`
+    /// for `ji`, `ii` unrolled by clang), with and without a `k` split. The 2x16 tile follows
+    /// well behind. The 4x16 tile at N = 128 has 0.5078 loads per FMA: load-bound at 31.1262 *
+    /// 2 / 0.5078 = 122.6, just below the FMA peak 129.2.
     #[test]
     fn register_tiles_rank_first_on_the_s3_machine() {
         let text = std::fs::read_to_string(S3).expect("the S3 file");
@@ -3121,10 +3243,28 @@ mod tests {
         // No scalar field: the scalar point stays the vector one over lanes, as before.
         assert_eq!(machine.mem_acc_scalar_gflops, 31.1262 / 4.0);
         let ranked = rank_matmul(&machine, 256).expect("ranks");
-        // The register tiles rank first: 4x16, 8x8, 2x32 (16 vector accumulators) and 2x16, 4x8
-        // (8 accumulators: the latency ceiling 86.8 is above their load ceiling).
-        assert!(ranked[..5].iter().all(|r| r.schedule.contains("unroll(")));
-        assert!(!ranked[5].schedule.contains("unroll("));
+        // The 4x16 tile ranks first, then the tie of the 16-accumulator tiles.
+        assert!(
+            ranked[0]
+                .schedule
+                .contains("split(1, i, io, ii, 4); split(1, j, jo, ji, 16)")
+        );
+        assert!(ranked[0].schedule.contains("unroll("));
+        let plateau = ranked[1].prediction.gflops;
+        assert!((plateau - 98.985).abs() < 1e-3, "{plateau}");
+        assert!(ranked[0].prediction.gflops > plateau);
+        let tied = |r: &Ranked| (r.prediction.gflops - plateau).abs() < 1e-9;
+        assert!(ranked[1..27].iter().all(tied));
+        assert!(!tied(&ranked[27]));
+        for tile in [
+            "ii, 2); split(1, j, jo, ji, 32",
+            "ii, 8); split(1, j, jo, ji, 8",
+        ] {
+            let found = ranked[1..27]
+                .iter()
+                .any(|r| r.schedule.contains(tile) && r.schedule.contains("unroll("));
+            assert!(found, "{tile}");
+        }
         let two_by_sixteen = ranked
             .iter()
             .find(|r| {
@@ -3319,6 +3459,13 @@ mod tests {
     /// unrolled-column-load ceiling, placeholder 15.7 here as this peak line has no
     /// `fma_col_unrolled_gflops`) moves the Spearman to 0.924 (0.926 with the 13 other records)
     /// and that group to ×1.12.
+    ///
+    /// From v1.8 the `"vectorized" ji <= 16` group compares predictions for the NEW codegen
+    /// (#96: a power-of-two `ji` is one vector iteration, `one_vector_iteration`) with
+    /// measurements of the OLD one (run 3 is from before #96, those loops were scalar code):
+    /// the group's error moves from ×1.159 to ×2.139 and the Spearman from 0.924 to 0.905 (the
+    /// 13 other records: 0.926 to 0.908). The other groups' numbers do not move. This is not a
+    /// model error to fix: a run measured with the new codegen is the comparison for them.
     #[test]
     fn compare_by_group_reproduces_the_run_3_numbers_of_64() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/results/");
@@ -3336,13 +3483,13 @@ mod tests {
             "{report}"
         );
         assert!(
-            report.contains("Spearman rank correlation 0.924;"),
+            report.contains("Spearman rank correlation 0.905;"),
             "{report}"
         );
         for (group, n, error) in [
             ("vectorized ji = 32/64", 106, "1.193"),
             ("scalar, ii innermost", 263, "1.119"),
-            ("\"vectorized\" ji <= 16 (scalar code)", 100, "1.159"),
+            ("\"vectorized\" ji <= 16 (scalar code)", 100, "2.139"),
         ] {
             let row = report
                 .lines()
@@ -3370,7 +3517,7 @@ mod tests {
         assert_eq!(sizes, 1000, "{report}");
         let all = compare_report("run 3", &text, None).expect("compares");
         assert!(
-            all.contains("1013 records") && all.contains("correlation 0.926;"),
+            all.contains("1013 records") && all.contains("correlation 0.908;"),
             "{all}"
         );
     }
@@ -3382,9 +3529,22 @@ mod tests {
     /// 100 / 82.3 / 71.9 / 100 GFLOP/s for these rows and this test fails; the run-3 medians
     /// are 23.3 / 26.7 / 9.7 / 19.9. The two vectorized rows have loads 2.0625 per FMA and 1
     /// store: the load ceiling is 60 * 2 / 2.0625 = 58.18, the store ceiling 58 binds (v1.3, one
-    /// pool: 60 * 3 / 3.0625 = 58.78). Row 3 is a scalar nest with an unrolled, unit-stride `ji`:
-    /// its ld/st ceiling is 23.2 * 3 / 2.12890625 = 32.69 (15 * 3 / 2.12890625 = 21.14 with the
-    /// rolled point), above the scalar FMA peak 25, which binds.
+    /// pool: 60 * 3 / 3.0625 = 58.78).
+    ///
+    /// Rows 3 and 4 (`ji` = 8, vectorized) were scalar unrolled code until v1.7 (rule K): row 3
+    /// 2.12890625 mem ops, 25.0 GFLOP/s, "compute" (ld/st ceiling 23.2 * 3 / 2.12890625 = 32.69
+    /// above the scalar FMA peak 25), row 4 1.140625, 22.58, "latency". Since v1.8 `ji` is one
+    /// vector iteration (`one_vector_iteration`), clang does not unroll it, and they pin the
+    /// new numbers; run 3 measured them with the old codegen (the medians above). In row 4
+    /// clang unrolls `ko` = 2 instead (2 * (5 + 5 + 9) = 48 <= 150: two copies of the
+    /// vectorized loop in the IR, clang remarks, Apple clang 21), which changes no count.
+    /// - row 3, `k, jo, i, ji`: per `(k, jo, i)` C 2 vectors loaded and stored, A 1 load, B 2
+    ///   vectors held across `i` (2 / 256 per `i`): (2 + 1 + 2 / 256 + 2) / 2 = 2.50390625; the
+    ///   store ceiling 58 / 1 binds (the load ceiling is 60 * 2 / 1.50390625 = 79.79).
+    /// - row 4, `jo, ko, i, ki, ji` with `ki` = 128: per `(jo, ko, i)` C 2 + 2, A 128, B 256
+    ///   loads over 256 vector FMAs: 388 / 256 = 1.515625; C is held across `ki` in 2 vector
+    ///   chains of 128: the latency ceiling 4 * 2.6 * (2 + W / 128) = 4 * 2 * 3.49 = 27.92 binds (the load
+    ///   ceiling is 60 * 2 / (386 / 256) = 79.58).
     #[test]
     fn run_3_schedules_with_a_full_unroll_keep_their_unroll_rule() {
         let machine = Machine::assumed_m5();
@@ -3408,17 +3568,17 @@ mod tests {
             ),
             (
                 "split(1, j, jo, ji, 8); reorder(1, k, jo, i, ji); vectorize(1, ji)",
-                &["ji"],
-                2.12890625,
-                25.0,
-                "compute",
+                &[],
+                2.50390625,
+                58.0,
+                "store",
             ),
             (
                 "split(1, j, jo, ji, 8); split(1, k, ko, ki, 128); reorder(1, jo, ko, i, ki, ji); \
                  vectorize(1, ji)",
-                &["ji"],
-                1.140625,
-                22.58,
+                &["ko"],
+                1.515625,
+                8.0 * 3.49,
                 "latency",
             ),
         ];
