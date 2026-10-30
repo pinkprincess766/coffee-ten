@@ -14,7 +14,7 @@ from three sessions; they describe this compiler on this Mac, not a comparison w
 | Code | S1, S2: commit `ffce49d`; S3: commit `4928ffa` (adds `unroll` and row-pointer indexing, #42–#44); clean tree (`"dirty": false` in every record) |
 | Sessions | S1 2026-10-15, 60 s pauses between series; S2 2026-10-16 on a cold Mac, 180 s pauses; S3 2026-10-18 on a cold Mac, 60 s pauses |
 | Method | per (kernel, N): a warm-up (S1–S3 and run 1: one round of one 10 ms sample per variant; from #61: each variant runs 300 ms), then 30 rounds; in every round each variant runs once, in a seeded random order; a sample repeats the kernel for ≥ 10 ms; median and p25–p75 of GFLOP/s = 2·N³ / time; a variant is flagged `drift` when the medians of its first and last 5 rounds differ by > 5% |
-| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58), `bench/results/2026-10-21-hypothesis-a-run2.jsonl` (hypothesis A, run 2, commit `702dcf1`), `bench/results/2026-10-22-hypothesis-a-run3.jsonl` (hypothesis A, run 3, commit `726cc1d`), `bench/results/2026-10-27-6556e03-peak.jsonl` (P4: `bench/peak` alone, with the store kernel #80), `bench/results/2026-10-27-4753578-peak.jsonl` (P5: `bench/peak` alone, with the unrolled scalar kernel #83), `bench/results/2026-10-28-827cd1d-peak.jsonl` (P6: `bench/peak` alone, with the column-reload kernel #88), `bench/results/2026-10-28-adcf09c-peak.jsonl` (P7: `bench/peak` alone, with the unrolled column-load kernel #91) |
+| Raw data | `bench/results/2026-10-15-ffce49d-s1.jsonl`, `bench/results/2026-10-16-ffce49d.jsonl`, `bench/results/2026-10-18-4928ffa.jsonl`, `bench/results/2026-10-18-0a946ba-peak.jsonl` (P1: `bench/peak` alone, after the kernel fix #46), `bench/results/2026-10-19-bb9a027-peak.jsonl` (P2: `bench/peak` alone, with the scalar kernel #50), `bench/results/2026-10-19-hypothesis-a.jsonl` (hypothesis A, run 1, commit `c435f89`), `bench/results/2026-10-21-561ede3-peak.jsonl` (P3: `bench/peak` alone, with the FMA chain kernels #58), `bench/results/2026-10-21-hypothesis-a-run2.jsonl` (hypothesis A, run 2, commit `702dcf1`), `bench/results/2026-10-22-hypothesis-a-run3.jsonl` (hypothesis A, run 3, commit `726cc1d`), `bench/results/2026-10-27-6556e03-peak.jsonl` (P4: `bench/peak` alone, with the store kernel #80), `bench/results/2026-10-27-4753578-peak.jsonl` (P5: `bench/peak` alone, with the unrolled scalar kernel #83), `bench/results/2026-10-28-827cd1d-peak.jsonl` (P6: `bench/peak` alone, with the column-reload kernel #88), `bench/results/2026-10-28-adcf09c-peak.jsonl` (P7: `bench/peak` alone, with the unrolled column-load kernel #91), `bench/results/2026-10-30-hypothesis-a-run4.jsonl` (hypothesis A, run 4, commit `736d82f`) |
 
 Every variant was checked against the naive kernel within the inner-product error bound
 before it was timed.
@@ -319,6 +319,47 @@ Run 3 with the P7 line: `coffee-ten-bench model compare --from
 bench/results/2026-10-22-hypothesis-a-run3.jsonl --peak
 bench/results/2026-10-28-adcf09c-peak.jsonl --group random` (without `--group`, all 1013
 records: Spearman 0.927).
+
+## Hypothesis A (spec §7.1), run 4: met; C4 out of sample: two of three groups
+
+Run 4 (commit `736d82f`, N = 256, seed 5, machine P7) is the first run with the short-loop
+codegen of C5 (#96): a vectorized loop of 8 or 16 iterations is now one vector iteration, and a
+4×16 or 8×8 tile holds C in registers without `unroll` steps. The model that chose the top 10
+was v1.7, not v1.8 (#97): the run was started from a checkout before #97 had merged. v1.7 and
+v1.8 share rank 1 (the unrolled 4×16 tile), which was also the best of the ten, so the decision
+does not depend on it. The comparison below uses v1.8, which models the new codegen.
+
+| | schedule | median [p25–p75], GFLOP/s |
+|---|---|---|
+| best random (candidate 483 of 1000) | `split i 8, j 8, k 64; reorder io, ko, jo, ki, ii, ji; vectorize ji` (8×8 tile, no unroll steps) | **116.90** [116.05–117.17] |
+| best of the model's top 10 (rank 1) | 4×16 register tile | **119.43** [118.14–120.00] |
+
+**Ratio 1.022: the criterion is met, by a small margin.** With C5, random search meets register
+tiles often: its best-so-far was 90.6 GFLOP/s after 16 candidates, 105.1 after 32, 114.4 after
+256 and 119.4 from candidate 483 on. In run 3 it stayed at 86–87. The model's advantage now
+comes from reaching the tile at the first measurement, not from finding something random
+search cannot.
+
+**C4 out of sample.** Model v1.8 against run 4's 1000 random records, P7 line (`model compare
+--from bench/results/2026-10-30-hypothesis-a-run4.jsonl --peak
+bench/results/2026-10-28-adcf09c-peak.jsonl --group random`):
+
+| group | n | measured median | predicted median | median of pred / meas |
+|---|---|---|---|---|
+| vectorized, `ji` = 128 | 50 | 43.7 | 45.4 | 1.037 |
+| **vectorized, `ji` = 32/64** | 96 | 55.0 | 56.7 | **1.109** |
+| **"vectorized", `ji` ≤ 16** (vector code since C5) | 96 | 35.9 | 56.7 | **1.227** |
+| scalar, `ji` innermost | 265 | 7.9 | 8.4 | 1.117 |
+| **scalar, `ii` innermost** | 249 | 7.3 | 8.4 | **1.091** |
+| scalar, `k`/`ki` innermost | 244 | 7.6 | 6.9 | 0.875 |
+
+Spearman 0.915 (median error ×1.13). Two of C4's three groups hold out of sample. The `ji` ≤ 16
+group misses at 1.227, and that is the group whose code changed with C5. Most of its error is
+in the 40 store-bound rows that have a rolled `ii` directly above the short vector `ji`. In 33
+of them `ii` is 16 to 128 with `k` or `ki` directly outside it, and they measure 12–40 GFLOP/s
+(median per `ii`) against a predicted store ceiling of 56.7. This is the
+column-reload shape of v1.6 (C's row is reloaded at the next `k` at a 1 KiB stride) in vector
+code. The v1.6 rule covers only scalar code. Not yet measured in isolation.
 
 ## Validity
 
