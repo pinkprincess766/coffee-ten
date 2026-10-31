@@ -85,7 +85,8 @@ name.
 
 Nests are numbered from 0 in `ct.loop_ir` order. In the example, nest 0 zero-fills the
 matmul result, nest 1 is the `i, k, j` update that `split` targets, and nest 2 is the
-relu. An illegal step raises `ValueError` with the step number.
+relu. An illegal step raises `ValueError` with the step number. The full syntax of kernels
+and schedules, with checked examples: [docs/loop-ir.md](docs/loop-ir.md).
 
 `Kernel.order_class` says what a schedule may change:
 
