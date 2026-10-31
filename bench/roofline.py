@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Roofline plot of the S3 matmul points from committed bench/results/*.jsonl (no new measurements).
 
-    python3 bench/roofline.py [results.jsonl] [-o docs/bench-roofline.png]
+    python3 bench/roofline.py [--input results.jsonl] [-o docs/bench-roofline.png]
 
 Ceilings come from the `"kind":"peak"` line of the same file (`bench/peak`): FMA peak
 `fma_gflops` and memory bandwidth `triad_gbs`, both medians; not datasheet numbers.
@@ -33,7 +33,7 @@ def ceilings(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("results", nargs="?", default=DEFAULT)
+    ap.add_argument("-i", "--input", default=DEFAULT, help="results JSONL with a peak line (default: S3)")
     ap.add_argument("-o", "--out", default=ROOT / "docs/bench-roofline.png")
     a = ap.parse_args()
     try:
@@ -42,8 +42,8 @@ def main():
         import matplotlib.pyplot as plt
     except ImportError:
         sys.exit("bench/roofline.py needs matplotlib: pip install matplotlib")
-    peak, bw = ceilings(a.results)
-    series = load(a.results)
+    peak, bw = ceilings(a.input)
+    series = load(a.input)
     fig, ax = plt.subplots(figsize=(7.5, 4.8))
     xs = sorted([2**e for e in range(-3, 8)] + [peak / bw])
     ax.plot(xs, [min(peak, bw * x) for x in xs], "k-", lw=1.5, label="_nolegend_")
