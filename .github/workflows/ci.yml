@@ -63,3 +63,28 @@ jobs:
           restore-keys: cargo-${{ matrix.os }}-${{ github.job }}-
       - run: python -m pip install ./crates/coffee-ten-py pytest numpy hypothesis
       - run: python -m pytest crates/coffee-ten-py/tests -q
+
+  # Plan item C15: a short bench/run.sh so the script cannot break unnoticed. The numbers
+  # from a shared runner mean nothing; only the shape of the output is checked.
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - run: bench/run.sh --quick --sizes 64 --pause 0 --yes
+      - name: Check the JSONL it wrote
+        run: |
+          python3 - bench/results/quick-*.jsonl <<'EOF'
+          import json, sys
+          paths = sys.argv[1:]
+          assert len(paths) == 1, paths
+          lines = open(paths[0]).read().splitlines()
+          records = [json.loads(line) for line in lines]
+          # One peak line, then 4 variants for each of 2 kernels at 1 size.
+          assert len(records) == 9, len(records)
+          assert records[0]["kind"] == "peak", records[0]
+          for r in records[1:]:
+              assert r["n"] == 64 and r["quick"] is True and r["verified"] is True, r
+          print(f"{paths[0]}: {len(records)} valid records")
+          EOF
