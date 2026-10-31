@@ -2,19 +2,29 @@
 """Fig. 4: hypothesis A ratio per run, from committed bench/results (no new measurements).
 
     python3 bench/hypothesis_ratio.py [--input run.jsonl ...] [-o docs/hypothesis-a-ratio.png]
+    python3 bench/hypothesis_ratio.py --table --input run.jsonl   # BENCHMARKS.md table, as text
 
 Ratio as in BENCHMARKS.md (spec §7.1): median GFLOP/s of the best of the model's top 10
 over the median of the best of 1000 random candidates, both from the run's interleaved
 decision run (the two `"group":"final"` records, 30 rounds). `search` logs them best random
 first, best model second (`log_records(.., "final", &[&random, &model])` in
 crates/coffee-ten-bench/src/search.rs); the same ratio as its report. Criterion: ratio ≥ 0.9.
-Dev-only tool; needs matplotlib (not a project dependency).
+The figure needs matplotlib (not a project dependency); `--table` does not import it.
+Dev-only tool.
+
+`--table` rebuilds the run's BENCHMARKS.md table from the log. "Candidate N" is the 1-based
+position among the `random` records, in log order, of the highest sequential median (a tie
+keeps the earlier: `best_of` in search.rs); the model's rank is the same for the `model`
+records. The best-so-far curve is the running maximum of the `random` sequential medians
+(`best_index_so_far`). The medians in the table are the `final` records', not the sequential
+ones.
 """
 import argparse, json, pathlib, sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from plot import ROOT  # noqa: E402
 
+CURVE_M = (16, 64)  # best-so-far values printed by --table
 RES = ROOT / "bench/results"
 DEFAULT = [RES / "2026-10-19-hypothesis-a.jsonl", RES / "2026-10-21-hypothesis-a-run2.jsonl",
            RES / "2026-10-22-hypothesis-a-run3.jsonl", RES / "2026-10-30-hypothesis-a-run4.jsonl"]
@@ -29,13 +39,50 @@ def ratio(path):
     return m, rnd
 
 
+def first_best(records):
+    """1-based index of the highest median; a tie keeps the earlier."""
+    medians = [r["median"] for r in records]
+    return medians.index(max(medians)) + 1
+
+
+def table(path):
+    recs = [json.loads(line) for line in open(path)]
+    random = [r for r in recs if r.get("group") == "random"]
+    model = [r for r in recs if r.get("group") == "model"]
+    m, r = ratio(path)
+    n_best, rank = first_best(random), first_best(model)
+    picked = (random[n_best - 1]["schedule"], model[rank - 1]["schedule"])
+    if (r["schedule"], m["schedule"]) != picked:
+        sys.exit(f"{path}: the final records are not the best random / best model records")
+    print(f"{path}")
+    rows = [(f"best random (candidate {n_best} of {len(random)})", r),
+            (f"best of the model's top {len(model)} (rank {rank})", m)]
+    for name, rec in rows:
+        print(f"| {name} | {rec['schedule']} "
+              f"| {rec['median']:.2f} [{rec['p25']:.2f}-{rec['p75']:.2f}] |")
+    print(f"ratio {m['median'] / r['median']:.3f}")
+    best_so_far, curve = 0.0, []
+    for x in random:
+        best_so_far = max(best_so_far, x["median"])
+        curve.append(best_so_far)
+    print("random best-so-far (sequential medians): "
+          + ", ".join(f"{curve[k - 1]:.2f} after {k}" for k in CURVE_M)
+          + f", {curve[-1]:.2f} from {n_best} on")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-i", "--input", action="append",
                     help="hypothesis A log, in run order (repeatable; default: runs 1-4)")
+    ap.add_argument("--table", action="store_true",
+                    help="print the BENCHMARKS.md table of each run as text (no matplotlib)")
     ap.add_argument("-o", "--out", default=ROOT / "docs/hypothesis-a-ratio.png")
     a = ap.parse_args()
     results = a.input or DEFAULT
+    if a.table:
+        for path in results:
+            table(path)
+        return
     try:
         import matplotlib
         matplotlib.use("Agg")
