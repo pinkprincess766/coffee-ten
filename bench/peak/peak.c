@@ -14,6 +14,12 @@
  * Usage: ./peak [--check] [--quick]
  */
 
+/* clock_gettime and struct timespec are POSIX, not C99: glibc hides them under -std=c99
+ * unless a POSIX level is asked for. macOS shows them anyway, and defining the macro there
+ * would hide pthread_set_qos_class_self_np. */
+#ifdef __linux__
+#define _POSIX_C_SOURCE 199309L
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
