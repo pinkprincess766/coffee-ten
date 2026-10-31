@@ -55,6 +55,24 @@ Python-объект `Tensor` записывает граф (трассировк
 для каждого скомпилированного ядра. Подробности и код, проверяющий каждый шаг:
 [Приложение B](#приложение-b-основания).
 
+Крейты в том порядке, в каком через них проходит ядро:
+
+```text
+Python Tensor          crates/coffee-ten-py         трассирует выражение, вызывает остальное
+  -> граф-IR           crates/coffee-ten-ir         SSA-DAG со статическими формами, broadcast
+  -> loop-IR           crates/coffee-ten-loop       понижение, текст расписания, apply
+  -> C, clang, dlopen  crates/coffee-ten-codegen-c  выдача C99, компиляция, загрузка, вызов
+  -> bench             crates/coffee-ten-bench      харнесс, поиск, модель стоимости
+эталон                 crates/coffee-ten-interp     исполняет граф-IR; оракул
+```
+
+[`coffee-ten-py`](crates/coffee-ten-py), [`coffee-ten-ir`](crates/coffee-ten-ir),
+[`coffee-ten-loop`](crates/coffee-ten-loop),
+[`coffee-ten-codegen-c`](crates/coffee-ten-codegen-c),
+[`coffee-ten-bench`](crates/coffee-ten-bench),
+[`coffee-ten-interp`](crates/coffee-ten-interp). Крейт bench не зависит от интерпретатора:
+каждое расписание он сверяет с наивным скомпилированным ядром.
+
 ### 2.2 Расписания
 
 Расписание — это текст: шаги, разделённые `;`. Шаг указывает гнездо по номеру и циклы по
