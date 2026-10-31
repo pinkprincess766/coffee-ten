@@ -72,6 +72,15 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install
+      # As in the rust job; run.sh builds coffee-ten-bench in ./target.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ubuntu-latest-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-ubuntu-latest-${{ github.job }}-
       - run: bench/run.sh --quick --sizes 64 --pause 0 --yes
       - name: Check the JSONL it wrote
         run: |
