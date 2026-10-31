@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fig. 4: hypothesis A ratio per run, from committed bench/results (no new measurements).
 
-    python3 bench/hypothesis_ratio.py [run1.jsonl run2.jsonl run3.jsonl] [-o docs/hypothesis-a-ratio.png]
+    python3 bench/hypothesis_ratio.py [--input run.jsonl ...] [-o docs/hypothesis-a-ratio.png]
 
 Ratio as in BENCHMARKS.md (spec §7.1): median GFLOP/s of the best of the model's top 10
 over the median of the best of 1000 random candidates, both from the run's interleaved
@@ -17,7 +17,7 @@ from plot import ROOT  # noqa: E402
 
 RES = ROOT / "bench/results"
 DEFAULT = [RES / "2026-10-19-hypothesis-a.jsonl", RES / "2026-10-21-hypothesis-a-run2.jsonl",
-           RES / "2026-10-22-hypothesis-a-run3.jsonl"]
+           RES / "2026-10-22-hypothesis-a-run3.jsonl", RES / "2026-10-30-hypothesis-a-run4.jsonl"]
 
 
 def ratio(path):
@@ -31,9 +31,11 @@ def ratio(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("results", nargs="*", default=DEFAULT)
+    ap.add_argument("-i", "--input", action="append",
+                    help="hypothesis A log, in run order (repeatable; default: runs 1-4)")
     ap.add_argument("-o", "--out", default=ROOT / "docs/hypothesis-a-ratio.png")
     a = ap.parse_args()
+    results = a.input or DEFAULT
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -41,7 +43,7 @@ def main():
     except ImportError:
         sys.exit("bench/hypothesis_ratio.py needs matplotlib: pip install matplotlib")
     fig, ax = plt.subplots(figsize=(6, 4.2))
-    for i, path in enumerate(a.results, 1):
+    for i, path in enumerate(results, 1):
         m, r = ratio(path)
         q = m["median"] / r["median"]
         lo, hi = m["p25"] / r["p75"], m["p75"] / r["p25"]
@@ -52,10 +54,10 @@ def main():
         ax.annotate(f"{q:.3f}", (i, q), xytext=(8, -3), textcoords="offset points", fontsize=9)
     ax.axhline(1.0, color="k", lw=1, label="1.0: model best = random best")
     ax.axhline(0.9, color="grey", ls="--", lw=1, label="0.9: criterion (spec §7.1)")
-    ax.set_xticks(range(1, len(a.results) + 1))
-    ax.set_xticklabels([f"run {i}" for i in range(1, len(a.results) + 1)])
-    ax.set_xlim(0.5, len(a.results) + 0.5)
-    ax.set_xlabel("hypothesis A run (seed = run number), N = 256")
+    ax.set_xticks(range(1, len(results) + 1))
+    ax.set_xticklabels([f"run {i}" for i in range(1, len(results) + 1)])
+    ax.set_xlim(0.5, len(results) + 0.5)
+    ax.set_xlabel("hypothesis A run, N = 256 (seeds 1, 2, 3, 5 for runs 1-4)")
     ax.set_ylim(0.5, 1.5)
     ax.set_ylabel("ratio, model-best / random-best GFLOP/s (dimensionless)")
     ax.set_title("hypothesis A, matmul N = 256: decision-run medians\n"
