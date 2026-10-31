@@ -204,6 +204,9 @@ random candidate's 5 samples the spread is now p75/p25 = 1.004 (run 1: 1.4–1.6
 | best random (candidate 953 of 1000) | 8×8 register tile | **112.98** [112.52–113.04] |
 | best of the model's top 10 (rank 1) | 4×16 register tile | **121.85** [121.40–121.92] |
 
+The table and the ratio come from one command:
+`python3 bench/hypothesis_ratio.py --table --input bench/results/2026-10-21-hypothesis-a-run2.jsonl`.
+
 **Ratio 1.079: the criterion is met.** The model's first measurement already gives its best
 schedule. Random search stays at 88–90 GFLOP/s until candidate 953, the only register tile
 among its 1000 draws. Over the 1000 random candidates the model has Spearman 0.571 and a
@@ -251,6 +254,9 @@ out-of-sample check of v1.3. Within-record spread p75/p25 = 1.004; no drift flag
 draws. Its best-so-far was 60.0 GFLOP/s after 16 candidates, 86.4 after 64 and 87.0 from 284
 on. The model's rank 1 gave 118 at the first measurement. The decision run's quartiles are wider than in run 2
 (p25 3–4% below the median), but the gap is far larger than that.
+
+The table, the ratio and these best-so-far values come from one command:
+`python3 bench/hypothesis_ratio.py --table --input bench/results/2026-10-22-hypothesis-a-run3.jsonl`.
 
 **The model's precision holds out of sample.** Over the 1000 random candidates, model v1.3 vs
 measured:
@@ -336,9 +342,12 @@ does not depend on it. The comparison below uses v1.8, which models the new code
 
 **Ratio 1.022: the criterion is met, by a small margin.** With C5, random search meets register
 tiles often: its best-so-far was 90.6 GFLOP/s after 16 candidates, 105.1 after 32, 114.4 after
-256 and 119.4 from candidate 483 on. In run 3 it stayed at 86–87. The model's advantage now
+256 and 119.3 from candidate 483 on. In run 3 it stayed at 86–87. The model's advantage now
 comes from reaching the tile at the first measurement, not from finding something random
 search cannot.
+
+The table, the ratio and the best-so-far values at 16 and from 483 on come from one command:
+`python3 bench/hypothesis_ratio.py --table --input bench/results/2026-10-30-hypothesis-a-run4.jsonl`.
 
 **C4 out of sample.** Model v1.8 against run 4's 1000 random records, P7 line (`model compare
 --from bench/results/2026-10-30-hypothesis-a-run4.jsonl --peak
