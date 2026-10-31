@@ -1001,6 +1001,90 @@ mod tests {
         );
     }
 
+    const README: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/README.md");
+
+    /// `(field, writer)` of the rows of the record table in bench/README.md, in table order:
+    /// the rows whose first cell is `` `field` `` and whose last cell is `harness`, `meta` or
+    /// `search`. The rows of the peak table (writer `peak.c`) are not read.
+    fn documented_fields() -> Vec<(String, String)> {
+        let text = fs::read_to_string(README).unwrap();
+        let mut rows = Vec::new();
+        for line in text.lines().filter(|line| line.starts_with("| `")) {
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+            let writer = cells[cells.len() - 1];
+            if ["harness", "meta", "search"].contains(&writer) {
+                rows.push((cells[0].trim_matches('`').to_string(), writer.to_string()));
+            }
+        }
+        rows
+    }
+
+    /// The keys of the top-level object of a one-line JSON text, in order. Strings in values
+    /// are skipped, so text that looks like a key cannot count as one.
+    fn top_level_keys(line: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let (mut depth, mut string_start, mut escaped) = (0usize, None, false);
+        for (i, c) in line.char_indices() {
+            match string_start {
+                Some(_) if escaped => escaped = false,
+                Some(_) if c == '\\' => escaped = true,
+                Some(start) if c == '"' => {
+                    if depth == 1 && line[i + 1..].starts_with(':') {
+                        keys.push(line[start + 1..i].to_string());
+                    }
+                    string_start = None;
+                }
+                Some(_) => {}
+                None => match c {
+                    '"' => string_start = Some(i),
+                    '{' | '[' => depth += 1,
+                    '}' | ']' => depth -= 1,
+                    _ => {}
+                },
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn top_level_keys_skips_nested_objects_and_key_like_text_in_values() {
+        let line = r#"{"a":1,"b":{"x":2},"c":"q\":\"y\":3","d":[{"z":1}],"e":null}"#;
+        assert_eq!(top_level_keys(line), ["a", "b", "c", "d", "e"]);
+    }
+
+    /// bench/README.md documents the fields of a log line. The harness line (`main.rs`:
+    /// `record_json`, `append_lines`) and the search line (`log_records`) must have exactly
+    /// the documented keys, in the documented order. Add a field to a writer and to the README
+    /// table together, in the order written.
+    #[test]
+    fn log_lines_have_exactly_the_keys_of_the_readme_table_in_its_order() {
+        let documented = documented_fields();
+        let search_rows = documented.iter().filter(|(_, w)| w == "search").count();
+        assert_eq!(search_rows, 1, "{documented:?}");
+        assert_eq!(documented.last().unwrap().1, "search", "{documented:?}");
+        let all: Vec<&str> = documented.iter().map(|(f, _)| f.as_str()).collect();
+        let harness = &all[..all.len() - 1];
+
+        let path = std::env::temp_dir().join(format!(
+            "coffee-ten-bench-schema-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let record = flat("vectorize(1, j)", 2.0);
+        let metadata = test_metadata(1);
+        append_lines(&path, &[record_json(&record, &metadata)]).unwrap();
+        let (mut config, _) = hand_search(None);
+        config.log = Some(path.clone());
+        log_records(&config, &metadata, "final", &[&record]).unwrap();
+        let log_text = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let lines: Vec<&str> = log_text.lines().collect();
+        assert_eq!(lines.len(), 2, "{log_text}");
+        assert_eq!(top_level_keys(lines[0]), harness, "{}", lines[0]);
+        assert_eq!(top_level_keys(lines[1]), all, "{}", lines[1]);
+    }
+
     /// A record with the given schedule text and three rates (median = the middle one).
     fn hand_record(schedule: &str, rates: [f64; 3]) -> Record {
         let info = RunInfo {
