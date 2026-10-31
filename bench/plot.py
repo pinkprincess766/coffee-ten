@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot matmul GFLOP/s vs N from committed bench/results/*.jsonl (no new measurements).
 
-    python3 bench/plot.py [results.jsonl] [-o docs/bench-gflops.png]
+    python3 bench/plot.py [--input results.jsonl] [-o docs/bench-gflops.png]
 
 Default input: S3 (2026-10-18-4928ffa), the only session with all four schedules.
 Dev-only tool; needs matplotlib (not a project dependency).
@@ -36,7 +36,7 @@ def load(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("results", nargs="?", default=DEFAULT)
+    ap.add_argument("-i", "--input", default=DEFAULT, help="results JSONL (default: S3)")
     ap.add_argument("-o", "--out", default=ROOT / "docs/bench-gflops.png")
     a = ap.parse_args()
     try:
@@ -45,7 +45,7 @@ def main():
         import matplotlib.pyplot as plt
     except ImportError:
         sys.exit("bench/plot.py needs matplotlib: pip install matplotlib")
-    series = load(a.results)
+    series = load(a.input)
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for i, name in enumerate(ORDER):
         if name not in series:
