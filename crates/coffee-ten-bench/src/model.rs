@@ -1502,7 +1502,7 @@ fn median(values: &[f64]) -> Option<f64> {
 const SCHEDULE_GROUPS: [&str; 6] = [
     "vectorized ji = 128",
     "vectorized ji = 32/64",
-    "\"vectorized\" ji <= 16 (scalar code)",
+    "vectorized ji <= 16",
     "scalar, ji innermost",
     "scalar, ii innermost",
     "scalar, k/ki innermost",
@@ -3460,7 +3460,7 @@ mod tests {
     /// `fma_col_unrolled_gflops`) moves the Spearman to 0.924 (0.926 with the 13 other records)
     /// and that group to ×1.12.
     ///
-    /// From v1.8 the `"vectorized" ji <= 16` group compares predictions for the NEW codegen
+    /// From v1.8 the `vectorized ji <= 16` group compares predictions for the NEW codegen
     /// (#96: a power-of-two `ji` is one vector iteration, `one_vector_iteration`) with
     /// measurements of the OLD one (run 3 is from before #96, those loops were scalar code):
     /// the group's error moves from ×1.159 to ×2.139 and the Spearman from 0.924 to 0.905 (the
@@ -3489,7 +3489,7 @@ mod tests {
         for (group, n, error) in [
             ("vectorized ji = 32/64", 106, "1.193"),
             ("scalar, ii innermost", 263, "1.119"),
-            ("\"vectorized\" ji <= 16 (scalar code)", 100, "2.139"),
+            ("vectorized ji <= 16", 100, "2.139"),
         ] {
             let row = report
                 .lines()
