@@ -51,6 +51,24 @@ backend emits C, and clang compiles it into a kernel loaded with libloading. The
 interpreter (`ct.run`) is the oracle for every compiled kernel. Details and the code that
 checks each step: [Appendix B](#appendix-b-basis).
 
+The crates, in the order a kernel passes through them:
+
+```text
+Python Tensor          crates/coffee-ten-py         traces an expression, calls the rest
+  -> graph IR          crates/coffee-ten-ir         static-shape SSA DAG, broadcasting
+  -> loop IR           crates/coffee-ten-loop       lowering, schedule text, apply
+  -> C, clang, dlopen  crates/coffee-ten-codegen-c  emit C99, compile, load, call
+  -> bench             crates/coffee-ten-bench      harness, search, cost model
+reference              crates/coffee-ten-interp     runs the graph IR; the oracle
+```
+
+[`coffee-ten-py`](crates/coffee-ten-py), [`coffee-ten-ir`](crates/coffee-ten-ir),
+[`coffee-ten-loop`](crates/coffee-ten-loop),
+[`coffee-ten-codegen-c`](crates/coffee-ten-codegen-c),
+[`coffee-ten-bench`](crates/coffee-ten-bench),
+[`coffee-ten-interp`](crates/coffee-ten-interp). The bench crate does not depend on the
+interpreter: it checks each schedule against the naive compiled kernel.
+
 ### 2.2 Schedules
 
 A schedule is text: steps separated by `;`. A step names a nest by number and loops by
