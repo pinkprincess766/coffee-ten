@@ -48,11 +48,16 @@ if [[ $dry_run -eq 0 && -s "$results" ]]; then
 fi
 
 warn() { echo "WARNING: $*" >&2; }
-if ! grep -q "'AC Power'" <<< "$(pmset -g batt)"; then
-  warn "not on AC power (pmset -g batt)"
-fi
-if grep -Eq 'lowpowermode[[:space:]]+1' <<< "$(pmset -g)"; then
-  warn "Low Power Mode is on (pmset -g)"
+# pmset is macOS only; elsewhere (the CI smoke job on Linux) the power checks are skipped.
+if command -v pmset > /dev/null; then
+  if ! grep -q "'AC Power'" <<< "$(pmset -g batt)"; then
+    warn "not on AC power (pmset -g batt)"
+  fi
+  if grep -Eq 'lowpowermode[[:space:]]+1' <<< "$(pmset -g)"; then
+    warn "Low Power Mode is on (pmset -g)"
+  fi
+else
+  warn "no pmset: power checks skipped"
 fi
 echo "commit $commit  results $results"
 echo "Conditions: close heavy apps; do not use the machine during the run."
