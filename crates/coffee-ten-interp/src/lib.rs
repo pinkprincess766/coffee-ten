@@ -246,9 +246,9 @@ fn evaluate<T: Scalar>(
                 shape: node.shape.clone(),
                 data: matmul(operand(&values, *a), operand(&values, *b)),
             },
-            Op::Reduce(op, x) => Tensor {
+            Op::Reduce(op, x, axis) => Tensor {
                 shape: node.shape.clone(),
-                data: reduce(*op, operand(&values, *x)),
+                data: reduce(*op, operand(&values, *x), *axis),
             },
         };
         values[index] = Some(value);
@@ -296,7 +296,7 @@ fn needed_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         }
         match &graph.nodes()[index].op {
             Op::Input { .. } | Op::Const(_) => {}
-            Op::Unary(_, x) | Op::Reduce(_, x) => needed[x.index()] = true,
+            Op::Unary(_, x) | Op::Reduce(_, x, _) => needed[x.index()] = true,
             Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 needed[a.index()] = true;
                 needed[b.index()] = true;
@@ -363,41 +363,44 @@ fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
     data
 }
 
-/// Reduction over the last axis of `x`, one value per row, in this exact order (the order of
-/// the C kernel, so f32 results agree bit for bit). With `n` the last dim, `n > 0`:
+/// Reduction of `x` over `axis` (counted from the start), one value per remaining index,
+/// in this exact order (the order of the C kernel, so f32 results agree bit for bit).
+/// The other axes stay in row-major order. With `n` the reduced dim, `n > 0`:
 ///
-/// - sum: `acc = 0; for k in 0..n ascending: acc = acc + x[.., k]`
-/// - max: `acc = x[.., 0]; for k in 1..n ascending: acc = max(acc, x[.., k])`, where
-///   `max(a, b) = a > b ? a : b` and `acc` is `a`, as in `BinaryOp::Max`.
-fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>) -> Vec<T> {
-    let n = *x
-        .shape()
-        .dims()
-        .last()
-        .expect("invariant: a reduced operand has rank >= 1");
-    assert!(
-        n > 0,
-        "invariant: a reduced operand has a non-empty last axis"
-    );
-    x.data
-        .chunks_exact(n)
-        .map(|row| match op {
-            ReduceOp::Sum => {
-                let mut acc = T::zero();
-                for &v in row {
-                    acc = acc.add(v);
+/// - sum: `acc = 0; for k in 0..n ascending: acc = acc + x[..., k, ...]`
+/// - max: `acc = x[..., 0, ...]; for k in 1..n ascending: acc = max(acc, x[..., k, ...])`,
+///   where `max(a, b) = a > b ? a : b` and `acc` is `a`, as in `BinaryOp::Max`.
+///
+/// The last axis is the old row reduction: each row is one contiguous chunk of `n`.
+fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec<T> {
+    let dims = x.shape().dims();
+    let n = dims[axis];
+    assert!(n > 0, "invariant: a reduced axis is non-empty");
+    let inner: usize = dims[axis + 1..].iter().product();
+    let outer: usize = dims[..axis].iter().product();
+    let mut out = Vec::with_capacity(outer * inner);
+    for o in 0..outer {
+        for i in 0..inner {
+            let at = |k: usize| x.data[o * n * inner + k * inner + i];
+            out.push(match op {
+                ReduceOp::Sum => {
+                    let mut acc = T::zero();
+                    for k in 0..n {
+                        acc = acc.add(at(k));
+                    }
+                    acc
                 }
-                acc
-            }
-            ReduceOp::Max => {
-                let mut acc = row[0];
-                for &v in &row[1..] {
-                    acc = binary(BinaryOp::Max, acc, v);
+                ReduceOp::Max => {
+                    let mut acc = at(0);
+                    for k in 1..n {
+                        acc = binary(BinaryOp::Max, acc, at(k));
+                    }
+                    acc
                 }
-                acc
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    out
 }
 
 fn broadcast_binary<T: Scalar>(
@@ -1009,6 +1012,65 @@ mod tests {
         // One element: no comparison, NaN stays.
         let (out32, out64) = reduce_both(ReduceOp::Max, &[1], &[f32::NAN]);
         assert!(out32.data()[0].is_nan() && out64.data()[0].is_nan());
+    }
+
+    /// `op` over `axis` of one input, in f32 and f64.
+    fn reduce_axis_both(
+        op: ReduceOp,
+        dims: &[usize],
+        axis: isize,
+        data: &[f32],
+    ) -> (Tensor<f32>, Tensor<f64>) {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(dims)).unwrap();
+        let r = g.reduce_axis(op, x, axis).unwrap();
+        let x_t = tensor(dims, data);
+        let inputs = [("x", &x_t)];
+        (
+            run_f32(&g, r, &inputs).unwrap(),
+            run_f64(&g, r, &inputs).unwrap(),
+        )
+    }
+
+    #[test]
+    fn column_sum_and_max_hand_values_in_both_modes() {
+        // [[1, 10], [100, 1000], [10000, 100000]]
+        let data = &[1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0];
+        // axis 0 walks each column top to bottom: 1+100+10000 and 10+1000+100000.
+        let (sum, _) = reduce_axis_both(ReduceOp::Sum, &[3, 2], 0, data);
+        assert_eq!(sum, tensor(&[1, 2], &[10101.0, 101010.0]));
+        // axis -2 is the same axis.
+        let (sum_neg, _) = reduce_axis_both(ReduceOp::Sum, &[3, 2], -2, data);
+        assert_eq!(sum_neg, sum);
+        // max of a column starts at the first element and keeps the later one on a tie.
+        let (max, _) = reduce_axis_both(ReduceOp::Max, &[3, 2], 0, data);
+        assert_eq!(max, tensor(&[1, 2], &[10000.0, 100000.0]));
+    }
+
+    #[test]
+    fn middle_axis_sum_walks_that_axis_ascending() {
+        // shape (2, 3, 2), axis 1. Element (0, _, 1) is 16777216, then 1, then 1:
+        // each +1 is lost in f32 and kept in f64. The other column adds exactly.
+        let data = &[
+            16777216.0, 1.0, //
+            1.0, 1.0, //
+            1.0, 1.0,
+        ];
+        let (sum32, sum64) = reduce_axis_both(ReduceOp::Sum, &[1, 3, 2], 1, data);
+        assert_eq!(sum32.shape(), &shape(&[1, 1, 2]));
+        assert_eq!(sum32.data(), &[16777216.0, 3.0]);
+        assert_eq!(sum64.data(), &[16777218.0, 3.0]);
+    }
+
+    #[test]
+    fn column_max_with_nan_follows_a_gt_b_else_b() {
+        // First column: NaN is dropped when 1 follows it. Second: 1 > NaN is false.
+        let (out32, out64) =
+            reduce_axis_both(ReduceOp::Max, &[2, 2], 0, &[f32::NAN, 1.0, 1.0, f32::NAN]);
+        assert_eq!(out32.shape(), &shape(&[1, 2]));
+        assert_eq!(out32.data()[0].to_bits(), 1.0f32.to_bits());
+        assert_eq!(out64.data()[0].to_bits(), 1.0f64.to_bits());
+        assert!(out32.data()[1].is_nan() && out64.data()[1].is_nan());
     }
 
     #[test]

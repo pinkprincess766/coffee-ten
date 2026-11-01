@@ -99,6 +99,8 @@ fn input_data(name: &str) -> (Vec<usize>, Vec<f32>) {
         "D" => (vec![3], DIVISOR.to_vec()),
         "X" => (vec![1000], x_data()),
         "S" => (vec![4, 1000], s_data()),
+        // Same 4000 values, read as 1000 rows of 4: a column sum walks a stride of 4.
+        "Col" => (vec![1000, 4], s_data()),
         "R" => (vec![4, 5], r_data()),
         _ => panic!("no data for input {name}"),
     }
@@ -257,6 +259,26 @@ fn div_matches_the_interpreter_bit_for_bit() {
     });
     assert!(inexact, "{result:?}");
     assert!(result.iter().any(|&x| x < 0.0), "{result:?}");
+}
+
+#[test]
+fn column_sum_matches_the_interpreter_bit_for_bit() {
+    let mut g = Graph::new();
+    let s = g.input("Col", shape(&[1000, 4])).unwrap();
+    let sum = g.reduce_axis(ReduceOp::Sum, s, 0).unwrap();
+    let result = check_against_reference("column_sum", &g, sum, &["Col"]);
+    assert_eq!(result.len(), 4);
+    // The test is only sharp if walking a column bottom-up changes the rounded sum.
+    let data = s_data();
+    let mut descending_differs = false;
+    for col in 0..4 {
+        let mut descending = 0.0f32;
+        for row in (0..1000).rev() {
+            descending += data[row * 4 + col];
+        }
+        descending_differs |= descending.to_bits() != result[col].to_bits();
+    }
+    assert!(descending_differs, "{result:?}");
 }
 
 #[test]

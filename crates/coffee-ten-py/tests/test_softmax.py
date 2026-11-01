@@ -1,4 +1,4 @@
-"""Tests of exp, `/`, last-axis `ct.sum` and `ct.max`, and `ct.softmax`.
+"""Tests of exp, `/`, `ct.sum` and `ct.max` over one axis, and `ct.softmax`.
 
 exp is not exactly rounded (libm in the interpreter, `expf` in the compiled kernel), so
 the two paths are each compared with a float64 NumPy reference within a derived bound,
@@ -148,6 +148,51 @@ def test_sum_and_max_shape_errors_come_at_op_time():
         ct.exp(1.0)
     with pytest.raises(TypeError):
         ct.softmax(A_VALUES)
+
+
+def test_sum_and_max_over_a_chosen_axis():
+    A = ct.input("A", (2, 3))
+    total = ct.sum(A, axis=0)
+    largest = ct.max(A, axis=-2)
+    assert total.shape == (1, 3)
+    assert largest.shape == (1, 3)
+    # Columns of [[1, 5, 3], [-2, -8, -4]]: sums [-1, -3, -1], maxes [1, 5, 3].
+    np.testing.assert_array_equal(ct.run(total, A=A_VALUES), f32([[-1.0, -3.0, -1.0]]))
+    np.testing.assert_array_equal(ct.run(largest, A=A_VALUES), f32([[1.0, 5.0, 3.0]]))
+    # axis 0 broadcasts across the rows.
+    shifted = A - total
+    np.testing.assert_array_equal(ct.run(shifted, A=A_VALUES), f32([[2.0, 8.0, 4.0], [-1.0, -5.0, -3.0]]))
+    t = np.arange(24, dtype=np.float32).reshape(2, 3, 4) - 5.0
+    x = ct.input("t", t.shape)
+    np.testing.assert_array_equal(ct.run(ct.sum(x, axis=1), t=t), t.sum(1, keepdims=True))
+    np.testing.assert_array_equal(ct.run(ct.max(x, axis=-2), t=t), t.max(-2, keepdims=True))
+
+
+def test_sum_and_max_axis_errors_name_the_axis():
+    for reduce in (ct.sum, ct.max):
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 3\) over axis 2$"):
+            reduce(ct.input("a", (2, 3)), axis=2)
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 3\) over axis -3$"):
+            reduce(ct.input("a", (2, 3)), axis=-3)
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(0, 3\) over axis 0$"):
+            reduce(ct.input("e", (0, 3)), axis=0)
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 0\) over its last axis$"):
+            reduce(ct.input("e", (2, 0)), axis=1)
+    # An empty axis that is not the reduced one is kept.
+    assert ct.sum(ct.input("e", (0, 3)), axis=1).shape == (0, 1)
+    # A nan first in a column is dropped; a nan last in a column survives.
+    x = f32([[np.nan, 1.0], [2.0, np.nan]])
+    out = ct.run(ct.max(ct.input("A", (2, 2)), axis=0), A=x)
+    assert out[0, 0] == 2.0
+    assert np.isnan(out[0, 1])
+
+
+def test_sum_over_axis_zero_compiles_like_the_interpreter(tmp_path):
+    A = ct.input("A", (2, 3))
+    for y in (ct.sum(A, axis=0), ct.max(A, axis=0), A - ct.sum(A, axis=0)):
+        compiled = ct.compile(y, cache_dir=tmp_path)(A=A_VALUES)
+        interpreted = ct.run(y, A=A_VALUES)
+        np.testing.assert_array_equal(compiled, interpreted)
 
 
 def test_sum_and_max_compile_like_the_interpreter(tmp_path):

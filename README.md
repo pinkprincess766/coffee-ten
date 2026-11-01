@@ -222,7 +222,8 @@ Compiler limitations:
 - CPU only: the C backend is built with clang; there is no GPU path.
 - Python operators: `+ - * /`, unary `-`, `ct.relu`, `ct.maximum`, `ct.exp`, and `@` or
   `ct.matmul` on 2-D tensors; `ct.softmax` is built from them.
-- Reductions are last-axis `ct.sum` and `ct.max` only, keeping the axis with size 1.
+- Reductions are `ct.sum` and `ct.max` over one axis (the last, if `axis` is omitted),
+  keeping that axis with size 1. A negative axis counts from the end.
 - `exp` calls the platform libm (within 1 ulp, not correctly rounded), so graphs with
   `exp` are checked against float64 within a derived bound, not bit for bit.
 - clang must be on `PATH` when `ct.compile` runs; without it, `ct.compile` raises
