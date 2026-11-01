@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use coffee_ten_codegen_c::{CompiledKernel, compile, emit_c};
 use coffee_ten_interp::{Tensor as DenseTensor, run_f32};
-use coffee_ten_ir::{BinaryOp, Graph, GraphError, NodeId, Op, ReduceOp, Shape, UnaryOp};
+use coffee_ten_ir::{
+    BinaryOp, Graph, GraphError, NodeId, Op, ReduceOp, Shape, UnaryOp, reduced_shape,
+};
 use coffee_ten_loop::{Buffer, Kernel, OrderClass, Schedule, apply_classified};
 use numpy::{
     PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyUntypedArray,
@@ -22,12 +24,16 @@ use pyo3::types::{PyDict, PyTuple};
 const MAX_DEPTH: usize = 1000;
 
 enum Expr {
-    Input { name: String, shape: Shape },
+    Input {
+        name: String,
+        shape: Shape,
+    },
     Const(f32),
     Unary(UnaryOp, Arc<Expr>),
     Binary(BinaryOp, Arc<Expr>, Arc<Expr>),
     MatMul(Arc<Expr>, Arc<Expr>),
-    Reduce(ReduceOp, Arc<Expr>),
+    /// The axis is counted from the start.
+    Reduce(ReduceOp, Arc<Expr>, usize),
 }
 
 /// A lazily evaluated tensor expression; it computes nothing until `run`.
@@ -88,21 +94,13 @@ impl PyTensor {
         })
     }
 
-    fn reduce(op: ReduceOp, x: &PyTensor) -> PyResult<PyTensor> {
-        // Same rule and message as `Graph::reduce`, so the error shows at op time.
-        let mut dims = x.shape.dims().to_vec();
-        match dims.last_mut() {
-            Some(last) if *last > 0 => *last = 1,
-            _ => {
-                return Err(value_error(GraphError::BadReduce {
-                    shape: x.shape.clone(),
-                }));
-            }
-        }
+    fn reduce(op: ReduceOp, x: &PyTensor, axis: isize) -> PyResult<PyTensor> {
+        // Same rule and message as `Graph::reduce_axis`, so the error shows at op time.
+        let (shape, axis) = reduced_shape(&x.shape, axis).map_err(value_error)?;
         let depth = check_depth(x.depth + 1)?;
         Ok(PyTensor {
-            expr: Arc::new(Expr::Reduce(op, Arc::clone(&x.expr))),
-            shape: Shape::new(dims),
+            expr: Arc::new(Expr::Reduce(op, Arc::clone(&x.expr), axis)),
+            shape,
             depth,
         })
     }
@@ -239,23 +237,28 @@ fn exp(x: &PyTensor) -> PyResult<PyTensor> {
     PyTensor::unary(UnaryOp::Exp, x)
 }
 
-/// Sum over the last axis, keepdims: shape `(..., n)` becomes `(..., 1)`.
+/// Sum over one axis, keepdims: that axis becomes size 1.
 ///
-/// The sum runs left to right in float32. A rank 0 Tensor or an empty last axis is a
-/// ValueError.
+/// `axis` counts from the end when it is negative, as in NumPy; the default `-1` is the
+/// last axis. The sum runs along the axis in increasing index order, in float32. A rank 0
+/// Tensor, an axis outside the rank, or an empty reduced axis is a ValueError.
 #[pyfunction]
-fn sum(x: &PyTensor) -> PyResult<PyTensor> {
-    PyTensor::reduce(ReduceOp::Sum, x)
+#[pyo3(signature = (x, axis=-1))]
+fn sum(x: &PyTensor, axis: isize) -> PyResult<PyTensor> {
+    PyTensor::reduce(ReduceOp::Sum, x, axis)
 }
 
-/// Maximum over the last axis, keepdims: shape `(..., n)` becomes `(..., 1)`.
+/// Maximum over one axis, keepdims: that axis becomes size 1.
 ///
-/// The running maximum `a` meets the next element `b` as `a > b ? a : b`, so NaN differs
-/// from NumPy: a nan survives only as the last element of the row, while `np.max` returns
-/// nan if there is one anywhere. A rank 0 Tensor or an empty last axis is a ValueError.
+/// `axis` counts from the end when it is negative, as in NumPy; the default `-1` is the
+/// last axis. The running maximum `a` meets the next element `b` as `a > b ? a : b`, so
+/// NaN differs from NumPy: a nan survives only when no later element follows it along the
+/// axis, while `np.max` returns nan if there is one anywhere. A rank 0 Tensor, an axis
+/// outside the rank, or an empty reduced axis is a ValueError.
 #[pyfunction]
-fn max(x: &PyTensor) -> PyResult<PyTensor> {
-    PyTensor::reduce(ReduceOp::Max, x)
+#[pyo3(signature = (x, axis=-1))]
+fn max(x: &PyTensor, axis: isize) -> PyResult<PyTensor> {
+    PyTensor::reduce(ReduceOp::Max, x, axis)
 }
 
 /// softmax(x) over the last axis, shape unchanged: `e / sum(e)` with `e = exp(x - max(x))`.
@@ -265,10 +268,10 @@ fn max(x: &PyTensor) -> PyResult<PyTensor> {
 /// overflow. Built from `max`, `-`, `exp`, `sum` and `/`; it is not a graph node.
 #[pyfunction]
 fn softmax(x: &PyTensor) -> PyResult<PyTensor> {
-    let row_max = PyTensor::reduce(ReduceOp::Max, x)?;
+    let row_max = PyTensor::reduce(ReduceOp::Max, x, -1)?;
     let shifted = PyTensor::binary(BinaryOp::Sub, x, &row_max)?;
     let e = PyTensor::unary(UnaryOp::Exp, &shifted)?;
-    let row_sum = PyTensor::reduce(ReduceOp::Sum, &e)?;
+    let row_sum = PyTensor::reduce(ReduceOp::Sum, &e, -1)?;
     PyTensor::binary(BinaryOp::Div, &e, &row_sum)
 }
 
@@ -351,9 +354,10 @@ fn lower(
             let b = lower(b, graph, memo)?;
             graph.matmul(a, b)?
         }
-        Expr::Reduce(op, x) => {
+        Expr::Reduce(op, x, axis) => {
             let x = lower(x, graph, memo)?;
-            graph.reduce(*op, x)?
+            // `axis` was resolved by `reduced_shape`, so it is within the rank.
+            graph.reduce_axis(*op, x, *axis as isize)?
         }
     };
     memo.insert(key, id);
