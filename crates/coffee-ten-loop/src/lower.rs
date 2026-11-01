@@ -55,8 +55,8 @@ pub fn lower_elementwise(graph: &Graph, output: NodeId, name: &str) -> Result<Ke
 /// is exactly the order of the interpreter's `run_f32` (`acc = 0; acc += a[i, k] * b[k, j]`),
 /// so the two agree bit for bit.
 ///
-/// A reduction over the last axis of `x` (`n` elements per row) writes a temporary of shape
-/// `(..., 1)`, or `out` if it is the output. See `reduce_nests` for its nests; they follow
+/// A reduction over one axis of `x` writes a temporary of the same rank with that axis
+/// set to 1, or `out` if it is the output. See `reduce_nests` for its nests; they follow
 /// the interpreter's order too, so the results agree bit for bit.
 pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerError> {
     let out_dims = node(graph, output)?.shape.dims().to_vec();
@@ -86,7 +86,15 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
     }
     for stage in &stages {
         if let Stage::Reduce(reduce) = stage {
-            loop_rank = loop_rank.max(node_dims(graph, reduce.x)?.len() - 1);
+            let rank = node_dims(graph, reduce.x)?.len();
+            // A last-axis reduction names its kept loops `i0` .. `i{rank-2}`. Any other
+            // axis also names the last kept loop `i{rank-1}`.
+            let names = if reduce.axis + 1 == rank {
+                rank - 1
+            } else {
+                rank
+            };
+            loop_rank = loop_rank.max(names);
         }
     }
     let mut reserved = vec!["out".to_string()];
@@ -135,6 +143,7 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
             Stage::Reduce(reduce) => nests.extend(reduce_nests(
                 reduce.op,
                 node_dims(graph, reduce.x)?,
+                reduce.axis,
                 buffer_in(reduce.x),
                 target,
             )),
@@ -235,11 +244,13 @@ struct MatMulNode {
     dims: (usize, usize, usize),
 }
 
-/// A reduction reachable from the output: `x` is `(..., n)` and the result is `(..., 1)`.
+/// A reduction reachable from the output: `axis` of `x` is reduced and kept at size 1.
 struct ReduceNode {
     id: NodeId,
     op: ReduceOp,
     x: NodeId,
+    /// Counted from the start.
+    axis: usize,
 }
 
 /// A node that gets its own nests: a matmul or a reduction.
@@ -292,8 +303,13 @@ fn reachable_stages(graph: &Graph, output: NodeId) -> Result<Vec<Stage>, LowerEr
                 }));
                 stack.extend([*a, *b]);
             }
-            Op::Reduce(op, x) => {
-                stages.push(Stage::Reduce(ReduceNode { id, op: *op, x: *x }));
+            Op::Reduce(op, x, axis) => {
+                stages.push(Stage::Reduce(ReduceNode {
+                    id,
+                    op: *op,
+                    x: *x,
+                    axis: *axis,
+                }));
                 stack.push(*x);
             }
             Op::Input { .. } | Op::Const(_) => {}
@@ -453,38 +469,37 @@ fn matmul_nests(
     [init, update]
 }
 
-/// Init and update nests of `target = reduce(op, X)` over the last axis of `X`, whose dims
-/// are `x_dims = (d0, .., n)`; `target` has shape `(d0, .., 1)`. Rank 1 has no `i` loops.
+/// Init and update nests of `target = reduce(op, X)` over `axis` of `X`. `target` has the
+/// same rank as `X` with that axis set to 1. Loops over the other axes are named `i{axis}`
+/// and run outside `r`, so the last axis (the only one the old kernels use) still prints
+/// `i0`, `i1`, ... with `r` innermost. Rank 1 over its only axis has no `i` loops.
 ///
 /// The order is the interpreter's (`reduce` in `coffee-ten-interp`), so results agree bit
 /// for bit:
 ///
-/// - sum: `T[i0, .., 0] = 0.0`, then `T = T + X[i0, .., r]` for `r` ascending;
-/// - max: `T[i0, .., 0] = X[i0, .., 0]`, then `T = max(T, X[i0, .., r + 1])` for `r` in
-///   `0..n - 1`, so the accumulator is the first argument. For `n == 1` there is no update.
-fn reduce_nests(op: ReduceOp, x_dims: &[usize], buffer_x: usize, target: usize) -> Vec<LoopNest> {
-    let (&n, leading) = x_dims
-        .split_last()
-        .expect("invariant: a reduced operand has rank >= 1");
+/// - sum: `T[..., 0, ...] = 0.0`, then `T = T + X[..., r, ...]` for `r` ascending;
+/// - max: `T[..., 0, ...] = X[..., 0, ...]`, then `T = max(T, X[..., r + 1, ...])` for
+///   `r` in `0..n - 1`, so the accumulator is the first argument. For `n == 1` there is
+///   no update.
+fn reduce_nests(
+    op: ReduceOp,
+    x_dims: &[usize],
+    axis: usize,
+    buffer_x: usize,
+    target: usize,
+) -> Vec<LoopNest> {
+    let n = x_dims[axis];
+    let rank = x_dims.len();
     let lp = |name: String, extent| Loop {
         name,
         extent,
         vectorize: false,
         unroll: false,
     };
-    let leading_loops: Vec<Loop> = leading
-        .iter()
-        .enumerate()
-        .map(|(axis, &extent)| lp(loop_name(axis), extent))
+    let kept_loops: Vec<Loop> = (0..rank)
+        .filter(|&kept| kept != axis)
+        .map(|kept| lp(loop_name(kept), x_dims[kept]))
         .collect();
-    let leading_index: Vec<AffineExpr> = (0..leading.len())
-        .map(|axis| var(&loop_name(axis)))
-        .collect();
-    let at = |buffer, last: AffineExpr| {
-        let mut index = leading_index.clone();
-        index.push(last);
-        Access { buffer, index }
-    };
     let constant = |constant| AffineExpr {
         constant,
         terms: Vec::new(),
@@ -492,6 +507,18 @@ fn reduce_nests(op: ReduceOp, x_dims: &[usize], buffer_x: usize, target: usize) 
     let r_plus = |constant| AffineExpr {
         constant,
         terms: vec![("r".to_string(), 1)],
+    };
+    let at = |buffer, reduced: AffineExpr| Access {
+        buffer,
+        index: (0..rank)
+            .map(|kept| {
+                if kept == axis {
+                    reduced.clone()
+                } else {
+                    var(&loop_name(kept))
+                }
+            })
+            .collect(),
     };
     let load = |access| Box::new(Expr::Load(access));
     let nest = |loops: Vec<Loop>, value| LoopNest {
@@ -503,13 +530,13 @@ fn reduce_nests(op: ReduceOp, x_dims: &[usize], buffer_x: usize, target: usize) 
         },
     };
     let with_r = |extent| {
-        let mut loops = leading_loops.clone();
+        let mut loops = kept_loops.clone();
         loops.push(lp("r".to_string(), extent));
         loops
     };
     match op {
         ReduceOp::Sum => {
-            let init = nest(leading_loops.clone(), Expr::Const(0.0));
+            let init = nest(kept_loops.clone(), Expr::Const(0.0));
             let sum = Expr::Binary(
                 BinaryOp::Add,
                 load(at(target, constant(0))),
@@ -518,7 +545,7 @@ fn reduce_nests(op: ReduceOp, x_dims: &[usize], buffer_x: usize, target: usize) 
             vec![init, nest(with_r(n), sum)]
         }
         ReduceOp::Max => {
-            let init = nest(leading_loops.clone(), Expr::Load(at(buffer_x, constant(0))));
+            let init = nest(kept_loops.clone(), Expr::Load(at(buffer_x, constant(0))));
             if n == 1 {
                 return vec![init];
             }
@@ -544,7 +571,7 @@ fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         }
         match &nodes[index].op {
             Op::Input { .. } | Op::Const(_) => {}
-            Op::Unary(_, x) | Op::Reduce(_, x) => is_reachable[x.index()] = true,
+            Op::Unary(_, x) | Op::Reduce(_, x, _) => is_reachable[x.index()] = true,
             Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 is_reachable[a.index()] = true;
                 is_reachable[b.index()] = true;
@@ -1294,6 +1321,57 @@ mod tests {
                 "  for r in 0..2:\n",
                 "    out[i0, 0] = max(out[i0, 0], x[i0, r + 1])\n",
             )
+        );
+    }
+
+    #[test]
+    fn sum_over_axis_zero_keeps_the_column_loops() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2, 3])).unwrap();
+        let sum = g.reduce_axis(coffee_ten_ir::ReduceOp::Sum, x, 0).unwrap();
+        assert_eq!(
+            full_text(&g, sum),
+            concat!(
+                "kernel k(x: f32[2, 3], out: f32[1, 3])\n",
+                "for i1 in 0..3:\n",
+                "  out[0, i1] = 0.0\n",
+                "for i1 in 0..3:\n",
+                "  for r in 0..2:\n",
+                "    out[0, i1] = out[0, i1] + x[r, i1]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn sum_over_a_middle_axis_names_the_kept_axes() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2, 3, 4])).unwrap();
+        let sum = g.reduce_axis(coffee_ten_ir::ReduceOp::Sum, x, 1).unwrap();
+        assert_eq!(
+            full_text(&g, sum),
+            concat!(
+                "kernel k(x: f32[2, 3, 4], out: f32[2, 1, 4])\n",
+                "for i0 in 0..2:\n",
+                "  for i2 in 0..4:\n",
+                "    out[i0, 0, i2] = 0.0\n",
+                "for i0 in 0..2:\n",
+                "  for i2 in 0..4:\n",
+                "    for r in 0..3:\n",
+                "      out[i0, 0, i2] = out[i0, 0, i2] + x[i0, r, i2]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn input_named_like_a_kept_axis_loop_is_a_name_clash() {
+        // Reducing axis 0 reserves `i1`, which a last-axis reduction of a matrix does not use
+        // as a reduction loop (its only `i` loop is `i0`).
+        let mut g = Graph::new();
+        let x = g.input("i1", shape(&[2, 3])).unwrap();
+        let sum = g.reduce_axis(coffee_ten_ir::ReduceOp::Sum, x, 0).unwrap();
+        assert_eq!(
+            lower(&g, sum, "k"),
+            Err(LowerError::NameClash("i1".to_string()))
         );
     }
 
