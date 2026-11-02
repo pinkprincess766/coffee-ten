@@ -32,6 +32,29 @@ impl<T> Tensor<T> {
     }
 }
 
+/// Evaluator storage can borrow caller-owned f32 inputs; all computed values are owned.
+enum Value<'a, T> {
+    Borrowed(&'a Tensor<T>),
+    Owned(Tensor<T>),
+}
+impl<T> std::ops::Deref for Value<'_, T> {
+    type Target = Tensor<T>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(x) => x,
+            Self::Owned(x) => x,
+        }
+    }
+}
+impl<T: Clone> Value<'_, T> {
+    fn into_owned(self) -> Tensor<T> {
+        match self {
+            Self::Borrowed(x) => x.clone(),
+            Self::Owned(x) => x,
+        }
+    }
+}
+
 /// Evaluates `output` in f32; every op is one f32 operation, no FMA, no reassociation.
 pub fn run_f32(
     graph: &Graph,
@@ -96,6 +119,12 @@ impl std::error::Error for InterpError {}
 
 /// Element type of the evaluator. Each method is one operation in `Self`.
 trait Scalar: Copy {
+    fn input(x: &Tensor<f32>) -> Value<'_, Self> {
+        Value::Owned(Tensor {
+            shape: x.shape.clone(),
+            data: x.data.iter().map(|&x| Self::from_f32(x)).collect(),
+        })
+    }
     fn from_f32(x: f32) -> Self;
     fn zero() -> Self;
     fn add(self, other: Self) -> Self;
@@ -109,6 +138,9 @@ trait Scalar: Copy {
 }
 
 impl Scalar for f32 {
+    fn input(x: &Tensor<f32>) -> Value<'_, Self> {
+        Value::Borrowed(x)
+    }
     fn from_f32(x: f32) -> f32 {
         x
     }
@@ -205,56 +237,58 @@ fn evaluate<T: Scalar>(
     let supplied = supplied_inputs(graph, inputs)?;
     let needed = needed_nodes(graph, output);
     let mut uses = remaining_uses(graph, &needed);
-    let mut values: Vec<Option<Tensor<T>>> = (0..graph.nodes().len()).map(|_| None).collect();
+    let mut values: Vec<Option<Value<'_, T>>> = (0..graph.nodes().len()).map(|_| None).collect();
     for (index, node) in graph.nodes().iter().enumerate().take(output.index() + 1) {
         if !needed[index] {
             continue;
         }
-        let value = match &node.op {
-            Op::Input { name } => {
-                let input =
-                    supplied[index].ok_or_else(|| InterpError::MissingInput(name.clone()))?;
-                let data = input.data.iter().map(|&x| T::from_f32(x)).collect();
-                Tensor {
+        let value = if let Op::Input { name } = &node.op {
+            let input = supplied[index].ok_or_else(|| InterpError::MissingInput(name.clone()))?;
+            T::input(input)
+        } else {
+            Value::Owned(match &node.op {
+                Op::Input { .. } => unreachable!("input was handled above"),
+                Op::Const(value) => Tensor {
                     shape: node.shape.clone(),
-                    data,
+                    data: vec![T::from_f32(*value)],
+                },
+                Op::Unary(op, x) => {
+                    let x = operand(&values, *x);
+                    let data = unary(*op, &x.data);
+                    Tensor {
+                        shape: node.shape.clone(),
+                        data,
+                    }
                 }
-            }
-            Op::Const(value) => Tensor {
-                shape: node.shape.clone(),
-                data: vec![T::from_f32(*value)],
-            },
-            Op::Unary(op, x) => {
-                let x = operand(&values, *x);
-                let data = unary(*op, &x.data);
-                Tensor {
+                Op::Binary(op, a, b) => {
+                    let data = broadcast_binary(
+                        *op,
+                        operand(&values, *a),
+                        operand(&values, *b),
+                        &node.shape,
+                    )?;
+                    Tensor {
+                        shape: node.shape.clone(),
+                        data,
+                    }
+                }
+                Op::MatMul(a, b) => Tensor {
                     shape: node.shape.clone(),
-                    data,
-                }
-            }
-            Op::Binary(op, a, b) => {
-                let data =
-                    broadcast_binary(*op, operand(&values, *a), operand(&values, *b), &node.shape)?;
-                Tensor {
+                    data: matmul(operand(&values, *a), operand(&values, *b)),
+                },
+                Op::Reduce(op, x, axis) => Tensor {
                     shape: node.shape.clone(),
-                    data,
-                }
-            }
-            Op::MatMul(a, b) => Tensor {
-                shape: node.shape.clone(),
-                data: matmul(operand(&values, *a), operand(&values, *b)),
-            },
-            Op::Reduce(op, x, axis) => Tensor {
-                shape: node.shape.clone(),
-                data: reduce(*op, operand(&values, *x), *axis),
-            },
+                    data: reduce(*op, operand(&values, *x), *axis),
+                },
+            })
         };
         values[index] = Some(value);
         release_operands(&mut values, &mut uses, &node.op);
     }
     Ok(values
         .swap_remove(output.index())
-        .expect("invariant: the output node is evaluated"))
+        .expect("invariant: the output node is evaluated")
+        .into_owned())
 }
 
 /// Input tensors by node index, after checking names, duplicates and shapes.
@@ -326,7 +360,7 @@ fn remaining_uses(graph: &Graph, needed: &[bool]) -> Vec<usize> {
     uses
 }
 
-fn release_operands<T>(values: &mut [Option<Tensor<T>>], uses: &mut [usize], op: &Op) {
+fn release_operands<T>(values: &mut [Option<Value<'_, T>>], uses: &mut [usize], op: &Op) {
     for id in op_inputs(op).into_iter().flatten() {
         uses[id.index()] -= 1;
         if uses[id.index()] == 0 {
@@ -335,7 +369,7 @@ fn release_operands<T>(values: &mut [Option<Tensor<T>>], uses: &mut [usize], op:
     }
 }
 
-fn operand<T>(values: &[Option<Tensor<T>>], id: NodeId) -> &Tensor<T> {
+fn operand<'a, T>(values: &'a [Option<Value<'_, T>>], id: NodeId) -> &'a Tensor<T> {
     values[id.index()]
         .as_ref()
         .expect("invariant: operands are evaluated before their users")
@@ -1358,14 +1392,36 @@ mod tests {
         g.binary(BinaryOp::Mul, x, x).unwrap(); // Dead users must not prolong lifetime.
         let mut uses = remaining_uses(&g, &needed_nodes(&g, y));
         assert_eq!(uses[x.index()], 3);
-        let mut values = vec![Some(tensor(&[2], &[1., 2.])), None, None, None];
+        let mut values = vec![
+            Some(Value::Owned(tensor(&[2], &[1., 2.]))),
+            None,
+            None,
+            None,
+        ];
         release_operands(&mut values, &mut uses, &g.get(twice).unwrap().op);
         assert!(values[x.index()].is_some());
         assert_eq!(uses[x.index()], 1);
-        values[twice.index()] = Some(tensor(&[2], &[2., 4.]));
+        values[twice.index()] = Some(Value::Owned(tensor(&[2], &[2., 4.])));
         release_operands(&mut values, &mut uses, &g.get(y).unwrap().op);
         assert!(values[x.index()].is_none());
         assert!(values[twice.index()].is_none());
+    }
+
+    #[test]
+    fn f32_inputs_are_borrowed_but_identity_results_are_owned() {
+        let input = tensor(&[2], &[-0., 1.]);
+        let borrowed = <f32 as Scalar>::input(&input);
+        assert!(matches!(borrowed, Value::Borrowed(_)));
+        assert_eq!(borrowed.data.as_ptr(), input.data.as_ptr());
+        let widened = <f64 as Scalar>::input(&input);
+        assert!(matches!(widened, Value::Owned(_)));
+        assert_eq!(widened.data[0].to_bits(), (-0.0f64).to_bits());
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2])).unwrap();
+        let mut out = run_f32(&g, x, &[("x", &input)]).unwrap();
+        assert_ne!(out.data.as_ptr(), input.data.as_ptr());
+        out.data[1] = 9.;
+        assert_eq!(input.data[1], 1.);
     }
 
     #[test]
