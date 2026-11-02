@@ -1,0 +1,34 @@
+# parent=8b78a30fa8bd9248e70c5b0a30ce96ea6eb0a5ef; source=working tree after plan item 08-after
+# cpu=Apple M5; rustc 1.98.0 (88d9e12ae 2026-08-18)
+# OS=macos ARCH=aarch64; 9 samples >=10ms each; one untimed call; includes allocation and graph evaluation
+case,dtype,p25_us,median_us,p75_us
+reduce_Sum_[512x 512]_axis0,f32,113.530,141.728,193.649
+reduce_Sum_[512x 512]_axis0,f64,117.500,117.621,118.013
+reduce_Max_[512x 512]_axis0,f32,27.529,27.813,27.934
+reduce_Max_[512x 512]_axis0,f64,53.833,53.933,54.182
+reduce_Sum_[512x 512]_axis1,f32,198.452,198.812,199.095
+reduce_Sum_[512x 512]_axis1,f64,208.938,209.540,210.148
+reduce_Max_[512x 512]_axis1,f32,119.773,119.902,120.930
+reduce_Max_[512x 512]_axis1,f64,128.165,128.566,129.806
+reduce_Sum_[8x 64x 128]_axis1,f32,24.316,24.378,24.418
+reduce_Sum_[8x 64x 128]_axis1,f64,29.447,29.488,29.831
+reduce_Max_[8x 64x 128]_axis1,f32,7.611,7.622,7.624
+reduce_Max_[8x 64x 128]_axis1,f64,13.714,13.848,13.855
+equal,f32,37.210,37.316,37.486
+equal,f64,42.367,42.628,42.779
+scalar,f32,114.693,115.220,115.276
+scalar,f64,116.550,116.837,116.915
+broadcast,f32,483.698,487.585,488.869
+broadcast,f64,477.770,479.843,483.855
+unary_Neg,f32,26.808,26.921,26.941
+unary_Neg,f64,28.723,28.877,28.918
+unary_Relu,f32,26.655,26.743,26.826
+unary_Relu,f64,28.768,28.852,29.216
+unary_Exp,f32,72.328,72.480,72.759
+unary_Exp,f64,108.456,108.790,111.216
+matmul_64,f32,101.622,101.920,102.000
+matmul_64,f64,101.306,101.757,101.856
+matmul_128,f32,897.549,899.295,900.073
+matmul_128,f64,932.936,934.564,935.621
+chain_32,f32,745.188,746.393,748.143
+chain_32,f64,751.167,753.441,762.015
