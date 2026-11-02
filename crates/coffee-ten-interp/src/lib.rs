@@ -379,6 +379,38 @@ fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec<T> {
     let inner: usize = dims[axis + 1..].iter().product();
     let outer: usize = dims[..axis].iter().product();
     let mut out = Vec::with_capacity(outer * inner);
+    if inner == 0 || outer == 0 {
+        return out;
+    }
+    if inner > 1 {
+        for o in 0..outer {
+            let start = o * n * inner;
+            let first_k = match op {
+                ReduceOp::Sum => {
+                    out.resize((o + 1) * inner, T::zero());
+                    0
+                }
+                ReduceOp::Max => {
+                    out.extend_from_slice(&x.data[start..start + inner]);
+                    1
+                }
+            };
+            let acc = &mut out[o * inner..];
+            for values in x.data[start..start + n * inner]
+                .chunks_exact(inner)
+                .skip(first_k)
+            {
+                for (acc, &value) in acc.iter_mut().zip(values) {
+                    *acc = match op {
+                        ReduceOp::Sum => acc.add(value),
+                        ReduceOp::Max => binary(BinaryOp::Max, *acc, value),
+                    };
+                }
+            }
+        }
+        return out;
+    }
+
     for o in 0..outer {
         for i in 0..inner {
             let at = |k: usize| x.data[o * n * inner + k * inner + i];
