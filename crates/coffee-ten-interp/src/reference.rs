@@ -125,3 +125,17 @@ pub(super) fn broadcast_binary<T: Scalar>(
     }
     Ok(data)
 }
+
+pub(super) fn unary<T: Scalar>(op: UnaryOp, x: T) -> T {
+    match op {
+        UnaryOp::Neg => x.neg(),
+        UnaryOp::Relu => {
+            if x.gt(T::zero()) {
+                x
+            } else {
+                T::zero()
+            }
+        }
+        UnaryOp::Exp => x.exp(),
+    }
+}

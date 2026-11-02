@@ -199,3 +199,23 @@ fn matmul_matches_frozen_reference_f32() {
 fn matmul_matches_frozen_reference_f64() {
     check_matmul::<f64>();
 }
+
+fn check_unary<T: Bitwise>() {
+    let mut rng = Rng(0x13198a2e03707344);
+    for special in [false, true] {
+        let x = rng.tensor::<T>(&[1024], special);
+        for op in [UnaryOp::Neg, UnaryOp::Relu, UnaryOp::Exp] {
+            assert_bits(
+                unary(op, &x.data),
+                x.data.iter().map(|&x| reference::unary(op, x)).collect(),
+                &format!("unary {op:?} special={special}"),
+            );
+        }
+    }
+    assert!(unary::<T>(UnaryOp::Neg, &[]).is_empty());
+}
+#[test]
+fn unary_matches_frozen_reference() {
+    check_unary::<f32>();
+    check_unary::<f64>();
+}
