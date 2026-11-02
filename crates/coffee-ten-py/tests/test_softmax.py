@@ -357,3 +357,13 @@ def softmax_cases(draw):
 def test_softmax_random_shapes_and_values_are_within_the_bound(x):
     out = ct.run(ct.softmax(ct.input("x", x.shape)), x=x)
     assert_softmax_within_bound(out, x)
+
+
+@pytest.mark.parametrize("shape,axis", [((1,), 0), ((2, 3), 0), ((2, 1, 3), 1), ((2, 3), -1)])
+def test_sum_of_negative_zeros_starts_from_positive_zero(shape, axis):
+    x = np.full(shape, -0.0, dtype=np.float32)
+    y = ct.sum(ct.input("x", shape), axis=axis)
+    for out in (ct.run(y, x=x), ct.compile(y)(x=x)):
+        assert np.all(out.view(np.uint32) == 0)
+    # NumPy also starts these sums with +0; do not document a sign difference.
+    assert np.all(np.sum(x, axis=axis, keepdims=True).view(np.uint32) == 0)
