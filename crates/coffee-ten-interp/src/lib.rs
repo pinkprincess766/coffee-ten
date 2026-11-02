@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+mod exceptional;
+
 use coffee_ten_ir::{BinaryOp, Graph, NodeId, Op, ReduceOp, Shape, UnaryOp};
 
 /// Row-major tensor; data.len() is the product of the dims (1 for a scalar).
@@ -96,6 +98,7 @@ impl std::error::Error for InterpError {}
 
 /// Element type of the evaluator. Each method is one operation in `Self`.
 trait Scalar: Copy {
+    fn is_finite(self) -> bool;
     fn from_f32(x: f32) -> Self;
     fn zero() -> Self;
     fn add(self, other: Self) -> Self;
@@ -109,6 +112,9 @@ trait Scalar: Copy {
 }
 
 impl Scalar for f32 {
+    fn is_finite(self) -> bool {
+        f32::is_finite(self)
+    }
     fn from_f32(x: f32) -> f32 {
         x
     }
@@ -139,6 +145,9 @@ impl Scalar for f32 {
 }
 
 impl Scalar for f64 {
+    fn is_finite(self) -> bool {
+        f64::is_finite(self)
+    }
     fn from_f32(x: f32) -> f64 {
         f64::from(x)
     }
@@ -373,6 +382,11 @@ fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
 ///
 /// The last axis is the old row reduction: each row is one contiguous chunk of `n`.
 fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec<T> {
+    // Rust permits NaN sign/payload differences between scalar and SIMD arithmetic.
+    // Keep non-finite sums in the original isolated strided kernel, just like the oracle.
+    if op == ReduceOp::Sum && x.data.iter().any(|x| !x.is_finite()) {
+        return exceptional::reduce(op, x, axis);
+    }
     let dims = x.shape().dims();
     let n = dims[axis];
     assert!(n > 0, "invariant: a reduced axis is non-empty");
