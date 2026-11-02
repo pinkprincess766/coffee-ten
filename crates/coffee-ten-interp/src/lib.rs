@@ -285,7 +285,7 @@ fn evaluate<T: Scalar>(
                     shape: node.shape.clone(),
                     data: matmul(operand(&values, *a), operand(&values, *b)),
                 },
-                Op::Reduce(op, x, axis) => Tensor {
+                Op::Reduce { op, x, axis } => Tensor {
                     shape: node.shape.clone(),
                     data: reduce(*op, operand(&values, *x), *axis),
                 },
@@ -338,7 +338,7 @@ fn needed_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         }
         match &graph.nodes()[index].op {
             Op::Input { .. } | Op::Const(_) => {}
-            Op::Unary(_, x) | Op::Reduce(_, x, _) => needed[x.index()] = true,
+            Op::Unary(_, x) | Op::Reduce { x, .. } => needed[x.index()] = true,
             Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 needed[a.index()] = true;
                 needed[b.index()] = true;
@@ -351,7 +351,7 @@ fn needed_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
 fn op_inputs(op: &Op) -> [Option<NodeId>; 2] {
     match op {
         Op::Input { .. } | Op::Const(_) => [None, None],
-        Op::Unary(_, x) | Op::Reduce(_, x, _) => [Some(*x), None],
+        Op::Unary(_, x) | Op::Reduce { x, .. } => [Some(*x), None],
         Op::Binary(_, a, b) | Op::MatMul(a, b) => [Some(*a), Some(*b)],
     }
 }
