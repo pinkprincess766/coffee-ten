@@ -496,9 +496,14 @@ fn broadcast_binary<T: Scalar>(
             .map(|&value| binary(op, value, scalar))
             .collect());
     }
-    let a_strides = broadcast_strides(a.shape(), out);
-    let b_strides = broadcast_strides(b.shape(), out);
-    let dims = out.dims();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let BroadcastLayout {
+        dims,
+        a_strides,
+        b_strides,
+    } = BroadcastLayout::new(a.shape(), b.shape(), out);
     let mut index = vec![0; dims.len()];
     let (mut a_at, mut b_at) = (0, 0);
     let mut data = Vec::with_capacity(len);
@@ -518,6 +523,42 @@ fn broadcast_binary<T: Scalar>(
         }
     }
     Ok(data)
+}
+
+/// Merge adjacent axes only when both operand offsets stay affine in the flat index.
+struct BroadcastLayout {
+    dims: Vec<usize>,
+    a_strides: Vec<usize>,
+    b_strides: Vec<usize>,
+}
+impl BroadcastLayout {
+    fn new(a: &Shape, b: &Shape, out: &Shape) -> Self {
+        let a_strides = broadcast_strides(a, out);
+        let b_strides = broadcast_strides(b, out);
+        let mut layout = Self {
+            dims: Vec::new(),
+            a_strides: Vec::new(),
+            b_strides: Vec::new(),
+        };
+        for ((&d, a), b) in out.dims().iter().zip(a_strides).zip(b_strides) {
+            if d == 1 {
+                continue;
+            }
+            if let Some(last) = layout.dims.len().checked_sub(1)
+                && layout.a_strides[last] == a * d
+                && layout.b_strides[last] == b * d
+            {
+                layout.dims[last] *= d;
+                layout.a_strides[last] = a;
+                layout.b_strides[last] = b;
+                continue;
+            }
+            layout.dims.push(d);
+            layout.a_strides.push(a);
+            layout.b_strides.push(b);
+        }
+        layout
+    }
 }
 
 #[cfg(test)]
@@ -1270,6 +1311,20 @@ mod tests {
         assert_eq!(ReductionLayout::new(&[usize::MAX, 3, 0], 1), None);
         let x = Tensor::new(shape(&[usize::MAX, 3, 0]), Vec::<f32>::new()).unwrap();
         assert!(reduce(ReduceOp::Max, &x, 1).is_empty());
+    }
+
+    #[test]
+    fn broadcast_layout_merges_only_compatible_strides() {
+        let out = shape(&[2, 1, 3, 4]);
+        let layout = BroadcastLayout::new(&out, &shape(&[]), &out);
+        assert_eq!(layout.dims, [24]);
+        assert_eq!(layout.a_strides, [1]);
+        assert_eq!(layout.b_strides, [0]);
+        let out = shape(&[2, 3, 4]);
+        let layout = BroadcastLayout::new(&shape(&[2, 1, 4]), &shape(&[1, 3, 1]), &out);
+        assert_eq!(layout.dims, [2, 3, 4]);
+        assert_eq!(layout.a_strides, [4, 0, 1]);
+        assert_eq!(layout.b_strides, [0, 1, 0]);
     }
 
     #[test]
