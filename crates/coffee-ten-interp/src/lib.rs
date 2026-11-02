@@ -378,58 +378,60 @@ fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec<T> {
     assert!(n > 0, "invariant: a reduced axis is non-empty");
     let inner: usize = dims[axis + 1..].iter().product();
     let outer: usize = dims[..axis].iter().product();
-    let mut out = Vec::with_capacity(outer * inner);
-    if inner == 0 || outer == 0 {
-        return out;
+    if outer == 0 || inner == 0 {
+        return Vec::new();
     }
-    if inner > 1 {
-        for o in 0..outer {
-            let start = o * n * inner;
-            let first_k = match op {
-                ReduceOp::Sum => {
-                    out.resize((o + 1) * inner, T::zero());
-                    0
-                }
-                ReduceOp::Max => {
-                    out.extend_from_slice(&x.data[start..start + inner]);
-                    1
-                }
-            };
-            let acc = &mut out[o * inner..];
-            for values in x.data[start..start + n * inner]
-                .chunks_exact(inner)
-                .skip(first_k)
-            {
-                for (acc, &value) in acc.iter_mut().zip(values) {
-                    *acc = match op {
-                        ReduceOp::Sum => acc.add(value),
-                        ReduceOp::Max => binary(BinaryOp::Max, *acc, value),
-                    };
-                }
+    match op {
+        ReduceOp::Sum => reduce_sum(&x.data, outer, n, inner),
+        ReduceOp::Max => reduce_max(&x.data, outer, n, inner),
+    }
+}
+
+fn reduce_sum<T: Scalar>(data: &[T], outer: usize, n: usize, inner: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(outer * inner);
+    if inner == 1 {
+        for row in data.chunks_exact(n) {
+            let mut acc = T::zero();
+            for &value in row {
+                acc = acc.add(value);
             }
+            out.push(acc);
         }
         return out;
     }
-
     for o in 0..outer {
-        for i in 0..inner {
-            let at = |k: usize| x.data[o * n * inner + k * inner + i];
-            out.push(match op {
-                ReduceOp::Sum => {
-                    let mut acc = T::zero();
-                    for k in 0..n {
-                        acc = acc.add(at(k));
-                    }
-                    acc
-                }
-                ReduceOp::Max => {
-                    let mut acc = at(0);
-                    for k in 1..n {
-                        acc = binary(BinaryOp::Max, acc, at(k));
-                    }
-                    acc
-                }
-            });
+        out.resize((o + 1) * inner, T::zero());
+        let acc = &mut out[o * inner..];
+        let start = o * n * inner;
+        for values in data[start..start + n * inner].chunks_exact(inner) {
+            for (acc, &value) in acc.iter_mut().zip(values) {
+                *acc = acc.add(value);
+            }
+        }
+    }
+    out
+}
+
+fn reduce_max<T: Scalar>(data: &[T], outer: usize, n: usize, inner: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(outer * inner);
+    if inner == 1 {
+        for row in data.chunks_exact(n) {
+            let mut acc = row[0];
+            for &value in &row[1..] {
+                acc = if acc.gt(value) { acc } else { value };
+            }
+            out.push(acc);
+        }
+        return out;
+    }
+    for o in 0..outer {
+        let start = o * n * inner;
+        out.extend_from_slice(&data[start..start + inner]);
+        let acc = &mut out[o * inner..];
+        for values in data[start + inner..start + n * inner].chunks_exact(inner) {
+            for (acc, &value) in acc.iter_mut().zip(values) {
+                *acc = if acc.gt(value) { *acc } else { value };
+            }
         }
     }
     out
