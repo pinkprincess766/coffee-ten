@@ -1095,6 +1095,67 @@ mod tests {
     }
 
     #[test]
+    fn max_axis_shapes_and_values_match_in_both_modes() {
+        for (dims, axis, data, expected) in [
+            (
+                vec![2, 3],
+                0,
+                vec![1., 5., -3., 2., 4., -1.],
+                vec![2., 5., -1.],
+            ),
+            (
+                vec![2, 2, 2],
+                1,
+                vec![1., 9., 3., 4., -1., -2., -3., -4.],
+                vec![3., 9., -1., -2.],
+            ),
+            (
+                vec![2, 1, 2],
+                1,
+                vec![-0., 2., -3., 4.],
+                vec![-0., 2., -3., 4.],
+            ),
+            (vec![3], 0, vec![-4., -2., -3.], vec![-2.]),
+        ] {
+            let (out, out64) = reduce_axis_both(ReduceOp::Max, &dims, axis, &data);
+            let mut reduced = dims.clone();
+            reduced[axis as usize] = 1;
+            assert_eq!(out.shape(), &shape(&reduced));
+            assert_eq!(out64.shape(), &shape(&reduced));
+            assert_eq!(
+                out.data().iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|x: &f32| x.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                out64.data().iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|&x| f64::from(x).to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn subtract_column_max_broadcasts_in_both_modes() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2, 3])).unwrap();
+        let m = g.reduce_axis(ReduceOp::Max, x, 0).unwrap();
+        let y = g.binary(BinaryOp::Sub, x, m).unwrap();
+        let input = tensor(&[2, 3], &[1., 5., -3., 2., 4., -1.]);
+        check_both(
+            &g,
+            y,
+            &[("x", &input)],
+            &[2, 3],
+            &[-1., 0., -2., 0., -1., 0.],
+        );
+    }
+
+    #[test]
     fn errors_print_one_short_line() {
         let mut g = Graph::new();
         let id = g.constant(1.0);
