@@ -156,7 +156,17 @@ fn check_broadcast<T: Bitwise>() {
 
 fn check_matmul<T: Bitwise>() {
     let mut rng = Rng(0xb7e151628aed2a6b);
-    let mut sizes = vec![(0, 3, 2), (2, 0, 3), (2, 3, 0), (1, 1, 1), (3, 17, 5)];
+    let mut sizes = vec![
+        (33, 65, 67),
+        (2, 97, 129),
+        (1, 1, 65),
+        (3, 65, 1),
+        (0, 3, 2),
+        (2, 0, 3),
+        (2, 3, 0),
+        (1, 1, 1),
+        (3, 17, 5),
+    ];
     for _ in 0..128 {
         sizes.push((rng.next() % 18, rng.next() % 18, rng.next() % 18));
     }
