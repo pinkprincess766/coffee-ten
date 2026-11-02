@@ -187,7 +187,7 @@ pub(super) fn evaluate<T: Scalar>(
                 shape: node.shape.clone(),
                 data: matmul(operand(&values, *a), operand(&values, *b)),
             },
-            Op::Reduce(op, x, axis) => Tensor {
+            Op::Reduce { op, x, axis } => Tensor {
                 shape: node.shape.clone(),
                 data: reduce(*op, operand(&values, *x), *axis),
             },

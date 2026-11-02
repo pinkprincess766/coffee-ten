@@ -82,7 +82,11 @@ pub enum Op {
     /// Reduces one axis and keeps it with size 1. The axis is counted from the start:
     /// `(2, 3)` over axis 1 is `(2, 1)`, over axis 0 is `(1, 3)`, and `(4,)` over axis 0
     /// is `(1,)`.
-    Reduce(ReduceOp, NodeId, usize),
+    Reduce {
+        op: ReduceOp,
+        x: NodeId,
+        axis: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,7 +169,7 @@ impl Graph {
     ) -> Result<NodeId, GraphError> {
         let x_shape = self.node(x)?.shape.clone();
         let (shape, axis) = reduced_shape(&x_shape, axis)?;
-        Ok(self.push(Op::Reduce(op, x, axis), shape))
+        Ok(self.push(Op::Reduce { op, x, axis }, shape))
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -198,7 +202,7 @@ impl fmt::Display for Graph {
                     format!("{} %{}, %{}", op.name(), a.index(), b.index())
                 }
                 Op::MatMul(a, b) => format!("matmul %{}, %{}", a.index(), b.index()),
-                Op::Reduce(op, x, axis) => {
+                Op::Reduce { op, x, axis } => {
                     // The last axis is the historical form, so its text stays `sum %0`.
                     if *axis + 1 == node.shape.rank() {
                         format!("{} %{}", op.name(), x.index())
@@ -413,7 +417,7 @@ mod tests {
         let g = sample_graph();
         for (index, node) in g.nodes().iter().enumerate() {
             match &node.op {
-                Op::Unary(_, x) | Op::Reduce(_, x, _) => assert!(x.index() < index),
+                Op::Unary(_, x) | Op::Reduce { x, .. } => assert!(x.index() < index),
                 Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                     assert!(a.index() < index && b.index() < index)
                 }
