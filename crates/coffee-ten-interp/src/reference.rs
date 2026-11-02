@@ -200,3 +200,9 @@ pub(super) fn evaluate<T: Scalar>(
         .swap_remove(output.index())
         .expect("invariant: the output node is evaluated"))
 }
+
+fn operand<T>(values: &[Option<Tensor<T>>], id: NodeId) -> &Tensor<T> {
+    values[id.index()]
+        .as_ref()
+        .expect("invariant: operands are evaluated before their users")
+}
