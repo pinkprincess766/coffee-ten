@@ -422,7 +422,7 @@ mod tests {
         let e = g.unary(coffee_ten_ir::UnaryOp::Exp, a).unwrap();
         let y = g.binary(coffee_ten_ir::BinaryOp::Div, e, b).unwrap();
         let k = crate::lower_elementwise(&g, y, "k").unwrap();
-        assert!(k.to_string().contains("exp(A[i0, i1]) / B[i1]"), "{k}");
+        assert!(k.to_string().contains("exp(A[_i0, _i1]) / B[_i1]"), "{k}");
         assert_round_trip(&k);
     }
 
