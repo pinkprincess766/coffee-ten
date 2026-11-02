@@ -168,17 +168,14 @@ impl Scalar for f64 {
     }
 }
 
-fn unary<T: Scalar>(op: UnaryOp, x: T) -> T {
+fn unary<T: Scalar>(op: UnaryOp, data: &[T]) -> Vec<T> {
     match op {
-        UnaryOp::Neg => x.neg(),
-        UnaryOp::Relu => {
-            if x.gt(T::zero()) {
-                x
-            } else {
-                T::zero()
-            }
-        }
-        UnaryOp::Exp => x.exp(),
+        UnaryOp::Neg => data.iter().map(|&x| x.neg()).collect(),
+        UnaryOp::Relu => data
+            .iter()
+            .map(|&x| if x.gt(T::zero()) { x } else { T::zero() })
+            .collect(),
+        UnaryOp::Exp => data.iter().map(|&x| x.exp()).collect(),
     }
 }
 
@@ -228,7 +225,7 @@ fn evaluate<T: Scalar>(
             },
             Op::Unary(op, x) => {
                 let x = operand(&values, *x);
-                let data = x.data.iter().map(|&v| unary(*op, v)).collect();
+                let data = unary(*op, &x.data);
                 Tensor {
                     shape: node.shape.clone(),
                     data,
