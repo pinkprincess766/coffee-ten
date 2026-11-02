@@ -387,17 +387,38 @@ fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec<T> {
     if op == ReduceOp::Sum && x.data.iter().any(|x| !x.is_finite()) {
         return exceptional::reduce(op, x, axis);
     }
-    let dims = x.shape().dims();
-    let n = dims[axis];
-    assert!(n > 0, "invariant: a reduced axis is non-empty");
-    let inner: usize = dims[axis + 1..].iter().product();
-    let outer: usize = dims[..axis].iter().product();
-    if outer == 0 || inner == 0 {
+    let Some(ReductionLayout { outer, n, inner }) = ReductionLayout::new(x.shape().dims(), axis)
+    else {
         return Vec::new();
-    }
+    };
     match op {
         ReduceOp::Sum => reduce_sum(&x.data, outer, n, inner),
         ReduceOp::Max => reduce_max(&x.data, outer, n, inner),
+    }
+}
+
+/// Coalesce row-major axes around the reduced axis without reshaping or copying data.
+/// All kernels use the resulting three-axis view, independent of the original rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReductionLayout {
+    outer: usize,
+    n: usize,
+    inner: usize,
+}
+
+impl ReductionLayout {
+    fn new(dims: &[usize], axis: usize) -> Option<Self> {
+        let n = dims[axis];
+        assert!(n > 0, "invariant: a reduced axis is non-empty");
+        // Check zero dimensions before products, including shapes with huge empty axes.
+        if dims.contains(&0) {
+            return None;
+        }
+        Some(Self {
+            outer: dims[..axis].iter().product(),
+            n,
+            inner: dims[axis + 1..].iter().product(),
+        })
     }
 }
 
@@ -1201,6 +1222,37 @@ mod tests {
             &[2, 3],
             &[-1., 0., -2., 0., -1., 0.],
         );
+    }
+
+    #[test]
+    fn reduction_layout_coalesces_without_copying() {
+        assert_eq!(
+            ReductionLayout::new(&[2, 3, 5, 7], 2),
+            Some(ReductionLayout {
+                outer: 6,
+                n: 5,
+                inner: 7
+            })
+        );
+        assert_eq!(
+            ReductionLayout::new(&[2, 3, 5, 7], 0),
+            Some(ReductionLayout {
+                outer: 1,
+                n: 2,
+                inner: 105
+            })
+        );
+        assert_eq!(
+            ReductionLayout::new(&[2, 3, 5, 7], 3),
+            Some(ReductionLayout {
+                outer: 30,
+                n: 7,
+                inner: 1
+            })
+        );
+        assert_eq!(ReductionLayout::new(&[usize::MAX, 3, 0], 1), None);
+        let x = Tensor::new(shape(&[usize::MAX, 3, 0]), Vec::<f32>::new()).unwrap();
+        assert!(reduce(ReduceOp::Max, &x, 1).is_empty());
     }
 
     #[test]
