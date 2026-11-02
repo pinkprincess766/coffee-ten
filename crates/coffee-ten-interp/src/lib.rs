@@ -346,15 +346,14 @@ fn broadcast_strides(operand: &Shape, out: &Shape) -> Vec<usize> {
 fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
     let (m, k) = (a.shape().dims()[0], a.shape().dims()[1]);
     let n = b.shape().dims()[1];
-    let mut data = Vec::with_capacity(m * n);
+    let mut data = vec![T::zero(); m * n];
     for i in 0..m {
-        for j in 0..n {
-            let mut acc = T::zero();
-            for kk in 0..k {
-                let product = a.data[i * k + kk].mul(b.data[kk * n + j]);
-                acc = acc.add(product);
+        for kk in 0..k {
+            let av = a.data[i * k + kk];
+            for j in 0..n {
+                let product = av.mul(b.data[kk * n + j]);
+                data[i * n + j] = data[i * n + j].add(product);
             }
-            data.push(acc);
         }
     }
     data
