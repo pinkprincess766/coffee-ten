@@ -262,17 +262,19 @@ fn max(x: &PyTensor, axis: isize) -> PyResult<PyTensor> {
     PyTensor::reduce(ReduceOp::Max, x, axis)
 }
 
-/// softmax(x) over the last axis, shape unchanged: `e / sum(e)` with `e = exp(x - max(x))`.
+/// softmax(x, axis=-1) over one axis, shape unchanged: `e / sum(e)` with `e = exp(x - max(x))`.
 ///
-/// Three passes over each row (max, then exp and sum, then divide), no online softmax.
-/// Numerically stable: subtracting the row max keeps every exponent <= 0, so exp cannot
+/// The default is the last axis; negative indices count from the end, as for sum/max.
+/// Three passes along the selected axis (max, then exp and sum, then divide), no online softmax.
+/// Numerically stable: subtracting the selected-axis max keeps every exponent <= 0, so exp cannot
 /// overflow. Built from `max`, `-`, `exp`, `sum` and `/`; it is not a graph node.
 #[pyfunction]
-fn softmax(x: &PyTensor) -> PyResult<PyTensor> {
-    let row_max = PyTensor::reduce(ReduceOp::Max, x, -1)?;
+#[pyo3(signature = (x, axis=-1))]
+fn softmax(x: &PyTensor, axis: isize) -> PyResult<PyTensor> {
+    let row_max = PyTensor::reduce(ReduceOp::Max, x, axis)?;
     let shifted = PyTensor::binary(BinaryOp::Sub, x, &row_max)?;
     let e = PyTensor::unary(UnaryOp::Exp, &shifted)?;
-    let row_sum = PyTensor::reduce(ReduceOp::Sum, &e, -1)?;
+    let row_sum = PyTensor::reduce(ReduceOp::Sum, &e, axis)?;
     PyTensor::binary(BinaryOp::Div, &e, &row_sum)
 }
 
