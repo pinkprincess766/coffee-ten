@@ -387,3 +387,46 @@ fn rank_three_buffer_is_a_row_pointer_and_matches_the_interpreter_bit_for_bit() 
         );
     }
 }
+
+#[test]
+fn matmul_test_mode_has_separate_multiply_and_add() {
+    let mut g = Graph::new();
+    let a = g.input("A", shape(&[17, 17])).unwrap();
+    let b = g.input("B", shape(&[17, 17])).unwrap();
+    let y = g.matmul(a, b).unwrap();
+    let source = emit_c(&lower(&g, y, "matmul_separate").unwrap()).unwrap();
+    assert!(!source.contains("fma("));
+    assert!(!source.contains("fmaf("));
+    let dir = TempDir::new("matmul-no-contraction");
+    let input = dir.0.join("k.c");
+    let output = dir.0.join("k.ll");
+    std::fs::write(&input, source).unwrap();
+    let result = std::process::Command::new("clang")
+        .args(coffee_ten_codegen_c::TEST_FLAGS)
+        .args(["-S", "-emit-llvm"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let ir = std::fs::read_to_string(output).unwrap();
+    assert!(ir.contains("fmul ") && ir.contains("fadd "), "{ir}");
+    assert!(
+        !ir.contains("llvm.fma") && !ir.contains("llvm.fmuladd"),
+        "{ir}"
+    );
+    for line in ir
+        .lines()
+        .filter(|line| line.contains("fmul ") || line.contains("fadd "))
+    {
+        assert!(
+            !line.contains("contract") && !line.contains("fast "),
+            "{line}"
+        );
+    }
+}
