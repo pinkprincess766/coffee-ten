@@ -229,3 +229,35 @@ fn unary_matches_frozen_reference() {
     check_unary::<f32>();
     check_unary::<f64>();
 }
+
+fn check_graph<T: Bitwise>() {
+    let mut g = Graph::new();
+    let x = g.input("x", shape(&[2, 3])).unwrap();
+    let twice = g.binary(BinaryOp::Add, x, x).unwrap();
+    let m = g.reduce_axis(ReduceOp::Max, twice, 0).unwrap();
+    let mut y = g.binary(BinaryOp::Sub, twice, m).unwrap();
+    for _ in 0..32 {
+        y = g.unary(UnaryOp::Neg, y).unwrap();
+    }
+    g.binary(BinaryOp::Mul, x, x).unwrap();
+    let mut rng = Rng(0xa4093822299f31d0);
+    for special in [false, true] {
+        let input = rng.tensor::<f32>(&[2, 3], special);
+        let inputs = [("x", &input)];
+        for out in [x, twice, m, y, g.constant(-0.)] {
+            let actual = evaluate::<T>(&g, out, &inputs).unwrap();
+            let expected = reference::evaluate::<T>(&g, out, &inputs).unwrap();
+            assert_eq!(actual.shape(), expected.shape());
+            assert_bits(
+                actual.data,
+                expected.data,
+                "shared/dead DAG and identity outputs",
+            );
+        }
+    }
+}
+#[test]
+fn live_graph_matches_frozen_evaluation() {
+    check_graph::<f32>();
+    check_graph::<f64>();
+}
