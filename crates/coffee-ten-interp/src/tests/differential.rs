@@ -261,3 +261,92 @@ fn live_graph_matches_frozen_evaluation() {
     check_graph::<f32>();
     check_graph::<f64>();
 }
+
+fn check_threads<T: Bitwise>() {
+    let mut rng = Rng(0x082efa98ec4e6c89);
+    for dims in [
+        vec![],
+        vec![0, 3],
+        vec![1],
+        vec![3, 2],
+        vec![2, 1, 3],
+        vec![2, 3, 4],
+    ] {
+        for special in [false, true] {
+            let x = rng.tensor::<T>(&dims, special);
+            let b = rng.tensor::<T>(&dims, special);
+            let scalar = rng.tensor::<T>(&[], special);
+            for threads in [1, 2, 3, 8] {
+                for op in [UnaryOp::Neg, UnaryOp::Relu, UnaryOp::Exp] {
+                    assert_bits(
+                        unary_threaded(op, &x.data, threads),
+                        x.data.iter().map(|&x| reference::unary(op, x)).collect(),
+                        "threaded unary",
+                    );
+                }
+                for op in [
+                    BinaryOp::Add,
+                    BinaryOp::Sub,
+                    BinaryOp::Mul,
+                    BinaryOp::Div,
+                    BinaryOp::Max,
+                ] {
+                    for b in [&b, &scalar] {
+                        assert_bits(
+                            broadcast_threaded(op, &x, b, &shape(&dims), threads).unwrap(),
+                            reference::broadcast_binary(op, &x, b, &shape(&dims)).unwrap(),
+                            "threaded binary",
+                        );
+                    }
+                }
+                for (axis, &n) in dims.iter().enumerate() {
+                    if n == 0 {
+                        continue;
+                    }
+                    for op in [ReduceOp::Sum, ReduceOp::Max] {
+                        assert_bits(
+                            reduce_threaded(op, &x, axis, threads),
+                            reference::reduce(op, &x, axis),
+                            "threaded reduction",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for (m, k, n) in [(0, 3, 2), (2, 0, 3), (2, 3, 0), (1, 1, 1), (3, 33, 65)] {
+        let a = rng.tensor::<T>(&[m, k], true);
+        let b = rng.tensor::<T>(&[k, n], true);
+        for threads in [1, 2, 3, 8] {
+            assert_bits(
+                matmul_threaded(&a, &b, threads),
+                reference::matmul(&a, &b),
+                "threaded matmul",
+            );
+        }
+    }
+    let mut g = Graph::new();
+    let x = g.input("x", shape(&[2, 3])).unwrap();
+    let y = g.binary(BinaryOp::Sub, x, x).unwrap();
+    let input = rng.tensor::<f32>(&[2, 3], true);
+    let inputs = [("x", &input)];
+    for threads in [1, 2, 3, 8] {
+        assert_bits(
+            evaluate_with_threads::<T>(&g, y, &inputs, threads)
+                .unwrap()
+                .data,
+            reference::evaluate::<T>(&g, y, &inputs).unwrap().data,
+            "threaded graph",
+        );
+    }
+    for threads in [0, MAX_THREADS + 1] {
+        assert!(
+            matches!(evaluate_with_threads::<T>(&g,y,&inputs,threads), Err(InterpError::InvalidThreads(n)) if n == threads)
+        );
+    }
+}
+#[test]
+fn threaded_execution_matches_frozen_reference() {
+    check_threads::<f32>();
+    check_threads::<f64>();
+}
