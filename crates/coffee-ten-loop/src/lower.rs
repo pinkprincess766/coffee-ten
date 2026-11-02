@@ -87,8 +87,8 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
     for stage in &stages {
         if let Stage::Reduce(reduce) = stage {
             let rank = node_dims(graph, reduce.x)?.len();
-            // A last-axis reduction names its kept loops `i0` .. `i{rank-2}`. Any other
-            // axis also names the last kept loop `i{rank-1}`.
+            // A last-axis reduction names its kept loops `_i0` .. `_i{rank-2}`. Any other
+            // axis also names the last kept loop `_i{rank-1}`.
             let names = if reduce.axis + 1 == rank {
                 rank - 1
             } else {
@@ -470,9 +470,9 @@ fn matmul_nests(
 }
 
 /// Init and update nests of `target = reduce(op, X)` over `axis` of `X`. `target` has the
-/// same rank as `X` with that axis set to 1. Loops over the other axes are named `i{axis}`
+/// same rank as `X` with that axis set to 1. Loops over the other axes are named `_i{axis}`
 /// and run outside `r`, so the last axis (the only one the old kernels use) still prints
-/// `i0`, `i1`, ... with `r` innermost. Rank 1 over its only axis has no `i` loops.
+/// `_i0`, `_i1`, ... with `r` innermost. Rank 1 over its only axis has no `i` loops.
 ///
 /// The order is the interpreter's (`reduce` in `coffee-ten-interp`), so results agree bit
 /// for bit:
@@ -652,7 +652,7 @@ fn lower_value(
 }
 
 fn loop_name(axis: usize) -> String {
-    format!("i{axis}")
+    format!("_i{axis}")
 }
 
 fn var(name: &str) -> AffineExpr {
@@ -697,6 +697,16 @@ mod tests {
     }
 
     #[test]
+    fn plain_i_names_no_longer_clash_with_generated_loops() {
+        let mut g = Graph::new();
+        let x = g.input("i1", shape(&[2, 3])).unwrap();
+        let y = g.reduce_axis(coffee_ten_ir::ReduceOp::Max, x, 0).unwrap();
+        let k = lower(&g, y, "k").unwrap();
+        assert_eq!(k.validate(), Ok(()));
+        assert!(k.to_string().contains("for _i1 in 0..3:"));
+    }
+
+    #[test]
     fn relu_of_broadcast_add_is_one_nest() {
         let mut g = Graph::new();
         let a = g.input("A", shape(&[2, 3])).unwrap();
@@ -707,9 +717,9 @@ mod tests {
             lowered_text(&g, out),
             concat!(
                 "kernel k(A: f32[2, 3], bias: f32[3], out: f32[2, 3])\n",
-                "for i0 in 0..2:\n",
-                "  for i1 in 0..3:\n",
-                "    out[i0, i1] = relu(A[i0, i1] + bias[i1])\n",
+                "for _i0 in 0..2:\n",
+                "  for _i1 in 0..3:\n",
+                "    out[_i0, _i1] = relu(A[_i0, _i1] + bias[_i1])\n",
             )
         );
     }
@@ -725,9 +735,9 @@ mod tests {
             lowered_text(&g, out),
             concat!(
                 "kernel k(A: f32[2, 3], B: f32[3], out: f32[2, 3])\n",
-                "for i0 in 0..2:\n",
-                "  for i1 in 0..3:\n",
-                "    out[i0, i1] = exp(A[i0, i1]) / B[i1]\n",
+                "for _i0 in 0..2:\n",
+                "  for _i1 in 0..3:\n",
+                "    out[_i0, _i1] = exp(A[_i0, _i1]) / B[_i1]\n",
             )
         );
     }
@@ -742,9 +752,9 @@ mod tests {
             lowered_text(&g, prod),
             concat!(
                 "kernel k(A: f32[2, 1], B: f32[3], out: f32[2, 3])\n",
-                "for i0 in 0..2:\n",
-                "  for i1 in 0..3:\n",
-                "    out[i0, i1] = A[i0, 0] * B[i1]\n",
+                "for _i0 in 0..2:\n",
+                "  for _i1 in 0..3:\n",
+                "    out[_i0, _i1] = A[_i0, 0] * B[_i1]\n",
             )
         );
     }
@@ -759,8 +769,8 @@ mod tests {
             lowered_text(&g, sum),
             concat!(
                 "kernel k(A: f32[4], out: f32[4])\n",
-                "for i0 in 0..4:\n",
-                "  out[i0] = 2.0 + A[i0]\n",
+                "for _i0 in 0..4:\n",
+                "  out[_i0] = 2.0 + A[_i0]\n",
             )
         );
     }
@@ -785,8 +795,8 @@ mod tests {
             lowered_text(&g, out),
             concat!(
                 "kernel k(A: f32[4], out: f32[4])\n",
-                "for i0 in 0..4:\n",
-                "  out[i0] = A[i0] + A[i0]\n",
+                "for _i0 in 0..4:\n",
+                "  out[_i0] = A[_i0] + A[_i0]\n",
             )
         );
     }
@@ -801,8 +811,8 @@ mod tests {
             lowered_text(&g, out),
             concat!(
                 "kernel k(A: f32[2], out: f32[2])\n",
-                "for i0 in 0..2:\n",
-                "  out[i0] = -(A[i0])\n",
+                "for _i0 in 0..2:\n",
+                "  out[_i0] = -(A[_i0])\n",
             )
         );
     }
@@ -837,10 +847,10 @@ mod tests {
     #[test]
     fn input_named_like_a_loop_variable_is_a_name_clash() {
         let mut g = Graph::new();
-        let x = g.input("i0", shape(&[2])).unwrap();
+        let x = g.input("_i0", shape(&[2])).unwrap();
         let y = g.unary(coffee_ten_ir::UnaryOp::Neg, x).unwrap();
         let err = lower_elementwise(&g, y, "k").unwrap_err();
-        assert_eq!(err, LowerError::NameClash("i0".to_string()));
+        assert_eq!(err, LowerError::NameClash("_i0".to_string()));
     }
 
     #[test]
@@ -922,9 +932,9 @@ mod tests {
             lowered_text(&g, out),
             concat!(
                 "kernel k(A: f32[2, 2], out: f32[2, 2])\n",
-                "for i0 in 0..2:\n",
-                "  for i1 in 0..2:\n",
-                "    out[i0, i1] = -(A[i0, i1])\n",
+                "for _i0 in 0..2:\n",
+                "  for _i1 in 0..2:\n",
+                "    out[_i0, _i1] = -(A[_i0, _i1])\n",
             )
         );
     }
@@ -1019,9 +1029,9 @@ mod tests {
                 "  for k in 0..3:\n",
                 "    for j in 0..2:\n",
                 "      t0[i, j] = t0[i, j] + (A[i, k] * B[k, j])\n",
-                "for i0 in 0..4:\n",
-                "  for i1 in 0..2:\n",
-                "    out[i0, i1] = relu(t0[i0, i1] + bias[i1])\n",
+                "for _i0 in 0..4:\n",
+                "  for _i1 in 0..2:\n",
+                "    out[_i0, _i1] = relu(t0[_i0, _i1] + bias[_i1])\n",
             )
         );
     }
@@ -1044,7 +1054,7 @@ mod tests {
         ));
         assert!(text.contains("      t0[i, j] = t0[i, j] + (A[i, k] * B[k, j])\n"));
         assert!(text.contains("      t1[i, j] = t1[i, j] + (C[i, k] * D[k, j])\n"));
-        assert!(text.ends_with("    out[i0, i1] = t0[i0, i1] + t1[i0, i1]\n"));
+        assert!(text.ends_with("    out[_i0, _i1] = t0[_i0, _i1] + t1[_i0, _i1]\n"));
         assert_eq!(text.matches("for i in").count(), 4);
     }
 
@@ -1074,9 +1084,9 @@ mod tests {
             full_text(&g, prod),
             concat!(
                 "kernel k(A: f32[2, 3], B: f32[3, 2], t0: f32[2, 3], out: f32[2, 2])\n",
-                "for i0 in 0..2:\n",
-                "  for i1 in 0..3:\n",
-                "    t0[i0, i1] = A[i0, i1] + 1.0\n",
+                "for _i0 in 0..2:\n",
+                "  for _i1 in 0..3:\n",
+                "    t0[_i0, _i1] = A[_i0, _i1] + 1.0\n",
                 "for i in 0..2:\n",
                 "  for j in 0..2:\n",
                 "    out[i, j] = 0.0\n",
@@ -1134,7 +1144,8 @@ mod tests {
             "kernel k(A: f32[2, 3], B: f32[3, 2], C: f32[2, 2], \
              t0: f32[2, 2], t1: f32[2, 2], out: f32[2, 2])\n"
         ));
-        let relu_nest = "for i0 in 0..2:\n  for i1 in 0..2:\n    t1[i0, i1] = relu(t0[i0, i1])\n";
+        let relu_nest =
+            "for _i0 in 0..2:\n  for _i1 in 0..2:\n    t1[_i0, _i1] = relu(t0[_i0, _i1])\n";
         let update_of_t0 = "      t0[i, j] = t0[i, j] + (A[i, k] * B[k, j])\n";
         let (relu_at, update_at) = (text.find(relu_nest), text.find(update_of_t0));
         assert!(update_at < relu_at && relu_at.is_some(), "{text}");
@@ -1155,9 +1166,9 @@ mod tests {
             full_text(&g, out),
             concat!(
                 "kernel k(X: f32[4, 3], W: f32[3, 2], bias: f32[2], t0: f32[4, 3], t1: f32[4, 2], out: f32[4, 2])\n",
-                "for i0 in 0..4:\n",
-                "  for i1 in 0..3:\n",
-                "    t0[i0, i1] = relu(X[i0, i1])\n",
+                "for _i0 in 0..4:\n",
+                "  for _i1 in 0..3:\n",
+                "    t0[_i0, _i1] = relu(X[_i0, _i1])\n",
                 "for i in 0..4:\n",
                 "  for j in 0..2:\n",
                 "    t1[i, j] = 0.0\n",
@@ -1165,9 +1176,9 @@ mod tests {
                 "  for k in 0..3:\n",
                 "    for j in 0..2:\n",
                 "      t1[i, j] = t1[i, j] + (t0[i, k] * W[k, j])\n",
-                "for i0 in 0..4:\n",
-                "  for i1 in 0..2:\n",
-                "    out[i0, i1] = t1[i0, i1] + bias[i1]\n",
+                "for _i0 in 0..4:\n",
+                "  for _i1 in 0..2:\n",
+                "    out[_i0, _i1] = t1[_i0, _i1] + bias[_i1]\n",
             )
         );
     }
@@ -1188,10 +1199,13 @@ mod tests {
             "kernel k(X: f32[2, 2], W: f32[2, 2], V: f32[2, 2], \
              t0: f32[2, 2], t1: f32[2, 2], t2: f32[2, 2], out: f32[2, 2])\n"
         ));
-        assert_eq!(text.matches("t0[i0, i1] = relu(X[i0, i1])\n").count(), 1);
+        assert_eq!(
+            text.matches("t0[_i0, _i1] = relu(X[_i0, _i1])\n").count(),
+            1
+        );
         assert!(text.contains("      t1[i, j] = t1[i, j] + (t0[i, k] * W[k, j])\n"));
         assert!(text.contains("      t2[i, j] = t2[i, j] + (t0[i, k] * V[k, j])\n"));
-        assert!(text.ends_with("    out[i0, i1] = t1[i0, i1] + t2[i0, i1]\n"));
+        assert!(text.ends_with("    out[_i0, _i1] = t1[_i0, _i1] + t2[_i0, _i1]\n"));
     }
 
     #[test]
@@ -1299,11 +1313,11 @@ mod tests {
             full_text(&g, sum),
             concat!(
                 "kernel k(x: f32[2, 3], out: f32[2, 1])\n",
-                "for i0 in 0..2:\n",
-                "  out[i0, 0] = 0.0\n",
-                "for i0 in 0..2:\n",
+                "for _i0 in 0..2:\n",
+                "  out[_i0, 0] = 0.0\n",
+                "for _i0 in 0..2:\n",
                 "  for r in 0..3:\n",
-                "    out[i0, 0] = out[i0, 0] + x[i0, r]\n",
+                "    out[_i0, 0] = out[_i0, 0] + x[_i0, r]\n",
             )
         );
     }
@@ -1315,11 +1329,11 @@ mod tests {
             full_text(&g, max),
             concat!(
                 "kernel k(x: f32[2, 3], out: f32[2, 1])\n",
-                "for i0 in 0..2:\n",
-                "  out[i0, 0] = x[i0, 0]\n",
-                "for i0 in 0..2:\n",
+                "for _i0 in 0..2:\n",
+                "  out[_i0, 0] = x[_i0, 0]\n",
+                "for _i0 in 0..2:\n",
                 "  for r in 0..2:\n",
-                "    out[i0, 0] = max(out[i0, 0], x[i0, r + 1])\n",
+                "    out[_i0, 0] = max(out[_i0, 0], x[_i0, r + 1])\n",
             )
         );
     }
@@ -1333,11 +1347,11 @@ mod tests {
             full_text(&g, sum),
             concat!(
                 "kernel k(x: f32[2, 3], out: f32[1, 3])\n",
-                "for i1 in 0..3:\n",
-                "  out[0, i1] = 0.0\n",
-                "for i1 in 0..3:\n",
+                "for _i1 in 0..3:\n",
+                "  out[0, _i1] = 0.0\n",
+                "for _i1 in 0..3:\n",
                 "  for r in 0..2:\n",
-                "    out[0, i1] = out[0, i1] + x[r, i1]\n",
+                "    out[0, _i1] = out[0, _i1] + x[r, _i1]\n",
             )
         );
     }
@@ -1351,27 +1365,27 @@ mod tests {
             full_text(&g, sum),
             concat!(
                 "kernel k(x: f32[2, 3, 4], out: f32[2, 1, 4])\n",
-                "for i0 in 0..2:\n",
-                "  for i2 in 0..4:\n",
-                "    out[i0, 0, i2] = 0.0\n",
-                "for i0 in 0..2:\n",
-                "  for i2 in 0..4:\n",
+                "for _i0 in 0..2:\n",
+                "  for _i2 in 0..4:\n",
+                "    out[_i0, 0, _i2] = 0.0\n",
+                "for _i0 in 0..2:\n",
+                "  for _i2 in 0..4:\n",
                 "    for r in 0..3:\n",
-                "      out[i0, 0, i2] = out[i0, 0, i2] + x[i0, r, i2]\n",
+                "      out[_i0, 0, _i2] = out[_i0, 0, _i2] + x[_i0, r, _i2]\n",
             )
         );
     }
 
     #[test]
     fn input_named_like_a_kept_axis_loop_is_a_name_clash() {
-        // Reducing axis 0 reserves `i1`, which a last-axis reduction of a matrix does not use
-        // as a reduction loop (its only `i` loop is `i0`).
+        // Reducing axis 0 reserves `_i1`, which a last-axis reduction of a matrix does not use
+        // as a reduction loop (its only `i` loop is `_i0`).
         let mut g = Graph::new();
-        let x = g.input("i1", shape(&[2, 3])).unwrap();
+        let x = g.input("_i1", shape(&[2, 3])).unwrap();
         let sum = g.reduce_axis(coffee_ten_ir::ReduceOp::Sum, x, 0).unwrap();
         assert_eq!(
             lower(&g, sum, "k"),
-            Err(LowerError::NameClash("i1".to_string()))
+            Err(LowerError::NameClash("_i1".to_string()))
         );
     }
 
@@ -1406,8 +1420,8 @@ mod tests {
             full_text(&g, max),
             concat!(
                 "kernel k(x: f32[2, 1], out: f32[2, 1])\n",
-                "for i0 in 0..2:\n",
-                "  out[i0, 0] = x[i0, 0]\n",
+                "for _i0 in 0..2:\n",
+                "  out[_i0, 0] = x[_i0, 0]\n",
             )
         );
         // Sum over one element still adds it to 0.0 (-0.0 + 0.0 is +0.0, as in the interpreter).
@@ -1423,14 +1437,14 @@ mod tests {
             full_text(&g, shifted),
             concat!(
                 "kernel k(x: f32[2, 3], t0: f32[2, 1], out: f32[2, 3])\n",
-                "for i0 in 0..2:\n",
-                "  t0[i0, 0] = x[i0, 0]\n",
-                "for i0 in 0..2:\n",
+                "for _i0 in 0..2:\n",
+                "  t0[_i0, 0] = x[_i0, 0]\n",
+                "for _i0 in 0..2:\n",
                 "  for r in 0..2:\n",
-                "    t0[i0, 0] = max(t0[i0, 0], x[i0, r + 1])\n",
-                "for i0 in 0..2:\n",
-                "  for i1 in 0..3:\n",
-                "    out[i0, i1] = x[i0, i1] - t0[i0, 0]\n",
+                "    t0[_i0, 0] = max(t0[_i0, 0], x[_i0, r + 1])\n",
+                "for _i0 in 0..2:\n",
+                "  for _i1 in 0..3:\n",
+                "    out[_i0, _i1] = x[_i0, _i1] - t0[_i0, 0]\n",
             )
         );
     }
@@ -1447,14 +1461,14 @@ mod tests {
             full_text(&g, sum),
             concat!(
                 "kernel k(A: f32[2, 3], t0: f32[2, 3], out: f32[2, 1])\n",
-                "for i0 in 0..2:\n",
-                "  for i1 in 0..3:\n",
-                "    t0[i0, i1] = A[i0, i1] * 2.0\n",
-                "for i0 in 0..2:\n",
-                "  out[i0, 0] = 0.0\n",
-                "for i0 in 0..2:\n",
+                "for _i0 in 0..2:\n",
+                "  for _i1 in 0..3:\n",
+                "    t0[_i0, _i1] = A[_i0, _i1] * 2.0\n",
+                "for _i0 in 0..2:\n",
+                "  out[_i0, 0] = 0.0\n",
+                "for _i0 in 0..2:\n",
                 "  for r in 0..3:\n",
-                "    out[i0, 0] = out[i0, 0] + t0[i0, r]\n",
+                "    out[_i0, 0] = out[_i0, 0] + t0[_i0, r]\n",
             )
         );
     }
@@ -1473,7 +1487,7 @@ mod tests {
         ));
         let positions = [
             "      t0[i, j] = t0[i, j] + (A[i, k] * B[k, j])\n",
-            "    t1[i0, 0] = t1[i0, 0] + t0[i0, r]\n",
+            "    t1[_i0, 0] = t1[_i0, 0] + t0[_i0, r]\n",
             "      out[i, j] = out[i, j] + (t1[i, k] * C[k, j])\n",
         ]
         .map(|line| text.find(line).unwrap_or_else(|| panic!("{line}\n{text}")));
@@ -1497,9 +1511,12 @@ mod tests {
             "kernel k(X: f32[2, 3], t0: f32[2, 3], t1: f32[2, 1], t2: f32[2, 1], \
              out: f32[2, 1])\n"
         ));
-        assert_eq!(text.matches("t0[i0, i1] = relu(X[i0, i1])\n").count(), 1);
+        assert_eq!(
+            text.matches("t0[_i0, _i1] = relu(X[_i0, _i1])\n").count(),
+            1
+        );
         assert!(
-            text.ends_with("    out[i0, i1] = t1[i0, 0] + t2[i0, 0]\n"),
+            text.ends_with("    out[_i0, _i1] = t1[_i0, 0] + t2[_i0, 0]\n"),
             "{text}"
         );
     }
@@ -1520,7 +1537,7 @@ mod tests {
 
     #[test]
     fn input_named_like_a_reduce_loop_variable_is_a_name_clash() {
-        for clash in ["r", "i0", "out", "t0"] {
+        for clash in ["r", "_i0", "out", "t0"] {
             let mut g = Graph::new();
             let x = g.input(clash, shape(&[2, 3])).unwrap();
             let neg = g.unary(coffee_ten_ir::UnaryOp::Neg, x).unwrap();
@@ -1532,13 +1549,13 @@ mod tests {
                 "input {clash}"
             );
         }
-        // A reduce that reads the input directly still reserves its loop `i0`.
+        // A reduce that reads the input directly still reserves its loop `_i0`.
         let mut g = Graph::new();
-        let x = g.input("i0", shape(&[2, 3])).unwrap();
+        let x = g.input("_i0", shape(&[2, 3])).unwrap();
         let sum = g.reduce(coffee_ten_ir::ReduceOp::Sum, x).unwrap();
         assert_eq!(
             lower(&g, sum, "k"),
-            Err(LowerError::NameClash("i0".to_string()))
+            Err(LowerError::NameClash("_i0".to_string()))
         );
     }
 
@@ -1619,10 +1636,10 @@ mod tests {
 
     #[test]
     fn input_named_like_an_elementwise_loop_variable_is_a_name_clash() {
-        let (g, out) = relu_matmul_bias("i1");
+        let (g, out) = relu_matmul_bias("_i1");
         assert_eq!(
             lower(&g, out, "k"),
-            Err(LowerError::NameClash("i1".to_string()))
+            Err(LowerError::NameClash("_i1".to_string()))
         );
     }
 
