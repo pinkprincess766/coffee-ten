@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+mod exceptional;
+
 use coffee_ten_ir::{BinaryOp, Graph, NodeId, Op, ReduceOp, Shape, UnaryOp};
 
 /// Row-major tensor; data.len() is the product of the dims (1 for a scalar).
@@ -96,6 +98,7 @@ impl std::error::Error for InterpError {}
 
 /// Element type of the evaluator. Each method is one operation in `Self`.
 trait Scalar: Copy {
+    fn is_finite(self) -> bool;
     fn from_f32(x: f32) -> Self;
     fn zero() -> Self;
     fn add(self, other: Self) -> Self;
@@ -109,6 +112,9 @@ trait Scalar: Copy {
 }
 
 impl Scalar for f32 {
+    fn is_finite(self) -> bool {
+        f32::is_finite(self)
+    }
     fn from_f32(x: f32) -> f32 {
         x
     }
@@ -139,6 +145,9 @@ impl Scalar for f32 {
 }
 
 impl Scalar for f64 {
+    fn is_finite(self) -> bool {
+        f64::is_finite(self)
+    }
     fn from_f32(x: f32) -> f64 {
         f64::from(x)
     }
@@ -373,12 +382,49 @@ fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
 ///
 /// The last axis is the old row reduction: each row is one contiguous chunk of `n`.
 fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec<T> {
+    // Rust permits NaN sign/payload differences between scalar and SIMD arithmetic.
+    // Keep non-finite sums in the original isolated strided kernel, just like the oracle.
+    if op == ReduceOp::Sum && x.data.iter().any(|x| !x.is_finite()) {
+        return exceptional::reduce(op, x, axis);
+    }
     let dims = x.shape().dims();
     let n = dims[axis];
     assert!(n > 0, "invariant: a reduced axis is non-empty");
     let inner: usize = dims[axis + 1..].iter().product();
     let outer: usize = dims[..axis].iter().product();
     let mut out = Vec::with_capacity(outer * inner);
+    if inner == 0 || outer == 0 {
+        return out;
+    }
+    if inner > 1 {
+        for o in 0..outer {
+            let start = o * n * inner;
+            let first_k = match op {
+                ReduceOp::Sum => {
+                    out.resize((o + 1) * inner, T::zero());
+                    0
+                }
+                ReduceOp::Max => {
+                    out.extend_from_slice(&x.data[start..start + inner]);
+                    1
+                }
+            };
+            let acc = &mut out[o * inner..];
+            for values in x.data[start..start + n * inner]
+                .chunks_exact(inner)
+                .skip(first_k)
+            {
+                for (acc, &value) in acc.iter_mut().zip(values) {
+                    *acc = match op {
+                        ReduceOp::Sum => acc.add(value),
+                        ReduceOp::Max => binary(BinaryOp::Max, *acc, value),
+                    };
+                }
+            }
+        }
+        return out;
+    }
+
     for o in 0..outer {
         for i in 0..inner {
             let at = |k: usize| x.data[o * n * inner + k * inner + i];
