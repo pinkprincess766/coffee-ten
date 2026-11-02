@@ -474,6 +474,14 @@ fn broadcast_binary<T: Scalar>(
             .collect());
     }
 
+    if b.shape().rank() == 0 {
+        let scalar = b.data[0];
+        return Ok(a
+            .data
+            .iter()
+            .map(|&value| binary(op, value, scalar))
+            .collect());
+    }
     let a_strides = broadcast_strides(a.shape(), out);
     let b_strides = broadcast_strides(b.shape(), out);
     let dims = out.dims();
