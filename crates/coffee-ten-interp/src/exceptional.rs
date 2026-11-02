@@ -32,3 +32,21 @@ pub(super) fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec
     }
     out
 }
+
+#[inline(never)]
+pub(super) fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
+    let (m, k) = (a.shape().dims()[0], a.shape().dims()[1]);
+    let n = b.shape().dims()[1];
+    let mut data = Vec::with_capacity(m * n);
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = T::zero();
+            for kk in 0..k {
+                let product = a.data[i * k + kk].mul(b.data[kk * n + j]);
+                acc = acc.add(product);
+            }
+            data.push(acc);
+        }
+    }
+    data
+}
