@@ -367,7 +367,7 @@ fn rank_three_buffer_is_a_row_pointer_and_matches_the_interpreter_bit_for_bit() 
     let kernel = lower(&g, out, "k").unwrap();
     let c = emit_c(&kernel).unwrap();
     assert!(c.contains("const float (*X)[3][4]"), "{c}");
-    assert!(c.contains("X[i0][i1][i2]"), "{c}");
+    assert!(c.contains("X[_i0][_i1][_i2]"), "{c}");
 
     // Both signs and a -0.0, so relu clips some elements and changes the sign of zero.
     let mut x_data: Vec<f32> = (0..24).map(|n| (n as f32 - 9.0) * 0.37).collect();

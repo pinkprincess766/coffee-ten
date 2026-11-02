@@ -75,8 +75,8 @@ def test_split_of_an_elementwise_kernel_is_bit_exact(tmp_path):
     # 7 is not a multiple of 3, so the split loop needs a guard.
     y = ct.relu(ct.input("x", (7,)) * 1.1 - 0.3)
     x = np.linspace(-2.0, 2.0, 7, dtype=np.float32)
-    kernel = ct.compile(y, schedule="split(0, i0, a, b, 3)", cache_dir=tmp_path)
-    assert kernel.schedule == "split(0, i0, a, b, 3)"
+    kernel = ct.compile(y, schedule="split(0, _i0, a, b, 3)", cache_dir=tmp_path)
+    assert kernel.schedule == "split(0, _i0, a, b, 3)"
     assert kernel.order_class == "preserving"
     assert_same_bits(kernel(x=x), ct.run(y, x=x))
 

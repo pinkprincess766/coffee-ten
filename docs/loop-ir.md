@@ -29,6 +29,11 @@ for i in 0..8:
 
 Nest 0 zero-fills `out`. Nest 1 adds the products, with the reduction loop `k` in the middle.
 
+Generated elementwise and reduction loops use `_i0`, `_i1`, etc. These names are
+reserved during lowering; ordinary input names such as `i1` are allowed. This naming
+change changes emitted kernel text and C source, so the source-based compilation cache
+naturally uses new keys. Previously cached libraries are left in place.
+
 ### 1.1 Grammar
 
 ```grammar

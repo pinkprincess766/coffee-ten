@@ -125,9 +125,9 @@ fn clang_vectorizes_exactly_the_marked_elementwise_loop() {
     let bias = g.input("bias", shape(&[N])).unwrap();
     let sum = g.binary(BinaryOp::Add, prod, bias).unwrap();
     let out = g.unary(UnaryOp::Relu, sum).unwrap();
-    // Nests 0 and 1 are the matmul; nest 2 is `out[i0, i1] = relu(t0[i0, i1] + bias[i1])`.
-    let source = emit_c(&scheduled(&g, out, "vectorize(2, i1)")).unwrap();
-    let marked = line_of(&source, "for (long i1", 0);
+    // Nests 0 and 1 are the matmul; nest 2 is `out[_i0, _i1] = relu(t0[_i0, _i1] + bias[_i1])`.
+    let source = emit_c(&scheduled(&g, out, "vectorize(2, _i1)")).unwrap();
+    let marked = line_of(&source, "for (long _i1", 0);
     let remarks = vectorized_loops("relu", &source);
     let lines: Vec<usize> = remarks.iter().map(|(line, _)| *line).collect();
     assert_eq!(lines, [marked], "{remarks:?}\n{source}");

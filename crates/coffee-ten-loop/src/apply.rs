@@ -1545,7 +1545,7 @@ mod tests {
         let a = g.input("A", Shape::new(vec![9])).unwrap();
         let y = g.unary(coffee_ten_ir::UnaryOp::Neg, a).unwrap();
         let k = lower_elementwise(&g, y, "k").unwrap();
-        let once = applied(&k, "split(0, i0, so, si, 3)");
+        let once = applied(&k, "split(0, _i0, so, si, 3)");
         let twice = applied(&once, "split(0, so, sso, ssi, 2)");
         assert_eq!(twice.nests[0].guards.len(), 1);
         assert_eq!(twice.validate(), Ok(()));
