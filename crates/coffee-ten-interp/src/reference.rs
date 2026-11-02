@@ -64,6 +64,7 @@ pub(super) fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
     data
 }
 
+#[inline(never)]
 pub(super) fn reduce<T: Scalar>(op: ReduceOp, x: &Tensor<T>, axis: usize) -> Vec<T> {
     let dims = x.shape().dims();
     let n = dims[axis];
