@@ -47,6 +47,7 @@ fn binary<T: Scalar>(op: BinaryOp, a: T, b: T) -> T {
     }
 }
 
+#[inline(never)]
 pub(super) fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
     let (m, k) = (a.shape().dims()[0], a.shape().dims()[1]);
     let n = b.shape().dims()[1];
