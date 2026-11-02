@@ -69,7 +69,7 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
         for &operand in stage.operands() {
             if !matches!(
                 node(graph, operand)?.op,
-                Op::Input { .. } | Op::MatMul(..) | Op::Reduce(..)
+                Op::Input { .. } | Op::MatMul(..) | Op::Reduce { .. }
             ) {
                 operands.push(operand);
             }
@@ -78,7 +78,7 @@ pub fn lower(graph: &Graph, output: NodeId, name: &str) -> Result<Kernel, LowerE
     operands.sort();
     operands.dedup();
 
-    let output_is_stage = matches!(node(graph, output)?.op, Op::MatMul(..) | Op::Reduce(..));
+    let output_is_stage = matches!(node(graph, output)?.op, Op::MatMul(..) | Op::Reduce { .. });
     let temp_count = operands.len() + stages.len() - usize::from(output_is_stage);
     let mut loop_rank = if output_is_stage { 0 } else { out_dims.len() };
     for &operand in &operands {
@@ -227,7 +227,7 @@ fn find_non_elementwise(graph: &Graph, output: NodeId) -> Result<Option<NodeId>,
             continue;
         }
         match &node.op {
-            Op::MatMul(..) | Op::Reduce(..) => return Ok(Some(id)),
+            Op::MatMul(..) | Op::Reduce { .. } => return Ok(Some(id)),
             Op::Input { .. } | Op::Const(_) => {}
             Op::Unary(_, x) => stack.push(*x),
             Op::Binary(_, a, b) => stack.extend([*a, *b]),
@@ -303,7 +303,7 @@ fn reachable_stages(graph: &Graph, output: NodeId) -> Result<Vec<Stage>, LowerEr
                 }));
                 stack.extend([*a, *b]);
             }
-            Op::Reduce(op, x, axis) => {
+            Op::Reduce { op, x, axis } => {
                 stages.push(Stage::Reduce(ReduceNode {
                     id,
                     op: *op,
@@ -571,7 +571,7 @@ fn reachable_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         }
         match &nodes[index].op {
             Op::Input { .. } | Op::Const(_) => {}
-            Op::Unary(_, x) | Op::Reduce(_, x, _) => is_reachable[x.index()] = true,
+            Op::Unary(_, x) | Op::Reduce { x, .. } => is_reachable[x.index()] = true,
             Op::Binary(_, a, b) | Op::MatMul(a, b) => {
                 is_reachable[a.index()] = true;
                 is_reachable[b.index()] = true;
@@ -590,7 +590,7 @@ fn tree_size(graph: &Graph, output: NodeId, is_leaf: &dyn Fn(usize) -> bool) -> 
     for index in 0..=output.index() {
         size[index] = match &nodes[index].op {
             _ if is_leaf(index) => 1,
-            Op::Input { .. } | Op::Const(_) | Op::MatMul(..) | Op::Reduce(..) => 1,
+            Op::Input { .. } | Op::Const(_) | Op::MatMul(..) | Op::Reduce { .. } => 1,
             Op::Unary(_, x) => size[x.index()].saturating_add(1),
             Op::Binary(_, a, b) => size[a.index()]
                 .saturating_add(size[b.index()])
@@ -612,7 +612,7 @@ fn lower_value(
     let expr = match (&node.op, buffer) {
         // A node with a buffer (input, matmul, reduce, materialized temporary) is read, not
         // expanded.
-        (Op::Input { .. } | Op::MatMul(..) | Op::Reduce(..), _) | (_, Some(_)) => {
+        (Op::Input { .. } | Op::MatMul(..) | Op::Reduce { .. }, _) | (_, Some(_)) => {
             let buffer =
                 buffer.expect("invariant: reachable inputs, matmuls and reduces have buffers");
             // Right-aligned broadcasting: input dim `dim` follows output loop `dim + offset`.
