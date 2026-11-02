@@ -4,6 +4,9 @@ use std::fmt;
 
 use coffee_ten_ir::{BinaryOp, Graph, NodeId, Op, ReduceOp, Shape, UnaryOp};
 
+mod parallel;
+use parallel::{broadcast_threaded, matmul_threaded, reduce_threaded, unary_threaded};
+
 /// Row-major tensor; data.len() is the product of the dims (1 for a scalar).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor<T> {
@@ -73,8 +76,33 @@ pub fn run_f64(
     evaluate(graph, output, inputs)
 }
 
+/// Maximum explicit thread count, bounding accidental thread creation.
+pub const MAX_THREADS: usize = 256;
+
+/// Opt-in output parallelism. Default `run_f32` never creates worker threads.
+/// Each output retains its serial arithmetic order; thread creation is per operation.
+pub fn run_f32_with_threads(
+    graph: &Graph,
+    output: NodeId,
+    inputs: &[(&str, &Tensor<f32>)],
+    threads: usize,
+) -> Result<Tensor<f32>, InterpError> {
+    evaluate_with_threads(graph, output, inputs, threads)
+}
+
+/// f64 counterpart of `run_f32_with_threads`; inputs are widened exactly as in `run_f64`.
+pub fn run_f64_with_threads(
+    graph: &Graph,
+    output: NodeId,
+    inputs: &[(&str, &Tensor<f32>)],
+    threads: usize,
+) -> Result<Tensor<f64>, InterpError> {
+    evaluate_with_threads(graph, output, inputs, threads)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum InterpError {
+    InvalidThreads(usize),
     UnknownNode(NodeId),
     /// An Input node reachable from `output` has no entry in `inputs`.
     MissingInput(String),
@@ -98,6 +126,9 @@ pub enum InterpError {
 impl fmt::Display for InterpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            InterpError::InvalidThreads(n) => {
+                write!(f, "threads must be in 1..={MAX_THREADS}, got {n}")
+            }
             InterpError::UnknownNode(id) => write!(f, "unknown node %{}", id.index()),
             InterpError::MissingInput(name) => write!(f, "missing input {name}"),
             InterpError::UnknownInput(name) => write!(f, "unknown input {name}"),
@@ -118,7 +149,7 @@ impl fmt::Display for InterpError {
 impl std::error::Error for InterpError {}
 
 /// Element type of the evaluator. Each method is one operation in `Self`.
-trait Scalar: Copy {
+trait Scalar: Copy + Send + Sync {
     fn input(x: &Tensor<f32>) -> Value<'_, Self> {
         Value::Owned(Tensor {
             shape: x.shape.clone(),
@@ -233,6 +264,18 @@ fn evaluate<T: Scalar>(
     output: NodeId,
     inputs: &[(&str, &Tensor<f32>)],
 ) -> Result<Tensor<T>, InterpError> {
+    evaluate_with_threads(graph, output, inputs, 1)
+}
+
+fn evaluate_with_threads<T: Scalar>(
+    graph: &Graph,
+    output: NodeId,
+    inputs: &[(&str, &Tensor<f32>)],
+    threads: usize,
+) -> Result<Tensor<T>, InterpError> {
+    if !(1..=MAX_THREADS).contains(&threads) {
+        return Err(InterpError::InvalidThreads(threads));
+    }
     graph.get(output).ok_or(InterpError::UnknownNode(output))?;
     let supplied = supplied_inputs(graph, inputs)?;
     let needed = needed_nodes(graph, output);
@@ -254,18 +297,19 @@ fn evaluate<T: Scalar>(
                 },
                 Op::Unary(op, x) => {
                     let x = operand(&values, *x);
-                    let data = unary(*op, &x.data);
+                    let data = unary_threaded(*op, &x.data, threads);
                     Tensor {
                         shape: node.shape.clone(),
                         data,
                     }
                 }
                 Op::Binary(op, a, b) => {
-                    let data = broadcast_binary(
+                    let data = broadcast_threaded(
                         *op,
                         operand(&values, *a),
                         operand(&values, *b),
                         &node.shape,
+                        threads,
                     )?;
                     Tensor {
                         shape: node.shape.clone(),
@@ -274,11 +318,11 @@ fn evaluate<T: Scalar>(
                 }
                 Op::MatMul(a, b) => Tensor {
                     shape: node.shape.clone(),
-                    data: matmul(operand(&values, *a), operand(&values, *b)),
+                    data: matmul_threaded(operand(&values, *a), operand(&values, *b), threads),
                 },
                 Op::Reduce { op, x, axis } => Tensor {
                     shape: node.shape.clone(),
-                    data: reduce(*op, operand(&values, *x), *axis),
+                    data: reduce_threaded(*op, operand(&values, *x), *axis, threads),
                 },
             })
         };
