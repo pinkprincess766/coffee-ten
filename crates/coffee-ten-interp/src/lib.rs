@@ -213,6 +213,7 @@ fn evaluate<T: Scalar>(
     graph.get(output).ok_or(InterpError::UnknownNode(output))?;
     let supplied = supplied_inputs(graph, inputs)?;
     let needed = needed_nodes(graph, output);
+    let mut uses = remaining_uses(graph, &needed);
     let mut values: Vec<Option<Tensor<T>>> = (0..graph.nodes().len()).map(|_| None).collect();
     for (index, node) in graph.nodes().iter().enumerate().take(output.index() + 1) {
         if !needed[index] {
@@ -258,6 +259,7 @@ fn evaluate<T: Scalar>(
             },
         };
         values[index] = Some(value);
+        release_operands(&mut values, &mut uses, &node.op);
     }
     Ok(values
         .swap_remove(output.index())
@@ -310,6 +312,36 @@ fn needed_nodes(graph: &Graph, output: NodeId) -> Vec<bool> {
         }
     }
     needed
+}
+
+fn op_inputs(op: &Op) -> [Option<NodeId>; 2] {
+    match op {
+        Op::Input { .. } | Op::Const(_) => [None, None],
+        Op::Unary(_, x) | Op::Reduce(_, x, _) => [Some(*x), None],
+        Op::Binary(_, a, b) | Op::MatMul(a, b) => [Some(*a), Some(*b)],
+    }
+}
+
+/// Count operand occurrences only in the live subgraph, including repeated operands.
+fn remaining_uses(graph: &Graph, needed: &[bool]) -> Vec<usize> {
+    let mut uses = vec![0; graph.nodes().len()];
+    for (node, &needed) in graph.nodes().iter().zip(needed) {
+        if needed {
+            for id in op_inputs(&node.op).into_iter().flatten() {
+                uses[id.index()] += 1;
+            }
+        }
+    }
+    uses
+}
+
+fn release_operands<T>(values: &mut [Option<Tensor<T>>], uses: &mut [usize], op: &Op) {
+    for id in op_inputs(op).into_iter().flatten() {
+        uses[id.index()] -= 1;
+        if uses[id.index()] == 0 {
+            values[id.index()] = None;
+        }
+    }
 }
 
 fn operand<T>(values: &[Option<Tensor<T>>], id: NodeId) -> &Tensor<T> {
@@ -1332,6 +1364,25 @@ mod tests {
         assert_eq!(layout.dims, [2, 3, 4]);
         assert_eq!(layout.a_strides, [4, 0, 1]);
         assert_eq!(layout.b_strides, [0, 1, 0]);
+    }
+
+    #[test]
+    fn last_use_releases_values_and_counts_duplicate_operands() {
+        let mut g = Graph::new();
+        let x = g.input("x", shape(&[2])).unwrap();
+        let twice = g.binary(BinaryOp::Add, x, x).unwrap();
+        let y = g.binary(BinaryOp::Sub, twice, x).unwrap();
+        g.binary(BinaryOp::Mul, x, x).unwrap(); // Dead users must not prolong lifetime.
+        let mut uses = remaining_uses(&g, &needed_nodes(&g, y));
+        assert_eq!(uses[x.index()], 3);
+        let mut values = vec![Some(tensor(&[2], &[1., 2.])), None, None, None];
+        release_operands(&mut values, &mut uses, &g.get(twice).unwrap().op);
+        assert!(values[x.index()].is_some());
+        assert_eq!(uses[x.index()], 1);
+        values[twice.index()] = Some(tensor(&[2], &[2., 4.]));
+        release_operands(&mut values, &mut uses, &g.get(y).unwrap().op);
+        assert!(values[x.index()].is_none());
+        assert!(values[twice.index()].is_none());
     }
 
     #[test]
