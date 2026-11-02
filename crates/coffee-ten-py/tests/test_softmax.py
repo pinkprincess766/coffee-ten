@@ -367,3 +367,32 @@ def test_sum_of_negative_zeros_starts_from_positive_zero(shape, axis):
         assert np.all(out.view(np.uint32) == 0)
     # NumPy also starts these sums with +0; do not document a sign difference.
     assert np.all(np.sum(x, axis=axis, keepdims=True).view(np.uint32) == 0)
+
+
+@pytest.mark.parametrize("shape,axis", [((2, 3), 0), ((2, 3, 4), 1), ((2, 3, 4), -2), ((1, 3), 0), ((3,), 0)])
+def test_softmax_chosen_axis_matches_composition_bit_for_bit(shape, axis, tmp_path):
+    x = softmax_inputs(shape, 1000.0)
+    X = ct.input("x", shape)
+    e = ct.exp(X - ct.max(X, axis=axis))
+    composed = e / ct.sum(e, axis=axis)
+    y = ct.softmax(X, axis=axis)
+    assert y.shape == shape
+    interpreted = ct.run(y, x=x)
+    np.testing.assert_array_equal(interpreted.view(np.uint32), ct.run(composed, x=x).view(np.uint32))
+    compiled = ct.compile(y, cache_dir=tmp_path)(x=x)
+    np.testing.assert_array_equal(compiled.view(np.uint32), ct.compile(composed, cache_dir=tmp_path)(x=x).view(np.uint32))
+    for out in (interpreted, compiled):
+        assert_softmax_within_bound(np.moveaxis(out, axis, -1), np.moveaxis(x, axis, -1))
+
+
+def test_softmax_axis_errors_and_empty_nonreduced_axis():
+    X = ct.input("x", (2, 3))
+    for axis in (-3, 2):
+        with pytest.raises(ValueError):
+            ct.softmax(X, axis=axis)
+    with pytest.raises(TypeError):
+        ct.softmax(X, axis="0")
+    with pytest.raises(ValueError):
+        ct.softmax(ct.input("x", (2, 0)), axis=1)
+    empty = np.empty((0, 3), dtype=np.float32)
+    assert ct.run(ct.softmax(ct.input("x", (0, 3)), axis=1), x=empty).shape == (0, 3)
