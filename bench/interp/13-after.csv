@@ -1,34 +1,34 @@
-# parent=4f82a104e867ed162a7cf865665be10a6bfb7edf; source=working tree after plan item 13-after
+# parent=f6e4ee65fca37efae4f45e5f9e37921d0400e0c5; source=working tree after plan item 13-after
 # cpu=Apple M5; rustc 1.98.0 (88d9e12ae 2026-08-18)
 # OS=macos ARCH=aarch64; 9 samples >=10ms each; one untimed call; includes allocation and graph evaluation
 case,dtype,p25_us,median_us,p75_us
-reduce_Sum_[512x 512]_axis0,f32,33.576,40.253,56.845
-reduce_Sum_[512x 512]_axis0,f64,50.082,50.229,50.326
-reduce_Max_[512x 512]_axis0,f32,30.629,30.876,30.983
-reduce_Max_[512x 512]_axis0,f64,52.796,53.085,53.257
-reduce_Sum_[512x 512]_axis1,f32,132.118,132.240,132.366
-reduce_Sum_[512x 512]_axis1,f64,140.041,140.245,140.389
-reduce_Max_[512x 512]_axis1,f32,122.595,122.785,123.175
-reduce_Max_[512x 512]_axis1,f64,130.340,130.411,130.713
-reduce_Sum_[8x 64x 128]_axis1,f32,7.688,7.825,7.860
-reduce_Sum_[8x 64x 128]_axis1,f64,13.539,13.614,13.715
-reduce_Max_[8x 64x 128]_axis1,f32,7.999,8.111,8.135
-reduce_Max_[8x 64x 128]_axis1,f64,13.283,13.334,13.560
-equal,f32,36.502,36.891,38.395
-equal,f64,42.316,42.457,42.788
-scalar,f32,33.787,33.881,34.121
-scalar,f64,35.827,35.837,35.862
-broadcast,f32,470.449,472.420,472.545
-broadcast,f64,473.924,475.604,476.994
-unary_Neg,f32,7.727,8.245,8.268
-unary_Neg,f64,13.425,13.778,14.094
-unary_Relu,f32,7.645,8.200,8.282
-unary_Relu,f64,14.097,14.139,14.145
-unary_Exp,f32,70.334,71.398,73.073
-unary_Exp,f64,107.207,108.448,108.933
-matmul_64,f32,35.697,35.725,35.981
-matmul_64,f64,36.149,36.186,36.282
-matmul_128,f32,282.012,282.520,283.905
-matmul_128,f64,283.030,283.324,283.480
-chain_32,f32,140.769,140.862,142.093
-chain_32,f64,288.383,289.807,292.520
+reduce_Sum_[512x 512]_axis0,f32,119.257,128.521,147.979
+reduce_Sum_[512x 512]_axis0,f64,121.002,122.166,123.646
+reduce_Max_[512x 512]_axis0,f32,27.314,27.839,28.153
+reduce_Max_[512x 512]_axis0,f64,51.049,51.364,51.816
+reduce_Sum_[512x 512]_axis1,f32,204.610,205.225,208.113
+reduce_Sum_[512x 512]_axis1,f64,211.443,211.693,212.857
+reduce_Max_[512x 512]_axis1,f32,126.945,127.685,130.308
+reduce_Max_[512x 512]_axis1,f64,134.207,134.383,134.865
+reduce_Sum_[8x 64x 128]_axis1,f32,24.684,25.084,25.233
+reduce_Sum_[8x 64x 128]_axis1,f64,29.747,29.789,30.079
+reduce_Max_[8x 64x 128]_axis1,f32,8.264,8.268,8.304
+reduce_Max_[8x 64x 128]_axis1,f64,13.640,13.668,13.809
+equal,f32,38.280,39.550,64.694
+equal,f64,40.287,41.951,42.670
+scalar,f32,34.767,34.810,35.191
+scalar,f64,36.593,37.055,37.516
+broadcast,f32,477.673,479.655,482.375
+broadcast,f64,477.155,479.246,480.321
+unary_Neg,f32,7.597,7.937,8.922
+unary_Neg,f64,13.348,13.782,14.262
+unary_Relu,f32,7.236,7.362,7.419
+unary_Relu,f64,14.211,14.383,14.449
+unary_Exp,f32,69.663,71.316,71.623
+unary_Exp,f64,108.060,108.935,113.204
+matmul_64,f32,36.458,36.887,40.678
+matmul_64,f64,40.553,40.674,41.652
+matmul_128,f32,278.053,279.282,282.355
+matmul_128,f64,299.696,303.975,307.997
+chain_32,f32,143.312,143.377,144.311
+chain_32,f64,292.611,294.195,295.202
