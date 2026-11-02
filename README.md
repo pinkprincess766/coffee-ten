@@ -222,6 +222,7 @@ Compiler limitations:
 - CPU only: the C backend is built with clang; there is no GPU path.
 - Python operators: `+ - * /`, unary `-`, `ct.relu`, `ct.maximum`, `ct.exp`, and `@` or
   `ct.matmul` on 2-D tensors; `ct.softmax` is built from them.
+- `ct.softmax(x, axis=-1)` also accepts any valid reduction axis, including negative indices.
 - Reductions are `ct.sum` and `ct.max` over one axis (the last, if `axis` is omitted),
   keeping that axis with size 1. A negative axis counts from the end.
 - `exp` calls the platform libm (within 1 ulp, not correctly rounded), so graphs with
@@ -425,3 +426,4 @@ search). Checked by: unit tests in those files and
 ## License
 
 Apache-2.0, see `LICENSE`.
+
