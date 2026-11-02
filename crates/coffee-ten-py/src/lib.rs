@@ -240,7 +240,8 @@ fn exp(x: &PyTensor) -> PyResult<PyTensor> {
 /// Sum over one axis, keepdims: that axis becomes size 1.
 ///
 /// `axis` counts from the end when it is negative, as in NumPy; the default `-1` is the
-/// last axis. The sum runs along the axis in increasing index order, in float32. A rank 0
+/// last axis. Accumulation starts from +0.0, so summing only -0.0 values gives +0.0.
+/// The sum runs along the axis in increasing index order, in float32. A rank 0
 /// Tensor, an axis outside the rank, or an empty reduced axis is a ValueError.
 #[pyfunction]
 #[pyo3(signature = (x, axis=-1))]
