@@ -465,6 +465,15 @@ fn broadcast_binary<T: Scalar>(
     out: &Shape,
 ) -> Result<Vec<T>, InterpError> {
     let len = numel(out)?;
+    if a.shape() == out && b.shape() == out {
+        return Ok(a
+            .data
+            .iter()
+            .zip(&b.data)
+            .map(|(&a, &b)| binary(op, a, b))
+            .collect());
+    }
+
     let a_strides = broadcast_strides(a.shape(), out);
     let b_strides = broadcast_strides(b.shape(), out);
     let dims = out.dims();
