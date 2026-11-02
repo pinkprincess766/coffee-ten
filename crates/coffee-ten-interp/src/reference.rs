@@ -139,3 +139,62 @@ pub(super) fn unary<T: Scalar>(op: UnaryOp, x: T) -> T {
         UnaryOp::Exp => x.exp(),
     }
 }
+
+pub(super) fn evaluate<T: Scalar>(
+    graph: &Graph,
+    output: NodeId,
+    inputs: &[(&str, &Tensor<f32>)],
+) -> Result<Tensor<T>, InterpError> {
+    graph.get(output).ok_or(InterpError::UnknownNode(output))?;
+    let supplied = supplied_inputs(graph, inputs)?;
+    let needed = needed_nodes(graph, output);
+    let mut values: Vec<Option<Tensor<T>>> = (0..graph.nodes().len()).map(|_| None).collect();
+    for (index, node) in graph.nodes().iter().enumerate().take(output.index() + 1) {
+        if !needed[index] {
+            continue;
+        }
+        let value = match &node.op {
+            Op::Input { name } => {
+                let input =
+                    supplied[index].ok_or_else(|| InterpError::MissingInput(name.clone()))?;
+                let data = input.data.iter().map(|&x| T::from_f32(x)).collect();
+                Tensor {
+                    shape: node.shape.clone(),
+                    data,
+                }
+            }
+            Op::Const(value) => Tensor {
+                shape: node.shape.clone(),
+                data: vec![T::from_f32(*value)],
+            },
+            Op::Unary(op, x) => {
+                let x = operand(&values, *x);
+                let data = x.data.iter().map(|&v| unary(*op, v)).collect();
+                Tensor {
+                    shape: node.shape.clone(),
+                    data,
+                }
+            }
+            Op::Binary(op, a, b) => {
+                let data =
+                    broadcast_binary(*op, operand(&values, *a), operand(&values, *b), &node.shape)?;
+                Tensor {
+                    shape: node.shape.clone(),
+                    data,
+                }
+            }
+            Op::MatMul(a, b) => Tensor {
+                shape: node.shape.clone(),
+                data: matmul(operand(&values, *a), operand(&values, *b)),
+            },
+            Op::Reduce(op, x, axis) => Tensor {
+                shape: node.shape.clone(),
+                data: reduce(*op, operand(&values, *x), *axis),
+            },
+        };
+        values[index] = Some(value);
+    }
+    Ok(values
+        .swap_remove(output.index())
+        .expect("invariant: the output node is evaluated"))
+}
