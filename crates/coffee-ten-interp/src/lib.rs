@@ -347,12 +347,20 @@ fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
     let (m, k) = (a.shape().dims()[0], a.shape().dims()[1]);
     let n = b.shape().dims()[1];
     let mut data = vec![T::zero(); m * n];
+    // k blocks and k within each block remain ascending for every output element.
+    // Update the output directly: no per-block accumulator or reassociation.
+    const K_BLOCK: usize = 32;
+    const J_BLOCK: usize = 64;
     for i in 0..m {
-        for kk in 0..k {
-            let av = a.data[i * k + kk];
-            for j in 0..n {
-                let product = av.mul(b.data[kk * n + j]);
-                data[i * n + j] = data[i * n + j].add(product);
+        for kb in (0..k).step_by(K_BLOCK) {
+            for jb in (0..n).step_by(J_BLOCK) {
+                for kk in kb..(kb + K_BLOCK).min(k) {
+                    let av = a.data[i * k + kk];
+                    for j in jb..(jb + J_BLOCK).min(n) {
+                        let product = av.mul(b.data[kk * n + j]);
+                        data[i * n + j] = data[i * n + j].add(product);
+                    }
+                }
             }
         }
     }
