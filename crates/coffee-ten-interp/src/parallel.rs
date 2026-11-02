@@ -85,6 +85,9 @@ pub(super) fn reduce_threaded<T: Scalar>(
     axis: usize,
     threads: usize,
 ) -> Vec<T> {
+    if threads > 1 && op == ReduceOp::Sum && x.data.iter().any(|x| !x.is_finite()) {
+        return exceptional::reduce(op, x, axis);
+    }
     if threads == 1 {
         return reduce(op, x, axis);
     }
@@ -131,6 +134,9 @@ pub(super) fn reduce_threaded<T: Scalar>(
 }
 
 pub(super) fn matmul_threaded<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>, threads: usize) -> Vec<T> {
+    if threads > 1 && a.data.iter().chain(&b.data).any(|x| !x.is_finite()) {
+        return exceptional::matmul(a, b);
+    }
     if threads == 1 {
         return matmul(a, b);
     }
