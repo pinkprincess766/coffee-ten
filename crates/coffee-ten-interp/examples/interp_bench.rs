@@ -1,5 +1,7 @@
 //! End-to-end interpreter timing; no generated C or compiler benchmark is involved.
-use coffee_ten_interp::{Tensor, run_f32, run_f64};
+use coffee_ten_interp::{MAX_THREADS, Tensor, run_f32_with_threads, run_f64_with_threads};
+use std::sync::OnceLock;
+static THREADS: OnceLock<usize> = OnceLock::new();
 use coffee_ten_ir::{BinaryOp, Graph, NodeId, ReduceOp, Shape, UnaryOp};
 use std::{
     hint::black_box,
@@ -39,19 +41,41 @@ fn measure(mut f: impl FnMut()) -> (f64, f64, f64) {
 fn report(name: &str, g: &Graph, y: NodeId, inputs: &[(&str, &Tensor<f32>)]) {
     let name = name.replace(',', "x");
     let (q1, med, q3) = measure(|| {
-        black_box(run_f32(black_box(g), y, black_box(inputs)).unwrap());
+        black_box(
+            run_f32_with_threads(black_box(g), y, black_box(inputs), *THREADS.get().unwrap())
+                .unwrap(),
+        );
     });
     println!("{name},f32,{q1:.3},{med:.3},{q3:.3}");
     let (q1, med, q3) = measure(|| {
-        black_box(run_f64(black_box(g), y, black_box(inputs)).unwrap());
+        black_box(
+            run_f64_with_threads(black_box(g), y, black_box(inputs), *THREADS.get().unwrap())
+                .unwrap(),
+        );
     });
     println!("{name},f64,{q1:.3},{med:.3},{q3:.3}");
 }
-fn main() {
-    assert!(
-        std::env::args().len() == 1,
-        "usage: interp_bench (no arguments)"
-    );
+fn parse_threads(args: &[String]) -> Result<usize, &'static str> {
+    match args {
+        [] => Ok(1),
+        [flag, n] if flag == "--threads" => n
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MAX_THREADS).contains(n))
+            .ok_or("--threads must be in 1..=256"),
+        _ => Err("usage: interp_bench [--threads N]"),
+    }
+}
+fn main() -> std::process::ExitCode {
+    let threads = match parse_threads(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(threads) => threads,
+        Err(message) => {
+            eprintln!("{message}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    THREADS.set(threads).unwrap();
+    println!("# threads={threads}; 1 disables worker creation");
     println!(
         "# OS={} ARCH={}; 9 samples >=10ms each; one untimed call; includes allocation and graph evaluation",
         std::env::consts::OS,
@@ -111,4 +135,22 @@ fn main() {
         y = g.unary(UnaryOp::Neg, y).unwrap();
     }
     report("chain_32", &g, y, &[("x", &data(&[65536]))]);
+    std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn thread_option_is_explicit_and_validated() {
+        assert_eq!(parse_threads(&[]), Ok(1));
+        for value in ["2", "4", "256"] {
+            assert!(parse_threads(&["--threads".into(), value.into()]).is_ok());
+        }
+        for value in ["0", "257", "-1", "bad"] {
+            assert!(parse_threads(&["--threads".into(), value.into()]).is_err());
+        }
+        assert!(parse_threads(&["--threads".into()]).is_err());
+        assert!(parse_threads(&["--bad".into(), "2".into()]).is_err());
+    }
 }
