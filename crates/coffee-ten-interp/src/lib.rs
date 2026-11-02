@@ -435,7 +435,11 @@ fn broadcast_binary<T: Scalar>(
 }
 
 #[cfg(test)]
+mod reference;
+
+#[cfg(test)]
 mod tests {
+    mod differential;
     use super::*;
 
     fn shape(dims: &[usize]) -> Shape {
