@@ -1098,7 +1098,7 @@ mod tests {
             schedule,
             &Schedule::default(),
             OrderClass::Preserving,
-            &rates,
+            &crate::run::test_rounds(&rates),
         )
         .unwrap();
         record.schedule = schedule.to_string();

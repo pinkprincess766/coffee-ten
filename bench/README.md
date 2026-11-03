@@ -66,6 +66,7 @@ search lines have `group`; the files `run.sh` writes have none.
 | `p75` | number or null | GFLOP/s | r[3(n-1)/4] | harness |
 | `min` | number or null | GFLOP/s | r[0], the slowest sample | harness |
 | `drift` | bool | - | median of the first 5 rounds and of the last 5 differ by more than 5% of the first; always `false` below 10 samples | harness |
+| `rounds` | array | mixed | ordered objects: `round_index` (zero-based shared round), `elapsed_ns` (integer nanoseconds), `iterations` (kernel calls), `gflops` (raw rate, number or null); excludes warmup | harness |
 | `unit` | string | - | always `GFLOP/s`, the unit of `median`, `p25`, `p75`, `min` | harness |
 | `seed` | integer | - | `--seed`: seeds the input matrices and the round order (in `search` also the candidate sample) | meta |
 | `commit` | string | - | `git rev-parse --short HEAD`; `unknown` if git fails | meta |
@@ -82,6 +83,13 @@ A rate that is NaN or infinite is written as `null`; all other numbers are the s
 that reads back to the same value. The variant text as typed on the command line is not
 logged; `schedule` is its canonical form. Files from before `search` have the same 23 fields
 without `group`.
+
+New records retain `rounds` in acquisition order. The original aggregate fields use precisely
+these raw `gflops` values with the existing lower-median rule; the common `drift` flag is
+computed over the ordered run and is not a separate per-round flag. Older records (including
+hypothesis A runs 1–4) omit `rounds`; their aggregate readers continue to work. Raw samples
+cannot be reconstructed from an old aggregate-only log. Integer timing/call fields preserve
+the actual sample inputs; the raw rate is retained rather than recomputed during reporting.
 
 `group` values:
 
