@@ -26,6 +26,23 @@ fn quick_run_checks_and_times_naive_and_vectorized_matmul() {
     for record in &records {
         assert!(record.quick);
         assert_eq!(record.samples, QUICK_SAMPLES);
+        assert_eq!(record.rounds.len(), record.samples);
+        for (index, round) in record.rounds.iter().enumerate() {
+            assert_eq!(round.round_index, index);
+            assert!(round.elapsed_ns > 0 && round.iterations > 0);
+            let expected = 2.0 * 16.0f64.powi(3) * round.iterations as f64
+                / std::time::Duration::from_nanos(round.elapsed_ns).as_secs_f64()
+                / 1e9;
+            assert_eq!(round.gflops.to_bits(), expected.to_bits());
+        }
+        let rates: Vec<_> = record.rounds.iter().map(|r| r.gflops).collect();
+        assert_eq!(
+            coffee_ten_bench::stats::summarize(&rates)
+                .unwrap()
+                .median
+                .to_bits(),
+            record.stats.median.to_bits()
+        );
         let s = record.stats;
         assert!(s.min > 0.0, "{record:?}");
         assert!(

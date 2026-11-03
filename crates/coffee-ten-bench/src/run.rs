@@ -184,12 +184,13 @@ fn make_variant(
     })
 }
 
-/// One sample: runs the kernel until at least `min_sample` has passed, returns GFLOP/s.
+/// One sample: retain the rate and its original elapsed time and call count.
 fn time_sample(
     variant: &mut Variant,
     flop_per_call: f64,
     min_sample: Duration,
-) -> Result<f64, BenchError> {
+    round_index: usize,
+) -> Result<RoundSample, BenchError> {
     let start = Instant::now();
     let mut calls = 0u64;
     let elapsed = loop {
@@ -200,7 +201,14 @@ fn time_sample(
             break elapsed;
         }
     };
-    Ok(flop_per_call * calls as f64 / elapsed.as_secs_f64() / 1e9)
+    Ok(RoundSample {
+        round_index,
+        elapsed_ns: u64::try_from(elapsed.as_nanos()).map_err(|_| {
+            BenchError::Setup("sample duration exceeds u64 nanoseconds".to_string())
+        })?,
+        iterations: calls,
+        gflops: flop_per_call * calls as f64 / elapsed.as_secs_f64() / 1e9,
+    })
 }
 
 /// Each variant runs this long before round 1. Measured on an Apple M5 with `n = 256`: after the
@@ -262,6 +270,15 @@ pub struct RunInfo {
     pub quick: bool,
 }
 
+/// A measured round, in acquisition order. Warmup calls are excluded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoundSample {
+    pub round_index: usize,
+    pub elapsed_ns: u64,
+    pub iterations: u64,
+    pub gflops: f64,
+}
+
 /// What is reported for one variant.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
@@ -279,6 +296,8 @@ pub struct Record {
     pub stats: Stats,
     /// Number of samples.
     pub samples: usize,
+    /// Raw rounds backing these exact aggregates; indexes are shared across interleaved variants.
+    pub rounds: Vec<RoundSample>,
     /// Median of the first rounds differs from the median of the last by more than `DRIFT_LIMIT`.
     pub drift: bool,
     /// The run was `--quick`: not a measurement.
@@ -286,15 +305,16 @@ pub struct Record {
 }
 
 /// The one place where a record per variant is assembled; a JSONL line is written from it.
-/// Only called for variants that passed the check. `rates` in round order, GFLOP/s. `None` if
+/// Only called for variants that passed the check. Raw rates retain acquisition order. `None` if
 /// there are no samples.
 pub fn make_record(
     info: &RunInfo,
     variant: &str,
     schedule: &Schedule,
     order_class: OrderClass,
-    rates: &[f64],
+    rounds: &[RoundSample],
 ) -> Option<Record> {
+    let rates: Vec<f64> = rounds.iter().map(|r| r.gflops).collect();
     Some(Record {
         kernel: info.kernel,
         n: info.n,
@@ -303,9 +323,10 @@ pub fn make_record(
         schedule: schedule.to_string(),
         order_class,
         verified: true,
-        stats: summarize(rates)?,
-        samples: rates.len(),
-        drift: drifted(rates),
+        stats: summarize(&rates)?,
+        samples: rounds.len(),
+        rounds: rounds.to_vec(),
+        drift: drifted(&rates),
         quick: info.quick,
     })
 }
@@ -373,6 +394,21 @@ pub fn record_json(record: &Record, metadata: &Metadata) -> String {
         format!("\"p75\":{}", json_number(record.stats.p75)),
         format!("\"min\":{}", json_number(record.stats.min)),
         format!("\"drift\":{}", record.drift),
+        format!(
+            "\"rounds\":[{}]",
+            record
+                .rounds
+                .iter()
+                .map(|r| format!(
+                    "{{\"round_index\":{},\"elapsed_ns\":{},\"iterations\":{},\"gflops\":{}}}",
+                    r.round_index,
+                    r.elapsed_ns,
+                    r.iterations,
+                    json_number(r.gflops)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         format!("\"unit\":{}", json_string("GFLOP/s")),
         format!("\"seed\":{}", metadata.seed),
         format!("\"commit\":{}", json_string(&metadata.git_rev)),
@@ -480,7 +516,8 @@ impl Reference {
         let min_sample = Duration::from_millis(config.min_sample_ms);
         let mut rng = Rng::new(config.seed);
         let mut order: Vec<usize> = (0..variants.len()).collect();
-        let mut rates: Vec<Vec<f64>> = vec![Vec::with_capacity(config.samples); variants.len()];
+        let mut rounds: Vec<Vec<RoundSample>> =
+            vec![Vec::with_capacity(config.samples); variants.len()];
         // After the thread has been idle (waiting for clang, a pause) a kernel runs slow for
         // ~100 ms (see `WARMUP_MS`): every variant warms up in the interleaved order before
         // round 1, and the warm-up is not recorded.
@@ -489,24 +526,25 @@ impl Reference {
             let start = Instant::now();
             warm_up(warmup, || variants[index].run_once(), || start.elapsed())?;
         }
-        for _ in 0..config.samples {
+        for round_index in 0..config.samples {
             rng.shuffle(&mut order);
             for &index in &order {
-                let rate = time_sample(&mut variants[index], flop_per_call, min_sample)?;
-                rates[index].push(rate);
+                let round =
+                    time_sample(&mut variants[index], flop_per_call, min_sample, round_index)?;
+                rounds[index].push(round);
             }
         }
 
         variants
             .iter()
-            .zip(&rates)
-            .map(|(variant, rates)| {
+            .zip(&rounds)
+            .map(|(variant, rounds)| {
                 make_record(
                     &self.info,
                     &variant.text,
                     &variant.schedule,
                     variant.order_class,
-                    rates,
+                    rounds,
                 )
                 .ok_or_else(|| BenchError::Setup("no samples".to_string()))
             })
@@ -545,6 +583,20 @@ fn parallel_map<T: Sync, R: Send>(
     });
     done.sort_by_key(|(index, _)| *index);
     done.into_iter().map(|(_, result)| result).collect()
+}
+
+#[cfg(test)]
+pub(crate) fn test_rounds(rates: &[f64]) -> Vec<RoundSample> {
+    rates
+        .iter()
+        .enumerate()
+        .map(|(round_index, &gflops)| RoundSample {
+            round_index,
+            elapsed_ns: 1,
+            iterations: 1,
+            gflops,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -650,7 +702,7 @@ mod tests {
             "vectorize(1,j)",
             &schedule,
             OrderClass::Reordering,
-            &rates,
+            &test_rounds(&rates),
         )
         .unwrap();
         assert_eq!(record.samples, 10);
@@ -666,6 +718,76 @@ mod tests {
             make_record(&info, "", &schedule, OrderClass::Preserving, &[]),
             None
         );
+    }
+
+    #[test]
+    fn serialized_rounds_reproduce_the_aggregate_bits() {
+        let rates = [0.1, f64::from_bits(0.1f64.to_bits() + 1), 1.0 / 3.0, 7.25];
+        let record = make_record(
+            &RunInfo {
+                kernel: "matmul",
+                n: 8,
+                graph_hash: 0,
+                quick: false,
+            },
+            "",
+            &Schedule::default(),
+            OrderClass::Preserving,
+            &test_rounds(&rates),
+        )
+        .unwrap();
+        let metadata = Metadata {
+            hw_model: "test".into(),
+            cpu_brand: "test".into(),
+            os_version: "test".into(),
+            clang: "test".into(),
+            flags: "test".into(),
+            git_rev: "test".into(),
+            git_dirty: Some(false),
+            date_utc: "test".into(),
+            seed: 1,
+        };
+        let line = record_json(&record, &metadata);
+        let restored: Vec<f64> = line
+            .split("\"gflops\":")
+            .skip(1)
+            .map(|tail| tail.split([',', '}']).next().unwrap().parse().unwrap())
+            .collect();
+        let median: f64 = line
+            .split("\"median\":")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(restored.len(), rates.len());
+        for (got, want) in restored.iter().zip(rates) {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+        assert_eq!(
+            summarize(&restored).unwrap().median.to_bits(),
+            median.to_bits()
+        );
+        assert_eq!(median.to_bits(), record.stats.median.to_bits());
+    }
+
+    #[test]
+    fn aggregate_only_hypothesis_logs_remain_readable() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/results");
+        for name in [
+            "2026-10-19-hypothesis-a.jsonl",
+            "2026-10-21-hypothesis-a-run2.jsonl",
+            "2026-10-22-hypothesis-a-run3.jsonl",
+            "2026-10-30-hypothesis-a-run4.jsonl",
+        ] {
+            let text = std::fs::read_to_string(base.join(name)).unwrap();
+            assert!(!text.contains("\"rounds\":"));
+            let peak = std::fs::read_to_string(base.join("2026-10-28-adcf09c-peak.jsonl")).unwrap();
+            crate::model::compare_report(name, &format!("{peak}\n{text}"), Some("random"))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     #[test]
@@ -708,6 +830,7 @@ mod tests {
                 min: 11.25,
             },
             samples: 30,
+            rounds: Vec::new(),
             drift: false,
             quick: false,
         };
@@ -724,7 +847,7 @@ mod tests {
         };
         assert_eq!(
             record_json(&record, &metadata),
-            r#"{"kernel":"matmul","n":256,"graph_hash":"0123456789abcdef","schedule":"split(1, j, jo, ji, 8)","order_class":"preserving","verified":true,"quick":false,"samples":30,"median":12.5,"p25":12,"p75":13,"min":11.25,"drift":false,"unit":"GFLOP/s","seed":1,"commit":"abc1234","dirty":false,"clang":"Apple clang 17","flags":"-std=c99 -O2","machine":"Mac16,1","cpu":"Apple M4","os":"27.0","date":"2026-10-11T00:00:00Z"}"#
+            r#"{"kernel":"matmul","n":256,"graph_hash":"0123456789abcdef","schedule":"split(1, j, jo, ji, 8)","order_class":"preserving","verified":true,"quick":false,"samples":30,"median":12.5,"p25":12,"p75":13,"min":11.25,"drift":false,"rounds":[],"unit":"GFLOP/s","seed":1,"commit":"abc1234","dirty":false,"clang":"Apple clang 17","flags":"-std=c99 -O2","machine":"Mac16,1","cpu":"Apple M4","os":"27.0","date":"2026-10-11T00:00:00Z"}"#
         );
     }
 
