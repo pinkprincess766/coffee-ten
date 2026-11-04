@@ -59,6 +59,22 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rustc-env=COFFEE_TEN_SOURCE_HASH={state:016x}");
+    for (name, cargo_name) in [
+        ("PROFILE", "PROFILE"),
+        ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"),
+    ] {
+        println!("cargo:rerun-if-env-changed={cargo_name}");
+        let value = env::var(cargo_name).unwrap_or_default();
+        let value = if name == "RUSTFLAGS" {
+            value
+                .bytes()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        } else {
+            value
+        };
+        println!("cargo:rustc-env=COFFEE_TEN_{name}={value}");
+    }
     let version = std::process::Command::new(env::var_os("RUSTC").unwrap())
         .arg("--version")
         .output()

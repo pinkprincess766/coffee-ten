@@ -1,7 +1,7 @@
 //! A reproducibility key and compilation accounting, without fitting or new dependencies.
 use crate::{
     meta::Metadata,
-    run::{Record, fnv1a_64, json_string},
+    run::{Record, RunInfo, fnv1a_64, json_string},
     space::matmul_space,
 };
 use std::{
@@ -52,6 +52,8 @@ pub struct ProtocolKey {
     pub clang: String,
     pub flags: String,
     pub rustc: String,
+    pub harness_profile: String,
+    pub rustflags: String,
     pub samples: usize,
     pub min_sample_ms: u64,
     pub input_seed: u64,
@@ -61,6 +63,19 @@ pub struct ProtocolKey {
 }
 impl ProtocolKey {
     pub fn for_record(r: &Record, m: &Metadata) -> Self {
+        Self::for_run(
+            &RunInfo {
+                kernel: r.kernel,
+                n: r.n,
+                graph_hash: r.graph_hash,
+                min_sample_ms: r.min_sample_ms,
+                quick: r.quick,
+            },
+            r.samples,
+            m,
+        )
+    }
+    pub fn for_run(r: &RunInfo, samples: usize, m: &Metadata) -> Self {
         Self {
             version: VERSION,
             kernel: r.kernel.into(),
@@ -77,7 +92,9 @@ impl ProtocolKey {
             clang: m.clang.clone(),
             flags: m.flags.clone(),
             rustc: RUSTC.into(),
-            samples: r.samples,
+            harness_profile: env!("COFFEE_TEN_PROFILE").into(),
+            rustflags: env!("COFFEE_TEN_RUSTFLAGS").into(),
+            samples,
             min_sample_ms: r.min_sample_ms,
             input_seed: m.seed,
             quick: r.quick,
@@ -112,6 +129,8 @@ impl ProtocolKey {
             ("clang", &self.clang),
             ("flags", &self.flags),
             ("rustc", &self.rustc),
+            ("harness_profile", &self.harness_profile),
+            ("rustflags", &self.rustflags),
         ] {
             fields.push(format!("{}:{}", json_string(name), json_string(value)));
         }
