@@ -67,6 +67,12 @@ search lines have `group`; the files `run.sh` writes have none.
 | `min` | number or null | GFLOP/s | r[0], the slowest sample | harness |
 | `drift` | bool | - | median of the first 5 rounds and of the last 5 differ by more than 5% of the first; always `false` below 10 samples | harness |
 | `rounds` | array | mixed | ordered objects: `round_index` (zero-based shared round), `elapsed_ns` (integer nanoseconds), `iterations` (kernel calls), `gflops` (raw rate, number or null); excludes warmup | harness |
+| `protocol` | object | mixed | versioned reproducibility key; fields and compatibility rules in [protocol.md](../docs/protocol.md) | harness |
+| `measurement_ns` | integer | ns | sum of raw round elapsed times, excluding warmup and setup | harness |
+| `compilation_ns` | integer | ns | this variant's successful compiler API call, including cache lookup and library loading | harness |
+| `cache_hit` | bool | - | this compiler call reused an existing library without invoking clang | harness |
+| `reference_compilation` | object or null | mixed | initial correctness reference's `{elapsed_ns,cache_hit}`, on the first record only; additional to variant compilation | harness |
+| `compilation_wall_ns` | null | ns | reserved; no elapsed parallel compilation wall-time claim is made | harness |
 | `unit` | string | - | always `GFLOP/s`, the unit of `median`, `p25`, `p75`, `min` | harness |
 | `seed` | integer | - | `--seed`: seeds the input matrices and the round order (in `search` also the candidate sample) | meta |
 | `commit` | string | - | `git rev-parse --short HEAD`; `unknown` if git fails | meta |

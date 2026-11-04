@@ -23,7 +23,11 @@ fn quick_run_checks_and_times_naive_and_vectorized_matmul() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].variant, "");
     assert_eq!(records[1].variant, "vectorize(1, j)");
+    assert!(records[0].reference_compilation.is_some());
+    assert!(records[1].reference_compilation.is_none());
     for record in &records {
+        assert!(record.compilation_ns > 0);
+        assert_eq!(record.min_sample_ms, config.min_sample_ms);
         assert!(record.quick);
         assert_eq!(record.samples, QUICK_SAMPLES);
         assert_eq!(record.rounds.len(), record.samples);

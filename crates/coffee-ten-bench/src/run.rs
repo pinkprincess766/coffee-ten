@@ -140,6 +140,7 @@ pub struct Variant {
     kernel: Kernel,
     compiled: CompiledKernel,
     storage: Vec<Vec<f32>>,
+    pub(crate) compilation: crate::protocol::Compilation,
 }
 
 impl Variant {
@@ -171,8 +172,13 @@ fn make_variant(
     };
     let (kernel, order_class) =
         apply_classified(naive, schedule).map_err(|e| setup("cannot apply schedule", &e))?;
+    let compile_start = Instant::now();
     let compiled = compile_with_flags(&kernel, &cache_dir(), BENCH_FLAGS)
         .map_err(|e| setup("cannot compile", &e))?;
+    let compilation = crate::protocol::Compilation {
+        elapsed_ns: compile_start.elapsed().as_nanos(),
+        cache_hit: compiled.cache_hit(),
+    };
     let storage = inputs.storage(&kernel);
     Ok(Variant {
         text: text.to_string(),
@@ -181,6 +187,7 @@ fn make_variant(
         kernel,
         compiled,
         storage,
+        compilation,
     })
 }
 
@@ -266,6 +273,7 @@ pub struct RunInfo {
     pub n: usize,
     /// FNV-1a of the lowered kernel's text before any schedule.
     pub graph_hash: u64,
+    pub min_sample_ms: u64,
     /// The run was `--quick`: not a measurement.
     pub quick: bool,
 }
@@ -298,6 +306,12 @@ pub struct Record {
     pub samples: usize,
     /// Raw rounds backing these exact aggregates; indexes are shared across interleaved variants.
     pub rounds: Vec<RoundSample>,
+    pub min_sample_ms: u64,
+    /// Per-variant compiler API elapsed duration, including cache lookup/loading.
+    pub compilation_ns: u128,
+    pub cache_hit: bool,
+    /// Initial correctness reference compilation, charged once on the first record.
+    pub reference_compilation: Option<crate::protocol::Compilation>,
     /// Median of the first rounds differs from the median of the last by more than `DRIFT_LIMIT`.
     pub drift: bool,
     /// The run was `--quick`: not a measurement.
@@ -326,6 +340,10 @@ pub fn make_record(
         stats: summarize(&rates)?,
         samples: rounds.len(),
         rounds: rounds.to_vec(),
+        min_sample_ms: info.min_sample_ms,
+        compilation_ns: 0,
+        cache_hit: false,
+        reference_compilation: None,
         drift: drifted(&rates),
         quick: info.quick,
     })
@@ -342,7 +360,7 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 /// `text` as a JSON string literal: `"` and `\` escaped, `\n` and `\t` as such, other control
 /// characters as `\u00XX`.
-fn json_string(text: &str) -> String {
+pub(crate) fn json_string(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {
@@ -409,6 +427,28 @@ pub fn record_json(record: &Record, metadata: &Metadata) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        format!(
+            "\"protocol\":{}",
+            crate::protocol::ProtocolKey::for_record(record, metadata).to_json()
+        ),
+        format!(
+            "\"measurement_ns\":{}",
+            record
+                .rounds
+                .iter()
+                .map(|r| u128::from(r.elapsed_ns))
+                .sum::<u128>()
+        ),
+        format!("\"compilation_ns\":{}", record.compilation_ns),
+        format!("\"cache_hit\":{}", record.cache_hit),
+        format!(
+            "\"reference_compilation\":{}",
+            record
+                .reference_compilation
+                .map_or("null".into(), |c| c.to_json())
+        ),
+        // Reserved until an elapsed wall-time accounting protocol is agreed.
+        "\"compilation_wall_ns\":null".to_string(),
         format!("\"unit\":{}", json_string("GFLOP/s")),
         format!("\"seed\":{}", metadata.seed),
         format!("\"commit\":{}", json_string(&metadata.git_rev)),
@@ -436,7 +476,11 @@ pub fn run(config: &Config) -> Result<Vec<Record>, BenchError> {
     for (text, schedule) in &config.variants {
         variants.push(reference.build(text, schedule)?);
     }
-    reference.time(config, &mut variants, full_warmup(config.quick))
+    let mut records = reference.time(config, &mut variants, full_warmup(config.quick))?;
+    if let Some(first) = records.first_mut() {
+        first.reference_compilation = Some(reference.initial_compile);
+    }
+    Ok(records)
 }
 
 /// What variants are checked against and timed with: the seeded inputs and the naive kernel's
@@ -447,6 +491,7 @@ pub struct Reference {
     inputs: Inputs,
     scales: Vec<f64>,
     output: Vec<f32>,
+    pub(crate) initial_compile: crate::protocol::Compilation,
 }
 
 #[cfg(test)]
@@ -464,6 +509,7 @@ impl Reference {
             kernel: config.kernel.name(),
             n,
             graph_hash: fnv1a_64(naive_kernel.to_string().as_bytes()),
+            min_sample_ms: config.min_sample_ms,
             quick: config.quick,
         };
         let inputs = Inputs::new(n, config.seed);
@@ -479,6 +525,7 @@ impl Reference {
             inputs,
             scales,
             output: naive.output().to_vec(),
+            initial_compile: naive.compilation,
         })
     }
 
@@ -539,14 +586,17 @@ impl Reference {
             .iter()
             .zip(&rounds)
             .map(|(variant, rounds)| {
-                make_record(
+                let mut record = make_record(
                     &self.info,
                     &variant.text,
                     &variant.schedule,
                     variant.order_class,
                     rounds,
                 )
-                .ok_or_else(|| BenchError::Setup("no samples".to_string()))
+                .ok_or_else(|| BenchError::Setup("no samples".to_string()))?;
+                record.compilation_ns = variant.compilation.elapsed_ns;
+                record.cache_hit = variant.compilation.cache_hit;
+                Ok(record)
             })
             .collect()
     }
@@ -693,6 +743,7 @@ mod tests {
             kernel: "matmul",
             n: 8,
             graph_hash: 0,
+            min_sample_ms: 1,
             quick: true,
         };
         let schedule = Schedule::parse("vectorize(1,j)").unwrap();
@@ -728,6 +779,7 @@ mod tests {
                 kernel: "matmul",
                 n: 8,
                 graph_hash: 0,
+                min_sample_ms: 1,
                 quick: false,
             },
             "",
@@ -831,6 +883,10 @@ mod tests {
             },
             samples: 30,
             rounds: Vec::new(),
+            min_sample_ms: 1,
+            compilation_ns: 0,
+            cache_hit: false,
+            reference_compilation: None,
             drift: false,
             quick: false,
         };
@@ -845,8 +901,14 @@ mod tests {
             date_utc: "2026-10-11T00:00:00Z".to_string(),
             seed: 1,
         };
+        let line = record_json(&record, &metadata);
+        let added = format!(
+            ",\"protocol\":{},\"measurement_ns\":0,\"compilation_ns\":0,\"cache_hit\":false,\"reference_compilation\":null,\"compilation_wall_ns\":null",
+            crate::protocol::ProtocolKey::for_record(&record, &metadata).to_json()
+        );
+        assert!(line.contains(&added));
         assert_eq!(
-            record_json(&record, &metadata),
+            line.replace(&added, ""),
             r#"{"kernel":"matmul","n":256,"graph_hash":"0123456789abcdef","schedule":"split(1, j, jo, ji, 8)","order_class":"preserving","verified":true,"quick":false,"samples":30,"median":12.5,"p25":12,"p75":13,"min":11.25,"drift":false,"rounds":[],"unit":"GFLOP/s","seed":1,"commit":"abc1234","dirty":false,"clang":"Apple clang 17","flags":"-std=c99 -O2","machine":"Mac16,1","cpu":"Apple M4","os":"27.0","date":"2026-10-11T00:00:00Z"}"#
         );
     }
