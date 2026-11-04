@@ -158,9 +158,12 @@ fn measure_group(
         };
         let mut variant = [built?];
         let mut timed = reference.time(&bench, &mut variant, warmup)?;
-        let record = timed
+        let mut record = timed
             .pop()
             .expect("invariant: time gives one record per variant");
+        if group == "naive" && index == 0 {
+            record.reference_compilation = Some(reference.initial_compile);
+        }
         log_records(config, metadata, group, &[&record])?;
         records.push(record);
     }
@@ -1091,6 +1094,7 @@ mod tests {
             kernel: "matmul",
             n: 8,
             graph_hash: 0,
+            min_sample_ms: 1,
             quick: false,
         };
         let mut record = make_record(

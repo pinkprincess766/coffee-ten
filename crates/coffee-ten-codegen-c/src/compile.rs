@@ -107,6 +107,7 @@ pub struct CompiledKernel {
     entry: EntryFn,
     buffer_lens: Vec<usize>,
     library_path: PathBuf,
+    cache_hit: bool,
 }
 
 impl CompiledKernel {
@@ -138,6 +139,11 @@ impl CompiledKernel {
         // access of every nest.
         unsafe { (self.entry)(pointers.as_ptr()) };
         Ok(())
+    }
+
+    /// Whether this call reused an existing library without invoking clang.
+    pub fn cache_hit(&self) -> bool {
+        self.cache_hit
     }
 
     pub fn library_path(&self) -> &Path {
@@ -173,7 +179,8 @@ pub fn compile_with_flags(
     let source_path = cache_dir.join(format!("{stem}.c"));
     let library_path = cache_dir.join(format!("{stem}.{}", std::env::consts::DLL_EXTENSION));
 
-    if !library_path.exists() {
+    let cache_hit = library_path.exists();
+    if !cache_hit {
         std::fs::create_dir_all(cache_dir).map_err(io_error)?;
         // Write and build under names private to this call, then rename, so a reader never
         // sees a half-written file. Private to the call, not just the process: `cargo test`
@@ -202,6 +209,7 @@ pub fn compile_with_flags(
         entry,
         buffer_lens,
         library_path,
+        cache_hit,
     })
 }
 
@@ -550,6 +558,8 @@ mod tests {
         let modified_again = std::fs::metadata(second.library_path())
             .and_then(|m| m.modified())
             .unwrap();
+        assert!(!first.cache_hit());
+        assert!(second.cache_hit());
         assert_eq!(first.library_path(), second.library_path());
         assert_eq!(modified, modified_again);
     }

@@ -8,6 +8,7 @@ mod local;
 pub mod log;
 pub mod meta;
 pub mod model;
+pub mod protocol;
 pub mod run;
 pub mod search;
 pub mod space;
