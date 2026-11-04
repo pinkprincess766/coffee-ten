@@ -55,6 +55,18 @@ fn search_main(args: impl Iterator<Item = String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if config.replay.is_some() {
+        return match coffee_ten_bench::replay::run(&config, &meta::collect(config.seed)) {
+            Ok(result) => {
+                print!("{}", result.report());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     raise_qos();
     let metadata = meta::collect(config.seed);
     match coffee_ten_bench::search::search(&config, &metadata) {

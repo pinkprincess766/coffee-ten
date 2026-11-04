@@ -43,7 +43,7 @@ pub const DEFAULT_SAMPLES: usize = 5;
 pub const DEFAULT_MIN_SAMPLE_MS: u64 = 10;
 pub const SEARCH_USAGE: &str = "usage: coffee-ten-bench search --n <N> --budget <M> \
 [--seed <SEED>] [--samples <S>] [--min-sample-ms <MS>] [--log <path>] [--quick] \
-[--model-top <K> --from <results.jsonl>] [--local --from <results.jsonl>]";
+[--model-top <K> --from <results.jsonl>] [--local --from <results.jsonl>] [--replay <table.jsonl>]";
 /// Spec §7.1: the model's best must reach this fraction of the best random schedule.
 pub const CRITERION_RATIO: f64 = 0.9;
 
@@ -68,6 +68,8 @@ pub struct SearchConfig {
     pub from: Option<PathBuf>,
     /// Hill climb on the model's neighbors instead of the random sample.
     pub local: bool,
+    /// Offline random search over a complete compatible measurement table.
+    pub replay: Option<PathBuf>,
 }
 
 /// What a search measured.
@@ -312,6 +314,11 @@ fn measure_local(
 /// climb instead of the sample. A candidate that fails the check stops the search with
 /// its error; the records logged before it stay in the log.
 pub fn search(config: &SearchConfig, metadata: &Metadata) -> Result<Search, BenchError> {
+    if config.replay.is_some() {
+        return Err(BenchError::Usage(
+            "use replay::run for offline search".into(),
+        ));
+    }
     let space = matmul_space(config.n, config.n, config.n);
     let space_size = space.len();
     // Ranked before anything is measured: a bad `--from` fails at once.
@@ -643,6 +650,7 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
     let mut model_top = None;
     let mut from = None;
     let mut local = false;
+    let mut replay = None;
     while let Some(flag) = args.next() {
         if flag == "--quick" {
             quick = true;
@@ -664,6 +672,7 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
             "--log" => log = Some(PathBuf::from(value)),
             "--model-top" => model_top = Some(parse_number::<usize>(&flag, &value)?),
             "--from" => from = Some(PathBuf::from(value)),
+            "--replay" => replay = Some(PathBuf::from(value)),
             _ => return Err(usage(format!("unknown argument {flag}"))),
         }
     }
@@ -693,6 +702,11 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
             "--model-top and --from (the machine of the model) go together".to_string(),
         ));
     }
+    if replay.is_some() && (local || model_top.is_some() || from.is_some()) {
+        return Err(usage(
+            "--replay currently supports random search only".into(),
+        ));
+    }
     if quick {
         samples = QUICK_SAMPLES;
         min_sample_ms = QUICK_MIN_SAMPLE_MS;
@@ -711,6 +725,7 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
         model_top,
         from,
         local,
+        replay,
     })
 }
 
@@ -839,6 +854,7 @@ mod tests {
                 model_top: None,
                 from: None,
                 local: false,
+                replay: None,
             }
         );
         let quick = parse(&["--n", "16", "--budget", "3", "--samples", "50", "--quick"]).unwrap();
@@ -886,6 +902,7 @@ mod tests {
             model_top: None,
             from: None,
             local: false,
+            replay: None,
         };
         let metadata = test_metadata(config.seed);
         // `run` aborts with `BenchError::Mismatch` before timing a wrong variant, so an `Ok`
@@ -944,6 +961,7 @@ mod tests {
             model_top: None,
             from: None,
             local: false,
+            replay: None,
         };
         let reference = Reference::new(&bench_config(&config)).unwrap();
         // The third one is fine, but it comes after the failing one.
@@ -1128,6 +1146,7 @@ mod tests {
             model_top: Some(2),
             from: Some(PathBuf::from("peak.jsonl")),
             local: false,
+            replay: None,
         };
         let result = Search {
             space_size: 100,
@@ -1228,6 +1247,7 @@ mod tests {
             model_top: None,
             from: Some(peak.clone()),
             local: true,
+            replay: None,
         };
         let metadata = test_metadata(config.seed);
         let result = search(&config, &metadata).unwrap();
@@ -1301,6 +1321,7 @@ mod tests {
             model_top: Some(2),
             from: Some(peak.clone()),
             local: false,
+            replay: None,
         };
         let metadata = test_metadata(config.seed);
         let result = search(&config, &metadata).unwrap();
@@ -1380,6 +1401,7 @@ mod tests {
             model_top: Some(1),
             from: Some(PathBuf::from("/nonexistent/peak.jsonl")),
             local: false,
+            replay: None,
         };
         assert!(search(&config, &test_metadata(1)).is_err());
         assert!(!log.exists());

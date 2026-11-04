@@ -108,7 +108,7 @@ impl Inputs {
     }
 }
 
-fn build_kernel(kind: KernelKind, n: usize) -> Result<Kernel, BenchError> {
+pub(crate) fn build_kernel(kind: KernelKind, n: usize) -> Result<Kernel, BenchError> {
     let mut g = Graph::new();
     let shape = Shape::new(vec![n, n]);
     let setup = |e: &dyn std::fmt::Display| BenchError::Setup(format!("cannot build graph: {e}"));

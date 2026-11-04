@@ -41,6 +41,10 @@ of line exist:
   as the first line of its file, and a peak-only run is a file of its own. Search logs have
   none (see Peak line below). The other lines have no `kind`.
 
+Offline `search --replay` uses a separate `kind: replay_curve` schema with explicit
+provenance and charged stored costs; see [protocol.md](../docs/protocol.md#offline-replay-n3).
+It does not append live measurement records.
+
 ### Record fields
 
 The rows are in the order the keys are written. Every record has every field; the order and
