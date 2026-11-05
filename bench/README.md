@@ -28,6 +28,10 @@ copying numbers into BENCHMARKS.md.
 FMA contraction is allowed in benchmark builds (`-ffp-contract=fast`, as for peak);
 the bench header prints it.
 
+Raw-round confidence intervals are available through the [bootstrap analysis API](../docs/statistics.md).
+They leave the recorded aggregates and search behavior unchanged; report commands follow
+in N11/N12.
+
 ## Result files
 
 A results file is JSONL: one JSON object per line, appended and never rewritten. Three kinds

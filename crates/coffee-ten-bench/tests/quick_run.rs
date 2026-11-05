@@ -2,6 +2,7 @@
 
 use coffee_ten_bench::cli::{QUICK_SAMPLES, parse_args};
 use coffee_ten_bench::run;
+use coffee_ten_bench::stats::{BootstrapConfig, bootstrap_median, bootstrap_paired_ratio};
 
 #[test]
 fn quick_run_checks_and_times_naive_and_vectorized_matmul() {
@@ -54,5 +55,20 @@ fn quick_run_checks_and_times_naive_and_vectorized_matmul() {
             "{record:?}"
         );
         assert!(s.median.is_finite());
+        // Analysis consumes the actual N1 rounds after timing; acquisition stats stay intact.
+        let ci = bootstrap_median(&record.rounds, BootstrapConfig::default()).unwrap();
+        assert_eq!(ci.estimate.to_bits(), s.median.to_bits());
+        assert!(ci.lower > 0.0 && ci.lower <= ci.upper);
     }
+    // Both variants came from this one interleaved run, so equal round IDs are paired.
+    let ratio = bootstrap_paired_ratio(
+        &records[1].rounds,
+        &records[0].rounds,
+        BootstrapConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        ratio.estimate.to_bits(),
+        (records[1].stats.median / records[0].stats.median).to_bits()
+    );
 }
