@@ -4,7 +4,9 @@ use coffee_ten_bench::cli::Config;
 use coffee_ten_bench::log::append_lines;
 use coffee_ten_bench::meta::{self, Metadata};
 use coffee_ten_bench::run::record_json;
-use coffee_ten_bench::space::{enumerate_matmul, parse_space_args, summary};
+use coffee_ten_bench::space::{
+    SpaceConfig, enumerate_matmul_for, parse_space_config_args, summary,
+};
 use coffee_ten_bench::stats::{DRIFT_LIMIT, DRIFT_ROUNDS, MIN_ROUNDS_FOR_DRIFT};
 use coffee_ten_bench::{Record, parse_args, run};
 use std::process::ExitCode;
@@ -33,9 +35,20 @@ fn raise_qos() {}
 
 /// `coffee-ten-bench space --n <N>`: lists the schedule space, measures nothing.
 fn space_main(args: impl Iterator<Item = String>) -> ExitCode {
-    match parse_space_args(args) {
-        Ok(n) => {
-            print!("{}", summary(n, &enumerate_matmul(n, n, n)));
+    match parse_space_config_args(args) {
+        Ok(config) => {
+            let n = config.n;
+            if config.space != SpaceConfig::V1 {
+                print!("{}", config.space.description());
+                println!(
+                    "space hash {}",
+                    coffee_ten_bench::protocol::space_hash_for(n, config.space)
+                );
+            }
+            print!(
+                "{}",
+                summary(n, &enumerate_matmul_for(n, n, n, config.space))
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {

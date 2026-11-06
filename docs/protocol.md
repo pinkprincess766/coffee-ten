@@ -13,7 +13,8 @@ Each new harness/search record contains `protocol`, an object with these exact f
 | --- | --- |
 | `version` | Schema/protocol version, currently 1 |
 | `kernel`, `n`, `graph_hash` | Kernel kind, square size, hash of unscheduled lowered graph |
-| `space`, `space_hash` | `v1`; fingerprint of ordered canonical matmul candidates and arithmetic classes (order affects seeded sampling) |
+| `space`, `space_hash` | `v1` by default, opt-in `v2`; versioned fingerprint of ordered canonical matmul candidates and arithmetic classes (order affects seeded sampling) |
+| `cache`, `tile_factors` | V2 only: resolved cache inputs or null fallback, plus proposed factor values; see [cache-tiles.md](cache-tiles.md) |
 | `source_hash` | Fingerprint embedded at build time from Rust/TOML files under `crates`, root Cargo.toml/Cargo.lock, toolchain/config and peak C source |
 | `cpu`, `machine`, `os`, `arch`, `target_os` | CPU brand, hardware model, OS version, compiled architecture and OS |
 | `clang`, `flags`, `rustc` | Compiler versions and benchmark C flags, including FMA contraction policy |
@@ -31,6 +32,8 @@ remain readable by existing reports but cannot supply a complete replay table.
 
 The key describes the build inputs listed above, not external-library binary provenance or
 thermal state. Preserve original logs and environment information when publishing results.
+V1 has no cache-input fields and makes no cache queries. V2 has its own hash domain and
+full key even on fallback; mixing V1/V2 or differing V2 cache inputs fails replay validation.
 
 ## Budget and cost fields
 
@@ -62,7 +65,8 @@ The table acquisition order and first/subsequent warmup asymmetry remain relevan
 
 `search --replay table.jsonl --n N --budget M --seed POLICY_SEED` reads a complete
 single-run random-search table: exactly one `naive` reference and one `random` record for
-every candidate of the keyed default space. An optional peak line is ignored. Partial,
+every candidate of the keyed space (`v1` by default; pass `--space v2` for V2 data).
+An optional peak line is ignored. Partial,
 duplicate, unknown-schedule, mixed-group and mixed-protocol tables fail before output.
 Raw round counts, order, finite rates, timing-derived rates, aggregate bits and measurement
 costs are checked. Old logs without N1/N2 data cannot be used as replay tables.

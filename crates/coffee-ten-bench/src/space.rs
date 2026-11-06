@@ -25,6 +25,9 @@ use coffee_ten_loop::{Kernel, OrderClass, Schedule, Step, apply_classified, lowe
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+mod cache;
+pub use cache::{CacheInfo, SpaceConfig};
+
 /// Tile factors tried per loop; a loop can also stay unsplit.
 pub const TILE_FACTORS: [usize; 5] = [8, 16, 32, 64, 128];
 /// Register tile heights (`ii`) and widths (`ji`) tried, see `add_register_tiles`.
@@ -242,6 +245,77 @@ fn try_add(naive: &Kernel, steps: &[Step], space: &mut Space) {
 /// The legal candidates of `enumerate_matmul`.
 pub fn matmul_space(m: usize, k: usize, n: usize) -> Vec<Candidate> {
     enumerate_matmul(m, k, n).candidates
+}
+
+/// V2 retains every V1 candidate as an unchanged prefix, then appends new legal tilings.
+/// Cache capacity suggests additional values, never filters or ranks existing candidates.
+pub fn enumerate_matmul_for(m: usize, k: usize, n: usize, config: SpaceConfig) -> Space {
+    let mut space = enumerate_matmul(m, k, n);
+    if config == SpaceConfig::V1 {
+        return space;
+    }
+    let factors = config.tile_factors();
+    if factors.iter().all(|f| TILE_FACTORS.contains(f)) {
+        return space;
+    }
+    let Some(naive) = matmul_kernel(m, k, n) else {
+        return space;
+    };
+    let options = |extent: usize| {
+        std::iter::once(None)
+            .chain(
+                factors
+                    .iter()
+                    .copied()
+                    .filter(move |&f| f < extent && extent.is_multiple_of(f))
+                    .map(Some),
+            )
+            .collect::<Vec<_>>()
+    };
+    for i in options(m) {
+        for j in options(n) {
+            for r in options(k) {
+                let tiles = [i, j, r];
+                if tiles.iter().flatten().any(|f| !TILE_FACTORS.contains(f)) {
+                    add_for_tiles(&naive, tiles, &mut space);
+                }
+            }
+        }
+    }
+    space
+}
+
+pub fn matmul_space_for(m: usize, k: usize, n: usize, config: SpaceConfig) -> Vec<Candidate> {
+    enumerate_matmul_for(m, k, n, config).candidates
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceArgs {
+    pub n: usize,
+    pub space: SpaceConfig,
+}
+
+/// Version-aware CLI; the legacy parser below continues to return only a V1 size.
+pub fn parse_space_config_args<I: IntoIterator<Item = String>>(
+    args: I,
+) -> Result<SpaceArgs, crate::BenchError> {
+    let mut legacy = Vec::new();
+    let mut args = args.into_iter();
+    let mut space = SpaceConfig::V1;
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| crate::BenchError::Usage(format!("{flag} needs a value")))?;
+        if flag == "--space" {
+            space = SpaceConfig::from_arg(&value)?;
+        } else {
+            legacy.extend([flag, value]);
+        }
+    }
+    Ok(SpaceArgs {
+        n: parse_space_args(legacy)?,
+        space,
+    })
 }
 
 /// Parses the arguments after `space`: `--n <N>`, the size of the square matmul.
