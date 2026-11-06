@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   rust:
+    env:
+      COFFEE_TEN_FUZZ_FAILURE_DIR: ${{ github.workspace }}/target/fuzz-failures
     # macOS minutes are expensive while the repo is private: pull requests run on
     # ubuntu only, pushes to main and manual runs add macOS.
     strategy:
@@ -42,6 +44,8 @@ jobs:
         timeout-minutes: 10
 
   python:
+    env:
+      COFFEE_TEN_FUZZ_FAILURE_DIR: ${{ github.workspace }}/target/fuzz-failures
     strategy:
       fail-fast: false
       matrix:

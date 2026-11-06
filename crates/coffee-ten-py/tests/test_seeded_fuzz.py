@@ -51,6 +51,16 @@ def test_seeded_generated_programs_match_reference_bits(tmp_path):
         kernel = ct.compile(expression, cache_dir=tmp_path)
         actual = kernel(**inputs)
         assert kernel.order_class == "preserving"
+        different = (actual.dtype != reference.dtype or actual.shape != reference.shape
+                     or not np.array_equal(actual.view(np.uint32), reference.view(np.uint32)))
+        if different:
+            from ct_fuzz_minimize import python_mismatch, save_failure
+            directory = Path(os.environ.get("COFFEE_TEN_FUZZ_FAILURE_DIR", tmp_path)) / f"python-{case.index}"
+            try:
+                save_failure(case, lambda candidate: python_mismatch(candidate, ct, tmp_path / "minimize-cache"),
+                             directory, backend="python")
+            except Exception as error:
+                print(f"N9 minimizer stopped; original retained: {error}")
         assert actual.dtype == reference.dtype == np.float32
         assert actual.shape == reference.shape, case.row()
         np.testing.assert_array_equal(actual.view(np.uint32), reference.view(np.uint32),
