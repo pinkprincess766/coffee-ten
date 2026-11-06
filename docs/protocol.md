@@ -5,6 +5,79 @@ arithmetic are unchanged. Search already builds/checks a group in parallel befor
 its candidates one at a time. This document describes existing behavior and adds accounting;
 it does not authorize a different search or warmup policy.
 
+## Live acquisition protocol (N10)
+
+This section records current behavior in [run.rs](../crates/coffee-ten-bench/src/run.rs),
+[cli.rs](../crates/coffee-ten-bench/src/cli.rs),
+[search.rs](../crates/coffee-ten-bench/src/search.rs) and
+[stats.rs](../crates/coffee-ten-bench/src/stats.rs). It changes no timing policy.
+Field names refer to the [JSONL schema](../bench/README.md#record-fields).
+
+| Mode | Samples per variant | Minimum elapsed time per sample | Warmup |
+| --- | --- | --- | --- |
+| Harness | 30 by default | 10 ms by default | 300 ms per variant |
+| Random/model search group | 5 by default | 10 ms by default | 300 ms first candidate; 10 ms subsequent candidates |
+| Local-search step | 5 by default | 10 ms by default | 300 ms for each step (a separate single-candidate group) |
+| Model/random final comparison | 30 | Search minimum sample time | 300 ms per variant, interleaved harness |
+| Any `--quick` timing | 3 | 1 ms | 5 ms, including subsequent candidates |
+
+`--samples` and `--min-sample-ms` override their mode's defaults; `--quick` replaces both.
+The model/random final comparison deliberately uses the harness's 30 rounds, not a search
+`--samples` override; quick mode still uses 3. Each warmup runs at least one call and
+continues until its duration threshold is reached. Warmup calls are excluded from `rounds`
+and `measurement_ns`. This is per-variant/per-group warmup, not one 300 ms warmup for a
+whole search.
+
+The harness allocates/checks variants before timing. It shuffles warmup order with the
+seeded RNG, then for each `round_index` shuffles the variant order and takes one sample
+per variant. Shared round IDs describe those interleaved observations. Records are emitted
+in requested variant order; each `rounds` array retains acquisition order.
+
+Search measures `group: naive` first, outside `--budget`. Random candidates are a seeded
+shuffle without replacement, truncated to the candidate-count budget. A group's candidates
+are already compiled/checked in parallel before they are timed sequentially, one candidate
+alone per timing call; they are not interleaved with one another. Local steps depend on
+earlier results and compile/check separately. The optional `final` group is an interleaved
+comparison; when both winners have the same schedule no final timing is needed.
+Equal round counters from separate sequential calls do not by themselves establish paired
+observations for statistical analysis.
+
+One sample repeatedly invokes the existing kernel wrapper until elapsed time reaches the
+minimum threshold, checking after each call. The elapsed time includes that host call loop;
+it is not a pure instruction-cycle count. `elapsed_ns`, `iterations` and `gflops` retain
+the original inputs and rate formula: `2*N^3 * calls / elapsed_seconds / 1e9`, for both
+matmul-based harness kernels. Additional bias/ReLU operations are not added to this
+conventional matmul work count. Compilation, validation and warmup are not sample work.
+
+Aggregates are integer ranks of sorted raw rates, with no interpolation: `median` uses
+`(n-1)/2`, `p25` uses `(n-1)/4`, `p75` uses `3*(n-1)/4`, and `min` is the lowest rate.
+`drift` compares the lower medians of the first five and last five rounds. It is true
+only when `abs(last-first)/first > 0.05`; exactly 5% is not flagged. Below ten samples
+the two windows cannot be disjoint, so the check does not run and the stored flag is
+false. Thus the default five-round search and quick mode have no drift evidence, not a
+positive finding of stability. No samples are silently dropped or remeasured by this rule.
+
+### Conditions and deviations
+
+`bench/run.sh` normally builds release binaries, records peak once, then runs four variants
+(naive, tiled, tiled/vectorized, register tile) for each kernel/size, pausing 60 seconds
+between kernel/size invocations by default. Its power checks warn about battery/Low Power
+Mode, and its prompt asks for quiet conditions; `--yes` skips the prompt, not a physical
+verification. Keep AC power, Low Power Mode off and other heavy jobs inactive when taking
+publishable Mac numbers. The macOS QoS request improves the chance of a P-core but does
+not guarantee placement.
+
+Preserve `quick`, `dirty`, `drift`, `date`, `commit`, machine/compiler metadata and the
+protocol key when reporting results. Mark quick runs as smoke data. Disclose changed
+sampling/warmup/flags/space settings, active load, power conditions or pauses rather than
+treating them as the same experiment. A drift flag is an observation to report, not an
+automatic rejection hidden by rerunning. Changed settings need a separate compatible
+key/run; unknown identity or incompatible keys cannot establish a controlled comparison.
+Benchmark C permits FMA contraction (`flags`), while TEST_FLAGS disables it for bitwise
+reference checks; benchmark correctness checks run before timing and abort failed variants.
+This document describes current protocol limits without authorizing different scheduling,
+early stopping, one global warmup or measurement selection.
+
 ## Compatibility key
 
 Each new harness/search record contains `protocol`, an object with these exact fields:
