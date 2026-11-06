@@ -3,8 +3,8 @@
 `bench/run.sh` takes the numbers for BENCHMARKS.md in one command. It refuses a dirty
 tree, checks the power conditions, asks you to confirm the rest, builds
 `coffee-ten-bench` and `bench/peak`, runs `peak` once, then runs `matmul` and
-`relu-matmul-bias` for each N. Each (kernel, N) is one invocation with three variants:
-naive, tiled, tiled + vectorized. Output: `bench/results/<UTC date>-<commit>.jsonl`,
+`relu-matmul-bias` for each N. Each (kernel, N) is one invocation with four variants:
+naive, tiled, tiled + vectorized, register tile. Output: `bench/results/<UTC date>-<commit>.jsonl`,
 one `peak` line and one line per variant.
 
     bench/run.sh                                 # full run, asks to confirm conditions
@@ -20,6 +20,8 @@ one `peak` line and one line per variant.
 Method: variants interleaved within each run; 30 samples per variant, each at least
 10 ms; median, p25 and p75 (IQR) reported; a drift flag when the rate moves more than
 5% between the first and last 5 rounds; pauses between runs.
+The [acquisition protocol](../docs/protocol.md#live-acquisition-protocol-n10) distinguishes
+harness/search warmup, effective samples, drift availability and reportable deviations.
 
 Conditions: AC power, Low Power Mode off, heavy apps closed, no other jobs during the
 run. `run.sh` checks the first two and warns; you confirm the rest. Check them before
