@@ -63,7 +63,8 @@ python -m pytest crates/coffee-ten-py/tests/test_seeded_fuzz.py -q
 Failures print a full replay TSV row, seed and, for numerical failures, lowered IR.
 Set `COFFEE_TEN_FUZZ_CASE` to that complete TSV row to execute only the reproduced case
 with either driver. The checked-in corpus integrity tests still check the whole manifest.
-Future N9 will persist and shrink failing cases; N7 does not silently modify the corpus.
+N9 persists and shrinks output mismatches as described in [fuzz-minimization.md](fuzz-minimization.md);
+the checked-in corpus is not silently modified.
 Keep the source commit with a replay artifact because its grammar/builders define semantics.
 
 Drivers enforce a 120-second elapsed budget between cases. This is a workload guard, not
