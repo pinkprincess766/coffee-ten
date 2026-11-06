@@ -2,8 +2,8 @@
 
 N7 generates bounded programs over the **existing** API, as confirmed by Nikita on
 7 November 2026: matmul, axis reductions, unary/elementwise operations and broadcast.
-There is no new public einsum API. This is the differential-testing foundation; preserving
-metamorphic transformations (N8) and automatic failure minimization (N9) follow separately.
+There is no new public einsum API. N7 is the differential-testing foundation; N8 adds the
+preserving metamorphic checks below. Automatic failure minimization remains N9.
 
 ## Corpus and generator
 
@@ -71,3 +71,23 @@ a preemptive timer inside clang. The enclosing Rust debug/release and Python tes
 have 10-minute CI timeouts, so a stuck subprocess cannot hold a test step indefinitely.
 The existing workspace tests and Python test discovery include the corpus automatically;
 no required checks are skipped and no new dependency or test plugin is installed by N7.
+
+## Preserving metamorphic checks (N8)
+
+`cargo test -p coffee-ten-codegen-c --test fuzz_transforms` applies this fixed, bounded
+set to the same corpus and compares each compiled result with the original f32 interpreter:
+
+| Transformation | Why it preserves the result |
+| --- | --- |
+| Tile one non-singleton loop per nest by 2 | Split outer/inner loops remain adjacent and in their original position; guards discard padding. Every original iteration and every contribution to an output stay in the same order. |
+| Reverse independent loops in R-free nests | Every loop appears in the injective store index. No reduction loop is moved or reordered; iterations write independent outputs. The existing legality/classification checks must accept the schedule as preserving. |
+| Rename bound loop variables and every use | Loop extents, coefficients, expressions and operation order are unchanged. All accesses, store indices and guard expressions are renamed consistently. The renamed kernel is validated; renaming is also exercised after tiling to cover remainder guards. |
+| Append an unreachable graph expression | It has no path to the selected output. Both lowered IR and emitted C must remain exactly equal, and the interpreter/result must also remain bit-identical. |
+
+Tile/reorder schedules must return `OrderClass::Preserving`. The test never accepts a
+tolerance or a reordering class. It checks that each transformation is actually exercised
+somewhere in the full corpus; inapplicable loops are skipped rather than counted as work.
+The test has its own 120-second elapsed budget and accepts the same
+`COFFEE_TEN_FUZZ_CASE` replay row. Replaying a case may exercise fewer applicable variants.
+These are test-only transformations: no production rewrite rule, candidate ranking,
+analytical model, numerical reference or default-space behavior changes.
