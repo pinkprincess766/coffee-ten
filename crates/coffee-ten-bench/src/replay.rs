@@ -8,7 +8,7 @@ use crate::{
     protocol::ProtocolKey,
     run::{RunInfo, build_kernel, fnv1a_64, json_string},
     search::{SearchConfig, best_index_so_far, sample},
-    space::matmul_space,
+    space::matmul_space_for,
     stats::{drifted, summarize},
 };
 use coffee_ten_loop::OrderClass;
@@ -145,7 +145,7 @@ pub fn from_table(
             return Err(err("unknown CPU/platform/compiler identity"));
         }
     }
-    let space = matmul_space(config.n, config.n, config.n);
+    let space = matmul_space_for(config.n, config.n, config.n, config.space);
     let classes: HashMap<&str, OrderClass> = space
         .iter()
         .map(|c| (c.schedule.as_str(), c.class))
@@ -179,7 +179,12 @@ pub fn from_table(
                 // Input data stay fixed; --seed controls only selection during replay.
                 let mut input_metadata = metadata.clone();
                 input_metadata.seed = protocol.get("input_seed")?.uint()?;
-                key = Some(ProtocolKey::for_run(&info, config.samples, &input_metadata));
+                key = Some(ProtocolKey::for_space(
+                    &info,
+                    config.samples,
+                    &input_metadata,
+                    config.space,
+                ));
             }
             let schedule = row.get("schedule")?.text()?;
             let group = row.get("group")?.text()?;
@@ -317,6 +322,7 @@ impl Replay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::space::matmul_space;
     use crate::{
         run::REFERENCES_BUILT,
         search::{parse_search_args, search},
@@ -451,6 +457,50 @@ mod tests {
         }
         assert_eq!(REFERENCES_BUILT.with(std::cell::Cell::get), before);
     }
+    #[test]
+    fn expanded_v2_table_roundtrips_and_rejects_v1_or_different_cache_keys() {
+        use crate::space::{CacheInfo, SpaceConfig, matmul_space_for};
+        let path =
+            std::env::temp_dir().join(format!("coffee-ten-replay-v2-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut config = config();
+        config.n = 4;
+        config.space = SpaceConfig::V2(Some(CacheInfo::new(64, 512, 8).unwrap()));
+        config.log = Some(path.clone());
+        let live = search(&config, &metadata()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let before = REFERENCES_BUILT.with(std::cell::Cell::get);
+        let replay = from_table(&config, &metadata(), &text).unwrap();
+        assert_eq!(
+            replay.records.len(),
+            matmul_space_for(4, 4, 4, config.space).len()
+        );
+        assert_eq!(
+            replay
+                .records
+                .iter()
+                .map(|r| &r.schedule)
+                .collect::<Vec<_>>(),
+            live.records.iter().map(|r| &r.schedule).collect::<Vec<_>>()
+        );
+        assert_eq!(replay.protocol.space, "v2");
+        assert!(
+            replay
+                .protocol
+                .to_json()
+                .contains("\"tile_factors\":[2,4,8,16,32,64,128]")
+        );
+        config.space = SpaceConfig::V1;
+        assert!(from_table(&config, &metadata(), &text).is_err());
+        config.space = SpaceConfig::V2(None);
+        assert!(from_table(&config, &metadata(), &text).is_err());
+        // Both caches produce the same candidate set at n=4, but remain different keys.
+        config.space = SpaceConfig::V2(Some(CacheInfo::new(128, 512, 8).unwrap()));
+        assert!(from_table(&config, &metadata(), &text).is_err());
+        assert_eq!(REFERENCES_BUILT.with(std::cell::Cell::get), before);
+    }
+
     #[test]
     fn every_protocol_field_is_enforced_even_with_reordered_json_keys() {
         let unchanged = change_first(|_| {});

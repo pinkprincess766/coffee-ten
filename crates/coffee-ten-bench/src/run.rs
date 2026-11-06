@@ -290,6 +290,7 @@ pub struct RoundSample {
 /// What is reported for one variant.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
+    pub space: crate::space::SpaceConfig,
     pub kernel: &'static str,
     /// Matrix size.
     pub n: usize,
@@ -330,6 +331,7 @@ pub fn make_record(
 ) -> Option<Record> {
     let rates: Vec<f64> = rounds.iter().map(|r| r.gflops).collect();
     Some(Record {
+        space: crate::space::SpaceConfig::V1,
         kernel: info.kernel,
         n: info.n,
         graph_hash: info.graph_hash,
@@ -868,6 +870,7 @@ mod tests {
     #[test]
     fn record_json_is_one_line_with_the_log_keys_in_order() {
         let record = Record {
+            space: crate::space::SpaceConfig::V1,
             kernel: "matmul",
             n: 256,
             graph_hash: 0x0123_4567_89ab_cdef,

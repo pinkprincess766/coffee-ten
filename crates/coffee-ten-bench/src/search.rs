@@ -29,7 +29,7 @@ use crate::log::append_lines;
 use crate::meta::Metadata;
 use crate::model::{Machine, Ranked, machine_from_results, rank_matmul, spearman};
 use crate::run::{Record, Reference, candidate_warmup, full_warmup, record_json, run};
-use crate::space::{Candidate, matmul_space, neighbors};
+use crate::space::{Candidate, SpaceConfig, matmul_space_for, neighbors};
 use crate::stats::{Rng, Stats, summarize};
 use coffee_ten_loop::Schedule;
 use std::collections::HashMap;
@@ -43,7 +43,7 @@ pub const DEFAULT_SAMPLES: usize = 5;
 pub const DEFAULT_MIN_SAMPLE_MS: u64 = 10;
 pub const SEARCH_USAGE: &str = "usage: coffee-ten-bench search --n <N> --budget <M> \
 [--seed <SEED>] [--samples <S>] [--min-sample-ms <MS>] [--log <path>] [--quick] \
-[--model-top <K> --from <results.jsonl>] [--local --from <results.jsonl>] [--replay <table.jsonl>]";
+[--model-top <K> --from <results.jsonl>] [--local --from <results.jsonl>] [--replay <table.jsonl>] [--space v1|v2]";
 /// Spec §7.1: the model's best must reach this fraction of the best random schedule.
 pub const CRITERION_RATIO: f64 = 0.9;
 
@@ -70,6 +70,7 @@ pub struct SearchConfig {
     pub local: bool,
     /// Offline random search over a complete compatible measurement table.
     pub replay: Option<PathBuf>,
+    pub space: SpaceConfig,
 }
 
 /// What a search measured.
@@ -163,6 +164,7 @@ fn measure_group(
         let mut record = timed
             .pop()
             .expect("invariant: time gives one record per variant");
+        record.space = config.space;
         if group == "naive" && index == 0 {
             record.reference_compilation = Some(reference.initial_compile);
         }
@@ -319,7 +321,14 @@ pub fn search(config: &SearchConfig, metadata: &Metadata) -> Result<Search, Benc
             "use replay::run for offline search".into(),
         ));
     }
-    let space = matmul_space(config.n, config.n, config.n);
+    if config.space != SpaceConfig::V1
+        && (config.local || config.model_top.is_some() || config.from.is_some())
+    {
+        return Err(BenchError::Usage(
+            "--space v2 currently supports random search/replay only".into(),
+        ));
+    }
+    let space = matmul_space_for(config.n, config.n, config.n, config.space);
     let space_size = space.len();
     // Ranked before anything is measured: a bad `--from` fails at once.
     let model_input = match &config.from {
@@ -425,6 +434,14 @@ pub fn curve_points(measured: usize) -> Vec<usize> {
 pub fn report(config: &SearchConfig, result: &Search, metadata: &Metadata) -> String {
     let mut text = String::new();
     let measured = result.records.len();
+    if config.space != SpaceConfig::V1 {
+        text.push_str(&config.space.description());
+        let _ = writeln!(
+            text,
+            "space hash {}",
+            crate::protocol::space_hash_for(config.n, config.space)
+        );
+    }
     if config.quick {
         let _ = writeln!(
             text,
@@ -651,6 +668,7 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
     let mut from = None;
     let mut local = false;
     let mut replay = None;
+    let mut space = SpaceConfig::V1;
     while let Some(flag) = args.next() {
         if flag == "--quick" {
             quick = true;
@@ -673,6 +691,7 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
             "--model-top" => model_top = Some(parse_number::<usize>(&flag, &value)?),
             "--from" => from = Some(PathBuf::from(value)),
             "--replay" => replay = Some(PathBuf::from(value)),
+            "--space" => space = SpaceConfig::from_arg(&value)?,
             _ => return Err(usage(format!("unknown argument {flag}"))),
         }
     }
@@ -707,6 +726,11 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
             "--replay currently supports random search only".into(),
         ));
     }
+    if space != SpaceConfig::V1 && (local || model_top.is_some() || from.is_some()) {
+        return Err(usage(
+            "--space v2 currently supports random search/replay only".into(),
+        ));
+    }
     if quick {
         samples = QUICK_SAMPLES;
         min_sample_ms = QUICK_MIN_SAMPLE_MS;
@@ -726,6 +750,7 @@ pub fn parse_search_args<I: IntoIterator<Item = String>>(
         from,
         local,
         replay,
+        space,
     })
 }
 
@@ -734,6 +759,7 @@ mod tests {
     use super::*;
     use crate::meta::UNKNOWN;
     use crate::run::{RunInfo, make_record};
+    use crate::space::matmul_space;
     use coffee_ten_loop::OrderClass;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -855,6 +881,7 @@ mod tests {
                 from: None,
                 local: false,
                 replay: None,
+                space: SpaceConfig::V1,
             }
         );
         let quick = parse(&["--n", "16", "--budget", "3", "--samples", "50", "--quick"]).unwrap();
@@ -903,6 +930,7 @@ mod tests {
             from: None,
             local: false,
             replay: None,
+            space: SpaceConfig::V1,
         };
         let metadata = test_metadata(config.seed);
         // `run` aborts with `BenchError::Mismatch` before timing a wrong variant, so an `Ok`
@@ -962,6 +990,7 @@ mod tests {
             from: None,
             local: false,
             replay: None,
+            space: SpaceConfig::V1,
         };
         let reference = Reference::new(&bench_config(&config)).unwrap();
         // The third one is fine, but it comes after the failing one.
@@ -1147,6 +1176,7 @@ mod tests {
             from: Some(PathBuf::from("peak.jsonl")),
             local: false,
             replay: None,
+            space: SpaceConfig::V1,
         };
         let result = Search {
             space_size: 100,
@@ -1248,6 +1278,7 @@ mod tests {
             from: Some(peak.clone()),
             local: true,
             replay: None,
+            space: SpaceConfig::V1,
         };
         let metadata = test_metadata(config.seed);
         let result = search(&config, &metadata).unwrap();
@@ -1322,6 +1353,7 @@ mod tests {
             from: Some(peak.clone()),
             local: false,
             replay: None,
+            space: SpaceConfig::V1,
         };
         let metadata = test_metadata(config.seed);
         let result = search(&config, &metadata).unwrap();
@@ -1402,6 +1434,7 @@ mod tests {
             from: Some(PathBuf::from("/nonexistent/peak.jsonl")),
             local: false,
             replay: None,
+            space: SpaceConfig::V1,
         };
         assert!(search(&config, &test_metadata(1)).is_err());
         assert!(!log.exists());

@@ -2,7 +2,7 @@
 use crate::{
     meta::Metadata,
     run::{Record, RunInfo, fnv1a_64, json_string},
-    space::matmul_space,
+    space::{CacheInfo, SpaceConfig, matmul_space, matmul_space_for},
 };
 use std::{
     collections::HashMap,
@@ -35,6 +35,30 @@ pub fn space_hash(n: usize) -> String {
         .clone()
 }
 
+/// V2 uses its own hash domain even when unavailable hardware yields the V1 candidates.
+pub fn space_hash_for(n: usize, config: SpaceConfig) -> String {
+    if config == SpaceConfig::V1 {
+        return space_hash(n);
+    }
+    static CACHE: OnceLock<Mutex<HashMap<(usize, SpaceConfig), String>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    cache
+        .entry((n, config))
+        .or_insert_with(|| {
+            let mut bytes = b"coffee-ten-matmul-space-v2\0".to_vec();
+            for c in matmul_space_for(n, n, n, config) {
+                bytes.extend_from_slice(&(c.schedule.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(c.schedule.as_bytes());
+                bytes.push(match c.class {
+                    coffee_ten_loop::OrderClass::Preserving => 0,
+                    coffee_ten_loop::OrderClass::Reordering => 1,
+                });
+            }
+            format!("{:016x}", fnv1a_64(&bytes))
+        })
+        .clone()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolKey {
     pub version: u32,
@@ -43,6 +67,8 @@ pub struct ProtocolKey {
     pub graph_hash: String,
     pub space: String,
     pub space_hash: String,
+    pub cache: Option<CacheInfo>,
+    pub tile_factors: Option<Vec<usize>>,
     pub source_hash: String,
     pub cpu: String,
     pub machine: String,
@@ -63,7 +89,7 @@ pub struct ProtocolKey {
 }
 impl ProtocolKey {
     pub fn for_record(r: &Record, m: &Metadata) -> Self {
-        Self::for_run(
+        Self::for_space(
             &RunInfo {
                 kernel: r.kernel,
                 n: r.n,
@@ -73,16 +99,22 @@ impl ProtocolKey {
             },
             r.samples,
             m,
+            r.space,
         )
     }
     pub fn for_run(r: &RunInfo, samples: usize, m: &Metadata) -> Self {
+        Self::for_space(r, samples, m, SpaceConfig::V1)
+    }
+    pub fn for_space(r: &RunInfo, samples: usize, m: &Metadata, space: SpaceConfig) -> Self {
         Self {
             version: VERSION,
             kernel: r.kernel.into(),
             n: r.n,
             graph_hash: format!("{:016x}", r.graph_hash),
-            space: "v1".into(),
-            space_hash: space_hash(r.n),
+            space: space.name().into(),
+            space_hash: space_hash_for(r.n, space),
+            cache: space.cache(),
+            tile_factors: (space != SpaceConfig::V1).then(|| space.tile_factors()),
             source_hash: SOURCE_HASH.into(),
             cpu: m.cpu_brand.clone(),
             machine: m.hw_model.clone(),
@@ -133,6 +165,20 @@ impl ProtocolKey {
             ("rustflags", &self.rustflags),
         ] {
             fields.push(format!("{}:{}", json_string(name), json_string(value)));
+        }
+        if let Some(factors) = &self.tile_factors {
+            fields.push(format!(
+                "\"cache\":{}",
+                self.cache.map_or("null".into(), CacheInfo::to_json)
+            ));
+            fields.push(format!(
+                "\"tile_factors\":[{}]",
+                factors
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
         }
         fields.extend([
             format!("\"samples\":{}", self.samples),

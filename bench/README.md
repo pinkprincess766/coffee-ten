@@ -32,6 +32,11 @@ Raw-round confidence intervals are available through the [bootstrap analysis API
 They leave the recorded aggregates and search behavior unchanged; report commands follow
 in N11/N12.
 
+`space` and random `search`/`search --replay` accept opt-in `--space v2` for additional
+[cache-derived tile candidates](../docs/cache-tiles.md). Without the flag the original
+space and seeded sample are preserved. V2 cache inputs/factors are recorded inside its
+protocol key; the top-level record field set remains the same.
+
 ## Result files
 
 A results file is JSONL: one JSON object per line, appended and never rewritten. Three kinds
