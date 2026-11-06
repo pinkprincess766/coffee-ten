@@ -35,6 +35,20 @@ fn raise_qos() {}
 
 /// `coffee-ten-bench space --n <N>`: lists the schedule space, measures nothing.
 fn space_main(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut args = args.peekable();
+    if args.peek().map(String::as_str) == Some("reduce") {
+        args.next();
+        return match coffee_ten_bench::space::reduce_command(args) {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     match parse_space_config_args(args) {
         Ok(config) => {
             let n = config.n;
