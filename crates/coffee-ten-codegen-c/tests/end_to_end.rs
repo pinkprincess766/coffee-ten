@@ -7,6 +7,74 @@ use coffee_ten_interp::{Tensor, run_f32};
 use coffee_ten_ir::{BinaryOp, Graph, NodeId, ReduceOp, Shape, UnaryOp};
 use coffee_ten_loop::lower;
 
+#[test]
+fn reduction_outer_loop_matches_the_interpreter_on_every_axis() {
+    use coffee_ten_loop::{OrderClass, Schedule, Step, apply_classified};
+    let dir = TempDir::new("outer-reduce");
+    for dims in [vec![7, 5], vec![2, 7, 5], vec![3, 1, 4], vec![7]] {
+        for axis in 0..dims.len() {
+            for op in [ReduceOp::Sum, ReduceOp::Max] {
+                let mut graph = Graph::new();
+                let x = graph.input("X", shape(&dims)).unwrap();
+                let y = graph.reduce_axis(op, x, axis as isize).unwrap();
+                let original = lower(&graph, y, "outer_reduce_test").unwrap();
+                let mut schedule = Schedule::default();
+                if axis + 1 < dims.len()
+                    && let Some((nest, update)) = original
+                        .nests
+                        .iter()
+                        .enumerate()
+                        .find(|(_, n)| n.loops.iter().any(|l| l.name == "r"))
+                {
+                    let mut order: Vec<_> = update
+                        .loops
+                        .iter()
+                        .filter(|l| l.name != "r")
+                        .map(|l| l.name.clone())
+                        .collect();
+                    order.insert(axis, "r".into());
+                    schedule.steps.push(Step::Reorder { nest, order });
+                }
+                let (scheduled, class) = apply_classified(&original, &schedule).unwrap();
+                assert_eq!(class, OrderClass::Preserving);
+                let original_c = compile(&original, &dir.0).unwrap();
+                let scheduled_c = compile(&scheduled, &dir.0).unwrap();
+                let inner: usize = dims[axis + 1..].iter().product();
+                let len: usize = dims.iter().product();
+                let out_len = len / dims[axis];
+                for mode in 0..if op == ReduceOp::Max { 3 } else { 2 } {
+                    let data: Vec<f32> = (0..len)
+                        .map(|i| {
+                            if mode == 1 {
+                                if i % 2 == 0 { -0.0 } else { 0.0 }
+                            } else if mode == 2 && i % 5 == 0 {
+                                f32::from_bits(0x7fc0_0123)
+                            } else {
+                                [1e20, -1e20, 1.0, 0.25, 0.125, -0.0625, -0.0]
+                                    [(i / inner % dims[axis]) % 7]
+                            }
+                        })
+                        .collect();
+                    let input = tensor(&dims, &data);
+                    let reference = run_f32(&graph, y, &[("X", &input)]).unwrap();
+                    for compiled in [&original_c, &scheduled_c] {
+                        let mut x = data.clone();
+                        let mut out = vec![f32::NAN; out_len];
+                        compiled.run(&mut [&mut x, &mut out]).unwrap();
+                        for (got, want) in out.iter().zip(reference.data()) {
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "{dims:?} axis {axis} {op:?} mode {mode}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A fresh cache dir, removed when dropped (also if the test panics).
 struct TempDir(PathBuf);
 

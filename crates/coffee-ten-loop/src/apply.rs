@@ -302,7 +302,9 @@ fn unroll(
 ///   The only dependence is then the reassociation of a sum into the same element, which
 ///   is exactly what the `Reordering` class allows. Other forms, like `T[I] * 2 + e` or an
 ///   overwrite `T[I] = e`, depend on the order of the iterations in a way that is not
-///   rounding, so they are refused.
+///   rounding, so they are refused. An accumulator-first `max(T[I], e)` is also legal
+///   only if the relative order of all reduction loops stays unchanged; this preserves
+///   NaN and signed-zero selection as well as ordinary values.
 ///
 /// Class: a loop is a reduction loop if its name is not in the store index (non-zero
 /// coefficient). The step is `Reordering` iff it changes the relative order of the
@@ -338,8 +340,16 @@ fn reorder(
         !target.index.iter().any(in_index)
     };
     let has_reduction = nest.loops.iter().any(|l| is_reduction(&l.name));
+    let before = nest.loops.iter().map(|l| l.name.as_str());
+    let after = order.iter().map(String::as_str);
+    let is_same_reduction_order = before
+        .filter(|name| is_reduction(name))
+        .eq(after.filter(|name| is_reduction(name)));
+    let ordered_max = matches!(value, Expr::Binary(BinaryOp::Max, a, b)
+        if matches!(a.as_ref(), Expr::Load(x) if x.buffer == target.buffer && same_index(x, target))
+        && !any_load(b, &|x| x.buffer == target.buffer));
     let is_value_legal = if has_reduction {
-        is_accumulation(value, target)
+        is_accumulation(value, target) || (is_same_reduction_order && ordered_max)
     } else {
         !any_load(value, &|x| is_other_element(x, target))
     };
@@ -349,11 +359,6 @@ fn reorder(
             nest: nest_no,
         });
     }
-    let before = nest.loops.iter().map(|l| l.name.as_str());
-    let after = order.iter().map(String::as_str);
-    let is_same_reduction_order = before
-        .filter(|name| is_reduction(name))
-        .eq(after.filter(|name| is_reduction(name)));
     let loops: Vec<Loop> = order
         .iter()
         .map(|name| {
@@ -1358,6 +1363,35 @@ mod tests {
             let k = ik_kernel(4, var("i"), value);
             assert_eq!(classified(&k, "reorder(0, k, i)").1, OrderClass::Preserving);
         }
+    }
+
+    #[test]
+    fn max_update_only_moves_independent_loops_without_reordering_reduction_steps() {
+        let k = ik_kernel(
+            4,
+            var("i"),
+            bin(BinaryOp::Max, load(2, vec![var("i")]), a_ik()),
+        );
+        assert_eq!(classified(&k, "reorder(0, k, i)").1, OrderClass::Preserving);
+        assert_refused(
+            &k,
+            &schedule("split(0, k, ko, ki, 2); reorder(0, i, ki, ko)"),
+            ScheduleError::IllegalReorder { step: 1, nest: 0 },
+        );
+        let other = ik_kernel(
+            4,
+            var("i"),
+            bin(
+                BinaryOp::Max,
+                load(2, vec![var("i")]),
+                load(2, vec![var("i")]),
+            ),
+        );
+        assert_refused(
+            &other,
+            &schedule("reorder(0, k, i)"),
+            ScheduleError::IllegalReorder { step: 0, nest: 0 },
+        );
     }
 
     #[test]

@@ -27,6 +27,8 @@ use std::fmt::Write as _;
 
 mod cache;
 pub use cache::{CacheInfo, SpaceConfig};
+mod reduce;
+pub use reduce::{enumerate_reduce, reduce_command};
 
 /// Tile factors tried per loop; a loop can also stay unsplit.
 pub const TILE_FACTORS: [usize; 5] = [8, 16, 32, 64, 128];
