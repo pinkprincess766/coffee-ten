@@ -65,6 +65,7 @@ impl PyTensor {
 
     fn binary(op: BinaryOp, a: &PyTensor, b: &PyTensor) -> PyResult<PyTensor> {
         let shape = a.shape.broadcast(&b.shape).map_err(value_error)?;
+        check_shape_size(&shape)?;
         let depth = check_depth(a.depth.max(b.depth) + 1)?;
         let expr = Expr::Binary(op, Arc::clone(&a.expr), Arc::clone(&b.expr));
         Ok(PyTensor {
@@ -85,6 +86,7 @@ impl PyTensor {
                 }));
             }
         };
+        check_shape_size(&shape)?;
         let depth = check_depth(a.depth.max(b.depth) + 1)?;
         let expr = Expr::MatMul(Arc::clone(&a.expr), Arc::clone(&b.expr));
         Ok(PyTensor {
@@ -113,6 +115,23 @@ fn check_depth(depth: usize) -> PyResult<usize> {
         )));
     }
     Ok(depth)
+}
+
+/// Reject impossible dense element counts while the expression is built. Any zero
+/// dimension makes the tensor empty, irrespective of dimension order.
+fn check_shape_size(shape: &Shape) -> PyResult<()> {
+    if !shape.dims().contains(&0)
+        && shape
+            .dims()
+            .iter()
+            .try_fold(1usize, |size, &dim| size.checked_mul(dim))
+            .is_none()
+    {
+        return Err(PyValueError::new_err(format!(
+            "shape {shape} has too many elements"
+        )));
+    }
+    Ok(())
 }
 
 fn value_error(err: impl Display) -> PyErr {
@@ -209,6 +228,7 @@ fn input(name: String, shape: &Bound<'_, PyTuple>) -> PyResult<PyTensor> {
         })
         .collect::<PyResult<Vec<usize>>>()?;
     let shape = Shape::new(dims);
+    check_shape_size(&shape)?;
     let expr = Expr::Input {
         name,
         shape: shape.clone(),
