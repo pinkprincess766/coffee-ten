@@ -550,11 +550,16 @@ mod tests {
     #[test]
     fn second_compile_reuses_the_cached_library() {
         let dir = TempDir::new("cache");
+        let started = std::time::Instant::now();
         let first = compile(&matmul(), &dir.0).unwrap();
+        let cold_ns = started.elapsed().as_nanos();
+        let original_bytes = std::fs::read(first.library_path()).unwrap();
         let modified = std::fs::metadata(first.library_path())
             .and_then(|m| m.modified())
             .unwrap();
+        let started = std::time::Instant::now();
         let second = compile(&matmul(), &dir.0).unwrap();
+        let cached_ns = started.elapsed().as_nanos();
         let modified_again = std::fs::metadata(second.library_path())
             .and_then(|m| m.modified())
             .unwrap();
@@ -562,6 +567,49 @@ mod tests {
         assert!(second.cache_hit());
         assert_eq!(first.library_path(), second.library_path());
         assert_eq!(modified, modified_again);
+        assert_eq!(
+            original_bytes,
+            std::fs::read(second.library_path()).unwrap()
+        );
+        let (mut a, mut b) = matmul_inputs();
+        let inputs = (a.clone(), b.clone());
+        let mut cold = vec![f32::NAN; 8];
+        let mut cached = vec![f32::INFINITY; 8];
+        first.run(&mut [&mut a, &mut b, &mut cold]).unwrap();
+        second.run(&mut [&mut a, &mut b, &mut cached]).unwrap();
+        assert_eq!(
+            cold.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            cached.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(cold.iter().all(|v| v.is_finite()));
+        assert_eq!((a, b), inputs);
+        // Diagnostic only: host load and filesystem caching are not correctness contracts.
+        eprintln!("cache diagnostic: cold_ns={cold_ns}, cached_ns={cached_ns}");
+    }
+
+    #[test]
+    fn cache_key_tracks_source_flag_boundaries_order_and_compiler_version() {
+        let key = cache_key("source", &["-O2", "-ffp-contract=off"], "clang version 1");
+        assert_eq!(
+            key,
+            cache_key("source", &["-O2", "-ffp-contract=off"], "clang version 1")
+        );
+        for changed in [
+            cache_key(
+                "changed source",
+                &["-O2", "-ffp-contract=off"],
+                "clang version 1",
+            ),
+            cache_key("source", &["-O3", "-ffp-contract=off"], "clang version 1"),
+            cache_key("source", &["-ffp-contract=off", "-O2"], "clang version 1"),
+            cache_key("source", &["-O2", "-ffp-contract=off"], "clang version 2"),
+        ] {
+            assert_ne!(key, changed);
+        }
+        assert_ne!(
+            cache_key("source", &["ab", "c"], "clang"),
+            cache_key("source", &["a", "bc"], "clang")
+        );
     }
 
     #[test]
