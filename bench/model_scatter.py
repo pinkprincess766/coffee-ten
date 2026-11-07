@@ -22,7 +22,7 @@ PEAK = RES / "2026-10-21-561ede3-peak.jsonl"
 RUNS = [RES / "2026-10-21-hypothesis-a-run2.jsonl", RES / "2026-10-22-hypothesis-a-run3.jsonl"]
 ROW = re.compile(r"^\s*(\d+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+(\S+)\s+")
 VERSION = re.compile(r"analytic model (v[0-9.]+)")
-SUMMARY = re.compile(r"Spearman rank correlation ([0-9.]+); median \|ln\(predicted/measured\)\| "
+SUMMARY = re.compile(r"Spearman rank correlation (-?[0-9.]+); median \|ln\(predicted/measured\)\| "
                      r"([0-9.]+) \(a factor ([0-9.]+)\)")
 
 
