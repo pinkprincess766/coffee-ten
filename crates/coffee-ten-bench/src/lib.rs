@@ -4,6 +4,7 @@
 use std::fmt;
 
 pub mod cli;
+pub mod curves;
 mod json;
 mod local;
 pub mod log;

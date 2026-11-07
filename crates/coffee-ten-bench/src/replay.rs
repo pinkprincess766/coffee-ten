@@ -502,6 +502,49 @@ mod tests {
     }
 
     #[test]
+    fn multi_seed_csv_curves_reuse_the_validated_random_baseline() {
+        let text = table();
+        let before = REFERENCES_BUILT.with(std::cell::Cell::get);
+        let mut runs = Vec::new();
+        for seed in [1, 42, 999] {
+            let mut config = config();
+            config.seed = seed;
+            config.budget = 3;
+            runs.push(from_table(&config, &metadata(), text).unwrap());
+        }
+        let csv = crate::curves::csv(&runs).unwrap();
+        assert_eq!(csv.lines().count(), 1 + 3 * 4);
+        assert_eq!(csv, crate::curves::csv(&runs).unwrap());
+        for run in &runs {
+            let mut cost = run.naive.measurement_ns;
+            let mut best = run.naive.median;
+            for (step, row) in run.records.iter().enumerate() {
+                cost += row.measurement_ns;
+                best = best.max(row.median);
+                assert!(csv.lines().any(|line| line.starts_with(&format!(
+                    "{},{},{cost},",
+                    run.policy_seed,
+                    step + 1
+                ))));
+            }
+            let last = csv
+                .lines()
+                .find(|line| line.starts_with(&format!("{},3,", run.policy_seed)))
+                .unwrap();
+            assert_eq!(
+                last.split(',')
+                    .nth(4)
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+                    .to_bits(),
+                best.to_bits()
+            );
+        }
+        assert_eq!(REFERENCES_BUILT.with(std::cell::Cell::get), before);
+    }
+
+    #[test]
     fn every_protocol_field_is_enforced_even_with_reordered_json_keys() {
         let unchanged = change_first(|_| {});
         from_table(&config(), &metadata(), &unchanged).unwrap();
