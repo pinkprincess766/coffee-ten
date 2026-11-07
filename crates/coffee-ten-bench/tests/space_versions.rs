@@ -15,6 +15,25 @@ fn selected_hash(n: usize, seed: u64) -> String {
 }
 
 #[test]
+fn documented_schedule_space_anchors_match_computed_hashes_and_counts() {
+    let document = include_str!("../../../docs/schedule-space.md");
+    let mut anchors = 0;
+    for line in document.lines().filter(|line| line.starts_with("| v1 |")) {
+        let fields: Vec<_> = line.split('|').map(str::trim).collect();
+        assert_eq!(fields.len(), 6);
+        let n = fields[2].parse::<usize>().unwrap();
+        let count = fields[3].parse::<usize>().unwrap();
+        assert_eq!(matmul_space(n, n, n).len(), count, "documented n={n}");
+        assert_eq!(space_hash(n), fields[4], "documented n={n}");
+        anchors += 1;
+    }
+    assert_eq!(
+        anchors, 2,
+        "documentation must retain both baseline anchors"
+    );
+}
+
+#[test]
 fn default_space_and_seeded_sample_are_frozen_before_n5() {
     // Captured from main ee9393b before implementing N5. Changes need a separate,
     // explained baseline change, never a fixture update to accommodate V2.
