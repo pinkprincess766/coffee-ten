@@ -422,3 +422,16 @@ at commit `0b25b77` (checked on 2026-10-30).
 - **Not measured:** NumPy/Accelerate (it may use the matrix units; a comparison would not
   measure the compiler), multiple threads, N above 1024, other machines. L1 and L2
   sizes are assumed, not measured.
+
+## N20: complete V1 table, 7 November 2026
+
+The full default matmul N=256 space (7334 candidates plus naive, seed 1, five rounds)
+was acquired on the same Apple M5 with the current protocol and a clean source build.
+Best sequential median: **123.776 GFLOP/s**, first reached at candidate 732; the same
+winner is present in the first 1000 candidates. This is a new descriptive baseline,
+not a controlled speedup claim against runs 1-4, whose compiler builds and metadata differ.
+
+See [N20 methods, historical comparison and limitations](docs/n20-mac.md), the
+[generated N11 report](bench/results/2026-11-07-n20-v1-n256.report.md), and the
+[complete raw table](bench/results/2026-11-07-n20-v1-n256.jsonl).
+The default space hash remains `252d60d1d76478c7`; V2 is listed separately, not measured.

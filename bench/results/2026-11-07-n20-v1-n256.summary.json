@@ -1,0 +1,85 @@
+{
+  "checked_utc": "2026-11-07T08:55:18.640756+00:00",
+  "last_record_utc": "2026-11-07T07:54:11.722585+00:00",
+  "records": 7335,
+  "candidates": 7334,
+  "naive_gflops": 7.79547499342138,
+  "best_gflops": 123.77594881446109,
+  "best_step": 732,
+  "best_schedule": "split(1, i, io, ii, 32); split(1, j, jo, ji, 8); split(1, k, ko, ki, 8); reorder(1, io, ko, jo, ii, ki, ji); vectorize(1, ji)",
+  "measurement_ns": 452298467818,
+  "compilation_api_work_ns": 33174493428760,
+  "cache_hits": 2,
+  "cache_misses": 7333,
+  "raw_sha256": "e4766ae970b3b0267bc0167b7b9fd3217b3ed706554ee911bf562ac2eb680ac2",
+  "prefixes": [
+    {
+      "budget": 16,
+      "best_gflops": 39.707268478082185,
+      "best_step": 5
+    },
+    {
+      "budget": 64,
+      "best_gflops": 115.80382184472198,
+      "best_step": 23
+    },
+    {
+      "budget": 256,
+      "best_gflops": 118.84491390194593,
+      "best_step": 132
+    },
+    {
+      "budget": 1000,
+      "best_gflops": 123.77594881446109,
+      "best_step": 732
+    },
+    {
+      "budget": 7334,
+      "best_gflops": 123.77594881446109,
+      "best_step": 732
+    }
+  ],
+  "run1_schedule_prefix_matches": true,
+  "historical": [
+    {
+      "run": "A1",
+      "seed": 1,
+      "budget": 1000,
+      "naive": 7.811581450452829,
+      "best_random": 108.84123025507446,
+      "best_model": 77.12570974462784,
+      "clang": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+      "os": "27.0.1"
+    },
+    {
+      "run": "A2",
+      "seed": 2,
+      "budget": 1000,
+      "naive": 7.718394111332618,
+      "best_random": 113.2878058662165,
+      "best_model": 121.00673585204498,
+      "clang": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+      "os": "27.0.1"
+    },
+    {
+      "run": "A3",
+      "seed": 3,
+      "budget": 1000,
+      "naive": 7.425235103231804,
+      "best_random": 87.0217931722401,
+      "best_model": 118.04021201826401,
+      "clang": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+      "os": "27.0.1"
+    },
+    {
+      "run": "A4",
+      "seed": 5,
+      "budget": 1000,
+      "naive": 7.7807625129478675,
+      "best_random": 119.34982912543582,
+      "best_model": 120.88644883527729,
+      "clang": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+      "os": "27.2"
+    }
+  ]
+}
