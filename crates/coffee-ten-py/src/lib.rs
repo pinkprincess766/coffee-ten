@@ -401,10 +401,27 @@ fn read_input(name: &str, value: &Bound<'_, PyAny>) -> PyResult<DenseTensor<f32>
             "input {name} must have dtype float32, got {dtype}"
         )));
     }
-    let array = value.cast::<PyArrayDyn<f32>>()?.try_readonly()?;
-    let view: ndarray::ArrayViewD<'_, f32> = array.as_array();
-    let data: Vec<f32> = view.iter().copied().collect();
-    DenseTensor::new(Shape::new(view.shape().to_vec()), data).map_err(value_error)
+    let typed = value.cast::<PyArrayDyn<f32>>()?;
+    let shape = Shape::new(typed.shape().to_vec());
+    // Empty arrays have no data to borrow. Their pointer may be unaligned, and
+    // constructing an ndarray view would still require an aligned pointer.
+    if shape.dims().contains(&0) {
+        return DenseTensor::new(shape, Vec::new()).map_err(value_error);
+    }
+    let array = typed.try_readonly()?;
+    let itemsize = std::mem::size_of::<f32>() as isize;
+    let data = if typed.is_aligned() && typed.strides().iter().all(|s| s % itemsize == 0) {
+        let view: ndarray::ArrayViewD<'_, f32> = array.as_array();
+        view.iter().copied().collect()
+    } else {
+        // ndarray strides count elements, whereas NumPy permits arbitrary byte
+        // strides and unaligned data. Let NumPy copy those layouts in C order;
+        // keep the source read borrow alive until the copy has completed.
+        let contiguous = array.cast_array::<f32>(false)?;
+        let contiguous = contiguous.try_readonly()?;
+        contiguous.as_slice().map_err(value_error)?.to_vec()
+    };
+    DenseTensor::new(shape, data).map_err(value_error)
 }
 
 /// A kernel compiled by clang and loaded into this process; call it with the inputs.
