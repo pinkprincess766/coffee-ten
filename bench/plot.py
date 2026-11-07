@@ -61,7 +61,7 @@ def main():
     ax.set_xticks([64, 128, 256, 512, 1024], ["64", "128", "256", "512", "1024"])
     ax.set_xlabel("N")
     ax.set_ylabel("GFLOP/s (median, p25–p75)")
-    ax.set_title(f"matmul A @ B, single thread — {pathlib.Path(a.results).name}\n"
+    ax.set_title(f"matmul A @ B, single thread — {pathlib.Path(a.input).name}\n"
                  "hollow marker = drift (first/last 5 rounds differ by > 5%)", fontsize=10)
     ax.grid(alpha=0.3)
     ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
