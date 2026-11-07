@@ -209,6 +209,43 @@ pub fn bootstrap_paired_ratio(
     Ok(interval(estimate, a.len(), config, distribution))
 }
 
+/// Ratio of lower medians from independent runs. Equal round counters in separately
+/// acquired files do not establish pairing: draw each side independently by default.
+pub fn bootstrap_independent_ratio(
+    numerator: &[RoundSample],
+    denominator: &[RoundSample],
+    config: BootstrapConfig,
+) -> Result<BootstrapInterval, BootstrapError> {
+    if config.resamples == 0 {
+        return Err(BootstrapError::ZeroResamples);
+    }
+    let a = ordered(numerator)?;
+    let b = ordered(denominator)?;
+    let a_rates: Vec<_> = a.iter().map(|r| r.gflops).collect();
+    let b_rates: Vec<_> = b.iter().map(|r| r.gflops).collect();
+    let estimate = ratio(
+        summarize(&a_rates).unwrap().median,
+        summarize(&b_rates).unwrap().median,
+    )?;
+    let mut rng = Rng::new(config.seed);
+    let mut a_sample = vec![0.0; a.len()];
+    let mut b_sample = vec![0.0; b.len()];
+    let mut distribution = Vec::with_capacity(config.resamples);
+    for _ in 0..config.resamples {
+        for value in &mut a_sample {
+            *value = a_rates[draw_index(&mut rng, a.len())];
+        }
+        for value in &mut b_sample {
+            *value = b_rates[draw_index(&mut rng, b.len())];
+        }
+        distribution.push(ratio(
+            lower_median(&mut a_sample),
+            lower_median(&mut b_sample),
+        )?);
+    }
+    Ok(interval(estimate, a.len(), config, distribution))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +393,24 @@ mod tests {
             distribution,
         );
         assert_eq!((ci.lower, ci.upper), (2.0, 97.0));
+    }
+
+    #[test]
+    fn independent_runs_do_not_cancel_shared_counter_variation() {
+        let a = rounds(&[1.0, 2.0, 16.0, 32.0, 128.0]);
+        let config = BootstrapConfig {
+            resamples: 1000,
+            seed: 42,
+        };
+        let ci = bootstrap_independent_ratio(&a, &a, config).unwrap();
+        assert_eq!(ci.estimate, 1.0);
+        assert!(ci.lower < 1.0 && ci.upper > 1.0);
+        assert_eq!(ci, bootstrap_independent_ratio(&a, &a, config).unwrap());
+        assert_eq!(bootstrap_paired_ratio(&a, &a, config).unwrap().lower, 1.0);
+        let exact =
+            bootstrap_independent_ratio(&rounds(&[4.0; 3]), &rounds(&[2.0; 5]), config).unwrap();
+        assert_eq!((exact.estimate, exact.lower, exact.upper), (2.0, 2.0, 2.0));
+        assert!(bootstrap_independent_ratio(&[], &a, config).is_err());
+        assert!(bootstrap_independent_ratio(&a, &rounds(&[0.0]), config).is_err());
     }
 }

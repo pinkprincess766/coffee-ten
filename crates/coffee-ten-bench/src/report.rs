@@ -3,12 +3,14 @@ use crate::{
     BenchError,
     json::{self, Value},
     run::{RoundSample, fnv1a_64},
-    stats::{BootstrapConfig, bootstrap_median, drifted, summarize},
+    stats::{
+        BootstrapConfig, bootstrap_independent_ratio, bootstrap_median, bootstrap_paired_ratio,
+        drifted, summarize,
+    },
 };
 use std::fmt::Write as _;
 
-pub const USAGE: &str =
-    "usage: coffee-ten-bench report <run.jsonl> [--top <K>] [--seed <SEED>] [--resamples <B>]";
+pub const USAGE: &str = "usage: coffee-ten-bench report <run.jsonl> [--top <K>] [--seed <SEED>] [--resamples <B>]\n       coffee-ten-bench report --compare <A.jsonl> <B.jsonl> [--paired] [--seed <SEED>] [--resamples <B>]";
 
 #[derive(Debug)]
 pub(crate) struct Row {
@@ -245,24 +247,116 @@ pub fn markdown(text: &str, top: usize, bootstrap: BootstrapConfig) -> Result<St
 }
 
 pub fn command(args: impl IntoIterator<Item = String>) -> Result<String, BenchError> {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
+    let comparing = args.peek().map(String::as_str) == Some("--compare");
+    if comparing {
+        args.next();
+    }
     let path = args
         .next()
         .filter(|s| !s.starts_with('-'))
         .ok_or_else(|| error(USAGE))?;
+    let other = if comparing {
+        Some(
+            args.next()
+                .filter(|s| !s.starts_with('-'))
+                .ok_or_else(|| error(USAGE))?,
+        )
+    } else {
+        None
+    };
     let mut top = 10;
     let mut bootstrap = BootstrapConfig::default();
+    let mut paired = false;
     while let Some(flag) = args.next() {
+        if flag == "--paired" && comparing {
+            paired = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| error(format!("{flag} needs a value\n{USAGE}")))?;
         match flag.as_str() {
-            "--top" => top = value.parse().map_err(error)?,
+            "--top" if !comparing => top = value.parse().map_err(error)?,
             "--seed" => bootstrap.seed = value.parse().map_err(error)?,
             "--resamples" => bootstrap.resamples = value.parse().map_err(error)?,
             _ => return Err(error(format!("unknown argument {flag}\n{USAGE}"))),
         }
     }
     let text = std::fs::read_to_string(&path).map_err(|e| error(format!("{path}: {e}")))?;
-    markdown(&text, top, bootstrap)
+    if let Some(other) = other {
+        let other_text =
+            std::fs::read_to_string(&other).map_err(|e| error(format!("{other}: {e}")))?;
+        compare(&text, &other_text, bootstrap, paired)
+    } else {
+        markdown(&text, top, bootstrap)
+    }
+}
+
+fn best(rows: &[Row]) -> Result<&Row, BenchError> {
+    let mut best = &rows[0];
+    for row in &rows[1..] {
+        if row.protocol != best.protocol {
+            return Err(error("comparison requires exactly one protocol per file"));
+        }
+        if row.median > best.median {
+            best = row;
+        }
+    }
+    Ok(best)
+}
+
+/// Compare the first best observation of each file, never silently choosing a shared subset.
+/// `paired` is an explicit caller assertion of paired acquisition, not inferred from IDs.
+pub fn compare(
+    a: &str,
+    b: &str,
+    config: BootstrapConfig,
+    paired: bool,
+) -> Result<String, BenchError> {
+    let a_rows = read(a)?;
+    let b_rows = read(b)?;
+    let a_best = best(&a_rows)?;
+    let b_best = best(&b_rows)?;
+    if a_best.protocol != b_best.protocol {
+        return Err(error("protocol key mismatch between A and B"));
+    }
+    let bootstrap = if paired {
+        bootstrap_paired_ratio
+    } else {
+        bootstrap_independent_ratio
+    };
+    let ci = bootstrap(&a_best.rounds, &b_best.rounds, config).map_err(error)?;
+    let mut out = format!(
+        "# Run comparison\n\nA fingerprint: `{:016x}`. B fingerprint: `{:016x}`.\n\n",
+        fnv1a_64(a.as_bytes()),
+        fnv1a_64(b.as_bytes())
+    );
+    if a_best
+        .protocol
+        .get("quick")
+        .and_then(Value::boolean)
+        .map_err(error)?
+    {
+        out.push_str("**Quick smoke data; not a performance measurement.**\n\n");
+    }
+    writeln!(out, "Ratio: median(best A) / median(best B). 95% percentile bootstrap, {} resamples, seed {}, {} resampling.\n", config.resamples, config.seed, if paired { "paired (asserted by caller)" } else { "independent" }).unwrap();
+    out.push_str("| Run | Best schedule | Median GFLOP/s | Rounds | Drift |\n| --- | --- | ---: | ---: | --- |\n");
+    for (name, row) in [("A", a_best), ("B", b_best)] {
+        writeln!(
+            out,
+            "| {name} | {} | {:.6} | {} | {} |",
+            if row.schedule.is_empty() {
+                "(naive)".into()
+            } else {
+                cell(&row.schedule)
+            },
+            row.median,
+            row.rounds.len(),
+            row.drift
+        )
+        .unwrap();
+    }
+    writeln!(out, "\nMedian ratio A/B: {:.6}; 95% CI [{:.6}, {:.6}].\n\nIntervals are conditional on the selected winners and supplied rounds; they do not adjust for winner selection or independent process restarts.", ci.estimate, ci.lower, ci.upper).unwrap();
+    Ok(out)
 }

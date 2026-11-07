@@ -2,7 +2,8 @@
 
 mod bootstrap;
 pub use bootstrap::{
-    BootstrapConfig, BootstrapError, BootstrapInterval, bootstrap_median, bootstrap_paired_ratio,
+    BootstrapConfig, BootstrapError, BootstrapInterval, bootstrap_independent_ratio,
+    bootstrap_median, bootstrap_paired_ratio,
 };
 
 /// Rounds at each end of a run whose medians the drift check compares.
