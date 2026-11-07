@@ -113,6 +113,19 @@ fn search_main(args: impl Iterator<Item = String>) -> ExitCode {
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("report") {
+        args.next();
+        return match coffee_ten_bench::report::command(args) {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if args.peek().map(String::as_str) == Some("space") {
         args.next();
         return space_main(args);
