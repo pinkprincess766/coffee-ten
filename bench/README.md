@@ -58,6 +58,14 @@ It does not append live measurement records.
 
 ### Record fields
 
+`python3 bench/validate.py current.jsonl [...]` checks every record against the current
+C16/N1/N2 schema, including exact field sets and nested protocol/round/reference/peak
+objects. CI runs it on every bench-smoke output. The standard-library checker rejects
+missing/extra fields, duplicate JSON keys, nonfinite/nonpositive successful rates, invalid
+types and inconsistent aggregate/cost metadata. It deliberately targets current complete
+logs; older aggregate-only files remain readable by the existing historical-analysis tools.
+Regression tests run with `python3 -m unittest discover -s bench/tests -v`.
+
 The rows are in the order the keys are written. Every record has every field; the order and
 the key set are checked by a test in `crates/coffee-ten-bench/src/search.rs`, which reads
 this table, so change the table and the writer together. Writers: `harness` is `record_json`
@@ -127,7 +135,8 @@ standalone run, the files `bench/results/*-peak.jsonl` hold only this line. It h
 metadata fields. Every row in the table with type `stats` is an object `{"median", "p25",
 "p75", "min", "n"}` over `n` samples, in the unit of its field. Older files have fewer
 rows; each new kernel adds rows at the end, so the order below is the order of the newest
-file. These rows are not checked by a test.
+file. Current peak rows are checked by the CI schema validator; historical files with
+fewer fields are retained as historical data.
 
 | Field | Type | Unit | Meaning | Writer |
 | --- | --- | --- | --- | --- |
