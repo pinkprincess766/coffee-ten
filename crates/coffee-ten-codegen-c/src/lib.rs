@@ -19,7 +19,7 @@ pub enum CodegenError {
     DuplicateBuffer(String),
     /// A constant is NaN or infinite.
     NonFiniteConst(f32),
-    /// A name is a C keyword or a helper name, or a loop has the name of a buffer.
+    /// A name clashes with C, a helper, math.h when included, or a buffer shadowed by a loop.
     NameClash(String),
     /// A buffer has more elements than a C `long` index can address.
     BufferTooLarge(String),
@@ -91,6 +91,105 @@ const RESERVED: [&str; 41] = [
     "expf",
 ];
 
+// These object-like C99 math.h macros expand even in a parameter or loop declaration.
+const MATH_MACROS: &[&str] = &[
+    "HUGE_VAL",
+    "HUGE_VALF",
+    "HUGE_VALL",
+    "INFINITY",
+    "NAN",
+    "FP_INFINITE",
+    "FP_NAN",
+    "FP_NORMAL",
+    "FP_SUBNORMAL",
+    "FP_ZERO",
+    "FP_ILOGB0",
+    "FP_ILOGBNAN",
+    "MATH_ERRNO",
+    "MATH_ERREXCEPT",
+    "math_errhandling",
+];
+
+// Unlike parameters and local variables, a file-scope kernel function cannot shadow
+// math.h's typedefs, function declarations or function-like macros. Each function also
+// has the C99 float and long-double variants, with suffix f and l respectively.
+const MATH_FUNCTIONS: &[&str] = &[
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "cos",
+    "sin",
+    "tan",
+    "acosh",
+    "asinh",
+    "atanh",
+    "cosh",
+    "sinh",
+    "tanh",
+    "exp",
+    "exp2",
+    "expm1",
+    "frexp",
+    "ilogb",
+    "ldexp",
+    "log",
+    "log10",
+    "log1p",
+    "log2",
+    "logb",
+    "modf",
+    "scalbn",
+    "scalbln",
+    "cbrt",
+    "fabs",
+    "hypot",
+    "pow",
+    "sqrt",
+    "erf",
+    "erfc",
+    "lgamma",
+    "tgamma",
+    "ceil",
+    "floor",
+    "nearbyint",
+    "rint",
+    "lrint",
+    "llrint",
+    "round",
+    "lround",
+    "llround",
+    "trunc",
+    "fmod",
+    "remainder",
+    "remquo",
+    "copysign",
+    "nan",
+    "nextafter",
+    "nexttoward",
+    "fdim",
+    "fmax",
+    "fmin",
+    "fma",
+];
+
+const MATH_KERNEL_NAMES: &[&str] = &[
+    "float_t",
+    "double_t",
+    "fpclassify",
+    "signbit",
+    "isfinite",
+    "isinf",
+    "isnan",
+    "isnormal",
+    "isgreater",
+    "isgreaterequal",
+    "isless",
+    "islessequal",
+    "islessgreater",
+    "isunordered",
+];
+
 /// Emits `kernel` as one C99 function. Buffers that are stored to are `restrict` outputs;
 /// `restrict` is on outputs only, inputs are `const` and may alias each other.
 ///
@@ -130,6 +229,9 @@ pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
             }
         }
         scan_expr(&nest.body.value, &mut used)?;
+    }
+    if used.exp {
+        check_math_names(kernel)?;
     }
 
     let params: Vec<String> = kernel
@@ -222,6 +324,35 @@ fn check_name(name: &str) -> Result<(), CodegenError> {
     }
     if RESERVED.contains(&name) {
         return Err(CodegenError::NameClash(name.to_string()));
+    }
+    Ok(())
+}
+
+/// Only Exp includes math.h. Preserve names that work without that header, and local
+/// names that merely shadow one of its function declarations or typedefs.
+fn check_math_names(kernel: &Kernel) -> Result<(), CodegenError> {
+    let name = kernel.name.as_str();
+    if MATH_KERNEL_NAMES.contains(&name)
+        || MATH_FUNCTIONS.iter().any(|&function| {
+            name == function
+                || name.strip_suffix('f') == Some(function)
+                || name.strip_suffix('l') == Some(function)
+        })
+    {
+        return Err(CodegenError::NameClash(name.to_string()));
+    }
+    let names = std::iter::once(name)
+        .chain(kernel.buffers.iter().map(|b| b.name.as_str()))
+        .chain(
+            kernel
+                .nests
+                .iter()
+                .flat_map(|n| n.loops.iter().map(|l| l.name.as_str())),
+        );
+    for name in names {
+        if MATH_MACROS.contains(&name) {
+            return Err(CodegenError::NameClash(name.to_string()));
+        }
     }
     Ok(())
 }
@@ -753,6 +884,45 @@ mod tests {
         let mut k = exp_div();
         k.buffers[1].name = "expf".to_string();
         assert_eq!(emit_c(&k), Err(CodegenError::NameClash("expf".to_string())));
+    }
+
+    #[test]
+    fn math_header_names_are_rejected_only_where_they_collide() {
+        for name in ["NAN", "INFINITY", "HUGE_VALF", "FP_NAN", "math_errhandling"] {
+            let mut k = exp_div();
+            k.buffers[0].name = name.to_string();
+            assert_eq!(emit_c(&k), Err(CodegenError::NameClash(name.to_string())));
+            k.buffers[0].name = "A".to_string();
+            k.nests[0].loops[0].name = name.to_string();
+            k.nests[0].body.target.index[0].terms[0].0 = name.to_string();
+            // The expression has two loads; use a scalar Exp to keep this case independent.
+            k.nests[0].body.value = un(UnaryOp::Exp, Expr::Const(0.0));
+            assert_eq!(emit_c(&k), Err(CodegenError::NameClash(name.to_string())));
+        }
+        for name in ["NAN", "sin", "sqrtf", "fpclassify", "float_t"] {
+            let mut k = exp_div();
+            k.name = name.to_string();
+            assert_eq!(emit_c(&k), Err(CodegenError::NameClash(name.to_string())));
+        }
+    }
+
+    #[test]
+    fn non_exp_math_names_and_local_function_names_still_compile() {
+        for name in ["NAN", "INFINITY", "sin", "fpclassify", "float_t"] {
+            let mut k = kernel(
+                vec![buf(name, &[]), buf("Y", &[])],
+                vec![loop_nest(vec![], 1, vec![], load(0, vec![]))],
+            );
+            let expected = format!(
+                "void k(const float *{name}, float *restrict Y) {{\n    Y[0] = {name}[0];\n}}\n"
+            );
+            assert_eq!(emit_c(&k).unwrap(), expected);
+            assert_clang_accepts(&format!("non_exp_{name}"), &expected);
+            if !matches!(name, "NAN" | "INFINITY") {
+                k.nests[0].body.value = un(UnaryOp::Exp, load(0, vec![]));
+                assert_clang_accepts(&format!("exp_local_{name}"), &emit_c(&k).unwrap());
+            }
+        }
     }
 
     #[test]
