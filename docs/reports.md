@@ -31,3 +31,21 @@ rendering. Malformed inputs fail without partial output.
 
 The saved synthetic fixture `crates/coffee-ten-bench/tests/fixtures/report.jsonl` is
 checked against a Markdown golden through both the API and the actual command in CI.
+
+## Comparing runs (N12)
+
+```sh
+cargo run --release -p coffee-ten-bench -- report --compare A.jsonl B.jsonl
+```
+
+Each file must contain exactly one N2 protocol key, and the keys must be equal in full.
+Mixed-key files are rejected rather than silently choosing a compatible subset. The first
+row with the highest lower median is the winner of each file. The reported ratio is
+`median(best A) / median(best B)`, with the 95% bootstrap interval and both schedules.
+
+Separately acquired runs use **independent** resampling by default. Equal round indices
+across files do not establish paired observations. Use `--paired` only when the acquisition
+design actually paired the observations; this is an explicit caller assertion, printed in
+the report. Paired mode uses N4's shared-index resampling and checks matching index sets.
+`--seed` and `--resamples` apply to either mode. Neither interval corrects winner-selection
+bias or captures variation across process restarts. No search/acquisition behavior changes.

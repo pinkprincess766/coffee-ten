@@ -77,3 +77,50 @@ fn protocol_groups_do_not_pool_rounds_or_rank_incompatible_measurements() {
     // Stable tie order and top-k do not remove charges from rows outside the table.
     assert!(!out.contains("split(1, j"));
 }
+
+#[test]
+fn compares_best_candidates_with_explicit_pairing_and_exact_protocol_match() {
+    let config = BootstrapConfig {
+        resamples: 1000,
+        seed: 42,
+    };
+    let b = include_str!("fixtures/report-b.jsonl");
+    let independent = report::compare(b, LOG, config, false).unwrap();
+    assert!(independent.contains("Median ratio A/B: 2.000000"));
+    assert!(independent.contains("independent resampling"));
+    assert!(!independent.contains("95% CI [2.000000, 2.000000]"));
+    assert_eq!(independent, report::compare(b, LOG, config, false).unwrap());
+    let paired = report::compare(b, LOG, config, true).unwrap();
+    assert!(paired.contains("95% CI [2.000000, 2.000000]"));
+    assert!(paired.contains("paired (asserted by caller)"));
+    assert!(paired.contains("| A | vectorize(1, j)"));
+    for (before, after) in [
+        ("ffeeddccbbaa9988", "1111111111111111"),
+        ("0011223344556677", "1111111111111111"),
+        ("fixture CPU", "another CPU"),
+        (
+            "\"harness_profile\":\"release\"",
+            "\"harness_profile\":\"debug\"",
+        ),
+    ] {
+        let changed = LOG.replace(before, after);
+        assert_ne!(LOG, changed);
+        assert!(
+            report::compare(LOG, &changed, config, false)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol key mismatch")
+        );
+        assert!(report::compare(&format!("{LOG}{changed}"), LOG, config, false).is_err());
+    }
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/report.jsonl");
+    assert!(
+        report::command(
+            ["--compare", path, path, "--paired", "--resamples", "10"].map(str::to_string)
+        )
+        .unwrap()
+        .contains("95% CI [1.000000, 1.000000]")
+    );
+    assert!(report::command(["--compare", path].map(str::to_string)).is_err());
+    assert!(report::command(["--compare", path, path, "--top", "1"].map(str::to_string)).is_err());
+}
