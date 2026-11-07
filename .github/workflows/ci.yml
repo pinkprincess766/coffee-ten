@@ -91,16 +91,12 @@ jobs:
       - run: bench/run.sh --quick --sizes 64 --pause 0 --yes
       - name: Check the JSONL it wrote
         run: |
+          python3 -m unittest discover -s bench/tests -v
+          python3 bench/validate.py bench/results/quick-*.jsonl
           python3 - bench/results/quick-*.jsonl <<'EOF'
           import json, sys
-          paths = sys.argv[1:]
-          assert len(paths) == 1, paths
-          lines = open(paths[0]).read().splitlines()
-          records = [json.loads(line) for line in lines]
-          # One peak line, then 4 variants for each of 2 kernels at 1 size.
-          assert len(records) == 9, len(records)
-          assert records[0]["kind"] == "peak", records[0]
-          for r in records[1:]:
-              assert r["n"] == 64 and r["quick"] is True and r["verified"] is True, r
-          print(f"{paths[0]}: {len(records)} valid records")
+          assert len(sys.argv) == 2, sys.argv
+          records = [json.loads(line) for line in open(sys.argv[1])]
+          assert len(records) == 9 and records[0]["kind"] == "peak"
+          assert all(r["n"] == 64 and r["quick"] is True for r in records[1:])
           EOF
