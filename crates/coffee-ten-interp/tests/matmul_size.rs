@@ -40,3 +40,43 @@ fn zero_inner_dimension_checks_result_byte_capacity() {
         );
     }
 }
+
+#[test]
+fn empty_result_skips_even_an_enormous_row_count() {
+    let mut graph = Graph::new();
+    let a = graph.input("a", Shape::new(vec![usize::MAX, 0])).unwrap();
+    let b = graph.input("b", Shape::new(vec![0, 0])).unwrap();
+    let output = graph.matmul(a, b).unwrap();
+    let a = Tensor::new(Shape::new(vec![usize::MAX, 0]), Vec::<f32>::new()).unwrap();
+    let b = Tensor::new(Shape::new(vec![0, 0]), Vec::<f32>::new()).unwrap();
+    for threads in [1, 2] {
+        let out = run_f32_with_threads(&graph, output, &[("a", &a), ("b", &b)], threads).unwrap();
+        assert_eq!(out.shape().dims(), &[usize::MAX, 0]);
+        assert!(out.data().is_empty());
+        let out = run_f64_with_threads(&graph, output, &[("a", &a), ("b", &b)], threads).unwrap();
+        assert_eq!(out.shape().dims(), &[usize::MAX, 0]);
+        assert!(out.data().is_empty());
+    }
+}
+
+#[test]
+fn zero_k_nonempty_result_retains_positive_zero() {
+    let mut graph = Graph::new();
+    let a = graph.input("a", Shape::new(vec![2, 0])).unwrap();
+    let b = graph.input("b", Shape::new(vec![0, 3])).unwrap();
+    let output = graph.matmul(a, b).unwrap();
+    let a = Tensor::new(Shape::new(vec![2, 0]), Vec::<f32>::new()).unwrap();
+    let b = Tensor::new(Shape::new(vec![0, 3]), Vec::<f32>::new()).unwrap();
+    for threads in [1, 2] {
+        let out = run_f32_with_threads(&graph, output, &[("a", &a), ("b", &b)], threads).unwrap();
+        assert_eq!(
+            out.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vec![0u32; 6]
+        );
+        let out = run_f64_with_threads(&graph, output, &[("a", &a), ("b", &b)], threads).unwrap();
+        assert_eq!(
+            out.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vec![0u64; 6]
+        );
+    }
+}

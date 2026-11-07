@@ -121,7 +121,7 @@ pub enum InterpError {
         expected: usize,
         got: usize,
     },
-    /// The element count of this shape does not fit in `usize`.
+    /// The element count or evaluated result buffer size cannot be represented.
     TooLarge(Shape),
 }
 
@@ -325,10 +325,19 @@ fn evaluate_with_threads<T: Scalar>(
                         data,
                     }
                 }
-                Op::MatMul(a, b) => Tensor {
-                    shape: node.shape.clone(),
-                    data: matmul_threaded(operand(&values, *a), operand(&values, *b), threads),
-                },
+                Op::MatMul(a, b) => {
+                    let elements = numel(&node.shape)?;
+                    if elements
+                        .checked_mul(std::mem::size_of::<T>())
+                        .is_none_or(|bytes| bytes > isize::MAX as usize)
+                    {
+                        return Err(InterpError::TooLarge(node.shape.clone()));
+                    }
+                    Tensor {
+                        shape: node.shape.clone(),
+                        data: matmul_threaded(operand(&values, *a), operand(&values, *b), threads),
+                    }
+                }
                 Op::Reduce { op, x, axis } => Tensor {
                     shape: node.shape.clone(),
                     data: reduce_threaded(*op, operand(&values, *x), *axis, threads),
@@ -463,11 +472,14 @@ fn broadcast_strides(operand: &Shape, out: &Shape) -> Vec<usize> {
 /// roundings, never fused, and this is the order of the C kernel (init nest writes 0,
 /// update nest adds `A*B` with `k` ascending), so f32 results agree bit for bit.
 fn matmul<T: Scalar>(a: &Tensor<T>, b: &Tensor<T>) -> Vec<T> {
+    let (m, k) = (a.shape().dims()[0], a.shape().dims()[1]);
+    let n = b.shape().dims()[1];
+    if m == 0 || n == 0 {
+        return Vec::new();
+    }
     if a.data.iter().chain(&b.data).any(|x| !x.is_finite()) {
         return exceptional::matmul(a, b);
     }
-    let (m, k) = (a.shape().dims()[0], a.shape().dims()[1]);
-    let n = b.shape().dims()[1];
     let mut data = vec![T::zero(); m * n];
     // k blocks and k within each block remain ascending for every output element.
     // Update the output directly: no per-block accumulator or reassociation.
