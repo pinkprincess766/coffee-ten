@@ -136,6 +136,14 @@ The table acquisition order and first/subsequent warmup asymmetry remain relevan
 
 ## Offline replay (N3)
 
+N17's CI regression executes the public file-replay path twice with one policy seed,
+writing two independently created JSONL files from the same complete tiny table. It
+requires byte-for-byte equality of the entire files: no fields need to be ignored because
+replay records stored costs rather than newly measured time. The test checks input seed,
+policy seed, step count, unchanged input bytes and that replay builds no correctness
+references. A different policy seed must change the candidate sequence. The existing N3
+tests also cover several seeds and validate each sampled sequence against random search.
+
 `search --replay table.jsonl --n N --budget M --seed POLICY_SEED` reads a complete
 single-run random-search table: exactly one `naive` reference and one `random` record for
 every candidate of the keyed space (`v1` by default; pass `--space v2` for V2 data).

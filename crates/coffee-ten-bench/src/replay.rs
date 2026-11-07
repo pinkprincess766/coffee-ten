@@ -680,4 +680,82 @@ mod tests {
         assert!(run(&config, &metadata()).is_err());
         assert!(search(&config, &metadata()).is_err());
     }
+
+    #[test]
+    fn two_file_replays_with_one_seed_are_byte_identical() {
+        let directory = std::env::temp_dir().join(format!(
+            "coffee-ten-n17-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let input = directory.join("complete.jsonl");
+        let first = directory.join("first.jsonl");
+        let second = directory.join("second.jsonl");
+        let changed_seed = directory.join("changed-seed.jsonl");
+        std::fs::write(&input, table()).unwrap();
+        let before = REFERENCES_BUILT.with(std::cell::Cell::get);
+        let mut config = config();
+        config.budget = 3;
+        config.seed = 17;
+        config.replay = Some(input.clone());
+        config.log = Some(first.clone());
+        run(&config, &metadata()).unwrap();
+        config.log = Some(second.clone());
+        run(&config, &metadata()).unwrap();
+        let first_bytes = std::fs::read(&first).unwrap();
+        assert_eq!(first_bytes, std::fs::read(&second).unwrap());
+        let rows: Vec<_> = std::str::from_utf8(&first_bytes)
+            .unwrap()
+            .lines()
+            .map(|line| json::parse(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), config.budget);
+        for (step, row) in rows.iter().enumerate() {
+            assert_eq!(row.get("policy_seed").unwrap().uint::<u64>().unwrap(), 17);
+            assert_eq!(row.get("step").unwrap().uint::<usize>().unwrap(), step + 1);
+            assert_eq!(
+                row.get("protocol")
+                    .unwrap()
+                    .get("input_seed")
+                    .unwrap()
+                    .uint::<u64>()
+                    .unwrap(),
+                17
+            );
+        }
+        config.seed = 42;
+        config.log = Some(changed_seed.clone());
+        run(&config, &metadata()).unwrap();
+        let changed = std::fs::read_to_string(&changed_seed).unwrap();
+        let schedules = |text: &str| {
+            text.lines()
+                .map(|line| {
+                    json::parse(line)
+                        .unwrap()
+                        .get("schedule")
+                        .unwrap()
+                        .text()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            schedules(std::str::from_utf8(&first_bytes).unwrap()),
+            schedules(&changed)
+        );
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), table());
+        assert_eq!(REFERENCES_BUILT.with(std::cell::Cell::get), before);
+    }
 }
