@@ -1,0 +1,18 @@
+space v2  tile factors [8, 16, 32, 64, 128, 512]
+cache {"l1_bytes":65536,"l2_bytes":6291456,"line_bytes":128}
+space hash cb87764f049c4fea
+matmul 256x256x256, update nest 1
+candidates 7334  (dropped as illegal: 0)
+  preserving 7334
+  reordering 0
+first 10:
+  reorder(1, i, j, k)
+  reorder(1, i, k, j)
+  reorder(1, i, k, j); vectorize(1, j)
+  reorder(1, j, i, k)
+  reorder(1, j, k, i)
+  reorder(1, k, i, j)
+  reorder(1, k, i, j); vectorize(1, j)
+  reorder(1, k, j, i)
+  split(1, k, ko, ki, 8); reorder(1, i, j, ko, ki)
+  split(1, k, ko, ki, 8); reorder(1, i, ko, j, ki)

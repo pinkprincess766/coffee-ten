@@ -1,0 +1,166 @@
+{
+  "started_utc": "2026-11-07T06:41:53.940324+00:00",
+  "command": [
+    "caffeinate",
+    "-i",
+    "target/release/coffee-ten-bench",
+    "search",
+    "--n",
+    "256",
+    "--budget",
+    "7334",
+    "--seed",
+    "1",
+    "--samples",
+    "5",
+    "--min-sample-ms",
+    "10",
+    "--space",
+    "v1",
+    "--log",
+    "bench/results/2026-11-07-n20-v1-n256.jsonl"
+  ],
+  "conditions": {
+    "closed_apps": [
+      "Google Chrome",
+      "Grok Bot"
+    ],
+    "other_user_work": "none, per user",
+    "local_builds_and_tests": "completed before acquisition",
+    "residual_os_activity": "ordinary macOS services remain; not claimed noise-free"
+  },
+  "environment": [
+    {
+      "command": [
+        "git",
+        "rev-parse",
+        "HEAD"
+      ],
+      "status": 0,
+      "stdout": "d0dc132e208d25a38ed200fbdbe8c3a5cd219ee2",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "git",
+        "status",
+        "--porcelain",
+        "--untracked-files=no"
+      ],
+      "status": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sysctl",
+        "-n",
+        "hw.model"
+      ],
+      "status": 0,
+      "stdout": "Mac17,4",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sysctl",
+        "-n",
+        "machdep.cpu.brand_string"
+      ],
+      "status": 0,
+      "stdout": "Apple M5",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sysctl",
+        "-n",
+        "hw.memsize"
+      ],
+      "status": 0,
+      "stdout": "17179869184",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sysctl",
+        "-n",
+        "hw.l1dcachesize"
+      ],
+      "status": 0,
+      "stdout": "65536",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sysctl",
+        "-n",
+        "hw.l2cachesize"
+      ],
+      "status": 0,
+      "stdout": "6291456",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sysctl",
+        "-n",
+        "hw.cachelinesize"
+      ],
+      "status": 0,
+      "stdout": "128",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sw_vers",
+        "-productVersion"
+      ],
+      "status": 0,
+      "stdout": "27.2",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "clang",
+        "--version"
+      ],
+      "status": 0,
+      "stdout": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "pmset",
+        "-g",
+        "batt"
+      ],
+      "status": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=36307043)\t80%; AC attached; not charging present: true",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "pmset",
+        "-g",
+        "custom"
+      ],
+      "status": 0,
+      "stdout": "Battery Power:\n Sleep On Power Button 1\n lowpowermode         0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         2\n womp                 0\n networkoversleep     0\n sleep                1\n lessbright           1\n tcpkeepalive         1\n disksleep            10\nAC Power:\n Sleep On Power Button 1\n lowpowermode         0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         10\n womp                 1\n networkoversleep     0\n sleep                0\n tcpkeepalive         1\n disksleep            10",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "pmset",
+        "-g",
+        "therm"
+      ],
+      "status": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  ],
+  "acquisition_last_record_utc": "2026-11-07T07:54:11.722585+00:00",
+  "checked_after_exit_utc": "2026-11-07T08:55:18.640756+00:00",
+  "process_exit_code": 0
+}

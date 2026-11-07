@@ -1,0 +1,26 @@
+{
+  "scope": "TILE_FACTORS through matmul_space, excludes later V2 wrappers and unrelated helpers",
+  "current_commit": "d0dc132e208d25a38ed200fbdbe8c3a5cd219ee2",
+  "historical": [
+    {
+      "commit": "c435f89",
+      "v1_generator_identical": true,
+      "generator_block_sha256": "f81b10c5f70a25de77cdf94aa30f6daaedeb4ad673d6f1a039f7643e3f22b1f9"
+    },
+    {
+      "commit": "702dcf1",
+      "v1_generator_identical": true,
+      "generator_block_sha256": "f81b10c5f70a25de77cdf94aa30f6daaedeb4ad673d6f1a039f7643e3f22b1f9"
+    },
+    {
+      "commit": "726cc1d",
+      "v1_generator_identical": true,
+      "generator_block_sha256": "f81b10c5f70a25de77cdf94aa30f6daaedeb4ad673d6f1a039f7643e3f22b1f9"
+    },
+    {
+      "commit": "736d82f",
+      "v1_generator_identical": true,
+      "generator_block_sha256": "f81b10c5f70a25de77cdf94aa30f6daaedeb4ad673d6f1a039f7643e3f22b1f9"
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "2026-11-07-n20-v1-generator-provenance.json": {
+    "bytes": 895,
+    "sha256": "16eae5713e0ff14577ee955f5143314bf1c2e66e96b3fbead7ae8d414afde1e6"
+  },
+  "2026-11-07-n20-v1-n256.console.txt": {
+    "bytes": 2226,
+    "sha256": "c555e7f63116ab11d5274ee81c13bbb83a8d1601af055152a7dc5c37542f9b57"
+  },
+  "2026-11-07-n20-v1-n256.curves.csv": {
+    "bytes": 3328534,
+    "sha256": "960dec8b84bef2f207849661ca42c48545ffcb1bab86859c7d9fcee342ca66de"
+  },
+  "2026-11-07-n20-v1-n256.environment.json": {
+    "bytes": 4068,
+    "sha256": "0eac268ca9582010e91920f084bb7cb9a96cf3c47b5000a1ae89bc7c633327fe"
+  },
+  "2026-11-07-n20-v1-n256.historical.csv": {
+    "bytes": 807,
+    "sha256": "7ac617723df61c9dff2c992431c0973f5269a9c074e56dbb15dbb3efdc8fb428"
+  },
+  "2026-11-07-n20-v1-n256.jsonl": {
+    "bytes": 12999210,
+    "sha256": "e4766ae970b3b0267bc0167b7b9fd3217b3ed706554ee911bf562ac2eb680ac2"
+  },
+  "2026-11-07-n20-v1-n256.replay.txt": {
+    "bytes": 2080,
+    "sha256": "fb7646266066c9386f616a7769d8d01d37d835f20d2f94e089c653bba156b7b1"
+  },
+  "2026-11-07-n20-v1-n256.report.md": {
+    "bytes": 2609,
+    "sha256": "04abbda4650f70731629e44930d2c6079a78f738f0aca251ca5a41b818d5c98e"
+  },
+  "2026-11-07-n20-v1-n256.summary.json": {
+    "bytes": 2253,
+    "sha256": "768d76ecdf99436457fd911bed11d69b855ed38a31240721b31c0e435029b7d6"
+  },
+  "2026-11-07-n20-v2-n256-space.txt": {
+    "bytes": 568,
+    "sha256": "e74a7b56df06ad95e415fc58df29f78e40f79662de12ae9512d1dedcb0efd428"
+  }
+}
