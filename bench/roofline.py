@@ -67,7 +67,7 @@ def main():
     ax.set_ylim(0.8, peak * 1.6)
     ax.set_xlabel("arithmetic intensity, FLOP/byte (compulsory DRAM traffic: upper bound)")
     ax.set_ylabel("GFLOP/s (median)")
-    ax.set_title(f"matmul roofline, single thread — {pathlib.Path(a.results).name}\n"
+    ax.set_title(f"matmul roofline, single thread — {pathlib.Path(a.input).name}\n"
                  "ceilings: bench/peak medians of the same session; hollow = drift", fontsize=10)
     ax.grid(alpha=0.3, which="both")
     ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
