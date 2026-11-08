@@ -410,7 +410,11 @@ fn read_input(name: &str, value: &Bound<'_, PyAny>) -> PyResult<DenseTensor<f32>
     }
     let array = typed.try_readonly()?;
     let itemsize = std::mem::size_of::<f32>() as isize;
-    let data = if typed.is_aligned() && typed.strides().iter().all(|s| s % itemsize == 0) {
+    // rust-numpy 0.29 ndarray views are limited to 32 axes, even with NumPy 2.
+    let data = if typed.ndim() <= 32
+        && typed.is_aligned()
+        && typed.strides().iter().all(|s| s % itemsize == 0)
+    {
         let view: ndarray::ArrayViewD<'_, f32> = array.as_array();
         view.iter().copied().collect()
     } else {
