@@ -1564,9 +1564,17 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
             drifted += 1;
             continue;
         }
-        let n = number_after(line, "n").ok_or_else(|| bad("n"))? as usize;
+        let n = json::parse(line)
+            .and_then(|record| record.get("n")?.uint::<usize>())
+            .map_err(|_| bad("positive integer n"))?;
+        if n == 0 {
+            return Err(bad("positive integer n"));
+        }
         let schedule = string_after(line, "schedule").ok_or_else(|| bad("schedule"))?;
         let median = number_after(line, "median").ok_or_else(|| bad("median"))?;
+        if median <= 0.0 {
+            return Err(bad("positive median"));
+        }
         let prediction = predict_schedule(&machine, n, &schedule)?;
         let _ = writeln!(
             rows,
