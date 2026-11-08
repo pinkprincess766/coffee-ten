@@ -25,6 +25,12 @@ pub enum CodegenError {
     NameClash(String),
     /// A buffer has more elements than a C `long` index can address.
     BufferTooLarge(String),
+    /// A loop extent exceeds the C `long` counter's representable range.
+    LoopTooLarge {
+        nest: usize,
+        loop_name: String,
+        extent: usize,
+    },
 }
 
 impl fmt::Display for CodegenError {
@@ -36,6 +42,14 @@ impl fmt::Display for CodegenError {
             Self::NonFiniteConst(value) => write!(f, "constant {value} is not finite"),
             Self::NameClash(name) => write!(f, "name {name} clashes with C or another name"),
             Self::BufferTooLarge(name) => write!(f, "buffer {name} is too large to index"),
+            Self::LoopTooLarge {
+                nest,
+                loop_name,
+                extent,
+            } => write!(
+                f,
+                "nest {nest}: loop {loop_name} extent {extent} exceeds the C long limit"
+            ),
         }
     }
 }
@@ -222,9 +236,17 @@ pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
         }
     }
     let mut used = Helpers::default();
-    for nest in &kernel.nests {
+    for (nest_no, nest) in kernel.nests.iter().enumerate() {
         for l in &nest.loops {
             check_name(&l.name)?;
+            // Even an unused loop counter must stop before its increment overflows.
+            if i64::try_from(l.extent).is_err() {
+                return Err(CodegenError::LoopTooLarge {
+                    nest: nest_no,
+                    loop_name: l.name.clone(),
+                    extent: l.extent,
+                });
+            }
             // A loop variable with a buffer's name would shadow the parameter.
             if kernel.buffers.iter().any(|b| b.name == l.name) {
                 return Err(CodegenError::NameClash(l.name.clone()));
