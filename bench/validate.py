@@ -146,6 +146,13 @@ def validate(value):
         rate(value[name], name)
         require(value[name] == rates[index], f"{name} differs from raw rounds")
     require(value["measurement_ns"] == sum(sample["elapsed_ns"] for sample in raw), "measurement cost differs from rounds")
+    # Keep the live harness rule: disjoint five-round windows, strictly over 5%.
+    drift = False
+    if len(raw) >= 10:
+        first = sorted(sample["gflops"] for sample in raw[:5])[2]
+        last = sorted(sample["gflops"] for sample in raw[-5:])[2]
+        drift = abs(last - first) / first > 0.05
+    require(value["drift"] == drift, "drift differs from raw rounds")
 
 
 def unique_object(pairs):
