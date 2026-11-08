@@ -80,6 +80,34 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "minimum"):
             schema.validate(bad)
 
+    def test_drift_flag_matches_ordered_window_medians(self):
+        patterns = [
+            ([100] * 9, False),  # Two disjoint windows require ten rounds.
+            ([100] * 5 + [105] * 5, False),
+            ([100] * 5 + [95] * 5, False),
+            ([100] * 5 + [106] * 5, True),
+            ([100] * 5 + [94] * 5, True),
+            ([1, 100, 100, 100, 100, 100, 100, 100, 100, 1000], False),
+        ]
+        for rates, expected in patterns:
+            row = copy.deepcopy(self.row)
+            row["samples"] = row["protocol"]["samples"] = len(rates)
+            row["rounds"] = [dict(round_index=i, elapsed_ns=16_000_000,
+                                  iterations=rate * 1_000_000, gflops=float(rate))
+                             for i, rate in enumerate(rates)]
+            row["measurement_ns"] = sum(s["elapsed_ns"] for s in row["rounds"])
+            ordered = sorted(rates)
+            last = len(rates) - 1
+            for field, index in [("min", 0), ("p25", last // 4),
+                                 ("median", last // 2), ("p75", 3 * last // 4)]:
+                row[field] = float(ordered[index])
+            row["drift"] = expected
+            with self.subTest(rates=rates, flag=expected):
+                schema.validate(row)
+            row["drift"] = not expected
+            with self.subTest(rates=rates, flag=not expected), self.assertRaisesRegex(ValueError, "drift"):
+                schema.validate(row)
+
     def test_strict_json_and_file_line_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "input.jsonl"
