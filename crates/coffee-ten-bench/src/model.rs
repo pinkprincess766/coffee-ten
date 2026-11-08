@@ -1717,8 +1717,11 @@ pub fn cli_main<I: IntoIterator<Item = String>>(args: I) -> std::process::ExitCo
             // --peak: the machine comes from that file's peak line instead of --from's.
             let mut text = String::new();
             if let Some(peak) = &peak {
+                let peak_text = read_results(peak)?;
+                // Validate the selected source before adding a run with its own peak.
+                machine_from_results(&peak_text)?;
                 text.extend(
-                    read_results(peak)?
+                    peak_text
                         .lines()
                         .filter(|l| l.contains("\"kind\":\"peak\""))
                         .map(|l| format!("{l}\n")),
