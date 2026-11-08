@@ -14,6 +14,21 @@ with patch.object(sys, "path", [str(BENCH), *sys.path]):
 
 
 class ModelScatterTests(unittest.TestCase):
+    def test_failed_comparison_cleans_temporary_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            peak, run = Path(directory) / "peak.jsonl", Path(directory) / "run.jsonl"
+            scratch = Path(directory) / "scratch"
+            scratch.mkdir()
+            peak.write_text('{"kind":"peak"}\n')
+            for text, error in [('{"group":"random"}\n', subprocess.CalledProcessError),
+                                ('{broken}\n', ValueError)]:
+                run.write_text(text)
+                with self.subTest(text=text), patch.object(scatter.tempfile, "tempdir", str(scratch)), patch.object(
+                    scatter.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "bench")
+                ), self.assertRaises(error):
+                    scatter.compare(["bench"], peak, run)
+                self.assertEqual(list(scratch.iterdir()), [], "failed comparison leaked temporary data")
+
     def test_compare_accepts_signed_spearman_from_successful_tool_output(self):
         with tempfile.TemporaryDirectory() as directory:
             peak, run = Path(directory) / "peak.jsonl", Path(directory) / "run.jsonl"
