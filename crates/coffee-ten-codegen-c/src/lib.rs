@@ -1,8 +1,9 @@
 //! C99 backend for coffee-ten: prints a loop IR kernel as one C function.
 
 use coffee_ten_loop::{
-    Access, AffineExpr, BinaryOp, Buffer, Expr, Kernel, LoopIrError, LoopNest, UnaryOp,
+    Access, AffineExpr, BinaryOp, Buffer, Expr, Guard, Kernel, LoopIrError, LoopNest, UnaryOp,
 };
+use std::collections::BTreeMap;
 use std::fmt;
 
 mod compile;
@@ -25,6 +26,8 @@ pub enum CodegenError {
     NameClash(String),
     /// A buffer has more elements than a C `long` index can address.
     BufferTooLarge(String),
+    /// A raw affine product or prefix sum may overflow a C `long`.
+    AffineOverflow(String),
 }
 
 impl fmt::Display for CodegenError {
@@ -36,6 +39,9 @@ impl fmt::Display for CodegenError {
             Self::NonFiniteConst(value) => write!(f, "constant {value} is not finite"),
             Self::NameClash(name) => write!(f, "name {name} clashes with C or another name"),
             Self::BufferTooLarge(name) => write!(f, "buffer {name} is too large to index"),
+            Self::AffineOverflow(expr) => {
+                write!(f, "affine expression may overflow a C long: {expr}")
+            }
         }
     }
 }
@@ -204,6 +210,10 @@ const MATH_KERNEL_NAMES: &[&str] = &[
 /// `phi <16 x float>` in the optimized IR), Apple clang 21 and LLVM 22 keep it in registers.
 /// The same kernel with row pointers gets 4 `phi <16 x float>` on all five versions.
 /// Rank 0 and 1 stay `float *`.
+///
+/// Affine products and sums must fit a C `long` at every intermediate operation.
+/// This conservative interval check accounts for preceding single-variable guards;
+/// a final in-bounds affine result alone does not prove that its C evaluation is safe.
 pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
     kernel.validate().map_err(CodegenError::Invalid)?;
     check_name(&kernel.name)?;
@@ -234,6 +244,10 @@ pub fn emit_c(kernel: &Kernel) -> Result<String, CodegenError> {
     }
     if used.exp {
         check_math_names(kernel)?;
+    }
+
+    for nest in &kernel.nests {
+        check_affine_arithmetic(nest)?;
     }
 
     let params: Vec<String> = kernel
@@ -357,6 +371,136 @@ fn check_math_names(kernel: &Kernel) -> Result<(), CodegenError> {
         }
     }
     Ok(())
+}
+
+// Inclusive loop-value ranges at the current point of evaluation. A guard may only
+// tighten ranges after its own arithmetic has been checked.
+type AffineRanges<'a> = BTreeMap<&'a str, (i128, i128)>;
+
+fn check_affine_arithmetic(nest: &LoopNest) -> Result<(), CodegenError> {
+    let mut ranges: AffineRanges<'_> = nest
+        .loops
+        .iter()
+        .map(|l| (l.name.as_str(), (0, (l.extent - 1) as i128)))
+        .collect();
+    for guard in &nest.guards {
+        check_affine(&guard.expr, &ranges)?;
+        narrow_affine_ranges(guard, &mut ranges);
+    }
+    check_access_arithmetic(&nest.body.target, &ranges)?;
+    check_expr_arithmetic(&nest.body.value, &ranges)
+}
+
+fn check_access_arithmetic(access: &Access, ranges: &AffineRanges<'_>) -> Result<(), CodegenError> {
+    for index in &access.index {
+        check_affine(index, ranges)?;
+    }
+    Ok(())
+}
+
+fn check_expr_arithmetic(expr: &Expr, ranges: &AffineRanges<'_>) -> Result<(), CodegenError> {
+    match expr {
+        Expr::Load(access) => check_access_arithmetic(access, ranges),
+        Expr::Const(_) => Ok(()),
+        Expr::Unary(_, x) => check_expr_arithmetic(x, ranges),
+        Expr::Binary(_, a, b) => {
+            check_expr_arithmetic(a, ranges)?;
+            check_expr_arithmetic(b, ranges)
+        }
+    }
+}
+
+/// Follow affine_long_c's actual C evaluation order: products first, then the
+/// left-associative term sums, then the constant. Bounds are conservative when
+/// a variable is repeated; cancellation cannot hide an unsafe raw intermediate.
+fn check_affine(expr: &AffineExpr, ranges: &AffineRanges<'_>) -> Result<(), CodegenError> {
+    let error = || CodegenError::AffineOverflow(expr.to_string());
+    let fits = |(lo, hi): (i128, i128)| {
+        if lo < i128::from(i64::MIN) || hi > i128::from(i64::MAX) {
+            Err(error())
+        } else {
+            Ok(())
+        }
+    };
+    let mut prefix = (0i128, 0i128);
+    let mut first = true;
+    for (name, coeff) in &expr.terms {
+        if *coeff == 0 {
+            continue;
+        }
+        let (lo, hi) = ranges[name.as_str()];
+        let coefficient = i128::from(*coeff);
+        // A leading minus is applied before multiplication. The signed MIN
+        // helper is also negative before multiplication, wherever it occurs.
+        // Every other negative term computes a positive product, then subtracts.
+        let signed_product = *coeff >= 0 || first || *coeff == i64::MIN;
+        let multiplier = if signed_product {
+            coefficient
+        } else {
+            -coefficient
+        };
+        let a = multiplier.checked_mul(lo).ok_or_else(error)?;
+        let b = multiplier.checked_mul(hi).ok_or_else(error)?;
+        let product = (a.min(b), a.max(b));
+        fits(product)?;
+        let term = if signed_product {
+            product
+        } else {
+            (-product.1, -product.0)
+        };
+        prefix = (
+            prefix.0.checked_add(term.0).ok_or_else(error)?,
+            prefix.1.checked_add(term.1).ok_or_else(error)?,
+        );
+        fits(prefix)?;
+        first = false;
+    }
+    prefix = (
+        prefix
+            .0
+            .checked_add(i128::from(expr.constant))
+            .ok_or_else(error)?,
+        prefix
+            .1
+            .checked_add(i128::from(expr.constant))
+            .ok_or_else(error)?,
+    );
+    fits(prefix)
+}
+
+/// Optional tightening for a guard with just one variable after merging terms.
+/// Unsupported or overflowing simplifications leave the old, safe overestimate.
+fn narrow_affine_ranges(guard: &Guard, ranges: &mut AffineRanges<'_>) {
+    let mut merged = BTreeMap::<&str, i128>::new();
+    for (name, coeff) in &guard.expr.terms {
+        let sum = merged.entry(name.as_str()).or_default();
+        let Some(next) = sum.checked_add(i128::from(*coeff)) else {
+            return;
+        };
+        *sum = next;
+    }
+    merged.retain(|_, c| *c != 0);
+    if merged.len() != 1 {
+        return;
+    }
+    let (name, coeff) = merged.into_iter().next().expect("one nonzero term");
+    // All inputs are i64, so this subtraction fits i128.
+    let slack = i128::from(guard.bound) - 1 - i128::from(guard.expr.constant);
+    let (lo, hi) = ranges.get_mut(name).expect("validated loop");
+    if coeff > 0 {
+        let upper = slack.div_euclid(coeff);
+        if upper >= *lo {
+            *hi = (*hi).min(upper);
+        }
+    } else if let Some(magnitude) = coeff.checked_neg() {
+        // -m*x <= slack => x >= ceil(-slack/m).
+        let numerator = -slack;
+        let lower =
+            numerator.div_euclid(magnitude) + i128::from(numerator.rem_euclid(magnitude) != 0);
+        if lower <= *hi {
+            *lo = (*lo).max(lower);
+        }
+    }
 }
 
 fn indent(level: usize) -> String {
