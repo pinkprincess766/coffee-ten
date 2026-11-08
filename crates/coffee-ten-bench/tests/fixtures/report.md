@@ -1,6 +1,6 @@
 # Run report
 
-Input fingerprint: `9214d54cb4c0647c`.
+Input fingerprint: `cd0e590f0c28fdc1`.
 
 95% percentile bootstrap: 257 resamples, seed 42. Intervals describe supplied rounds, not process restarts or winner-selection uncertainty.
 
@@ -15,7 +15,7 @@ Input fingerprint: `9214d54cb4c0647c`.
 
 **Quick smoke data; not a performance measurement.**
 
-Records: 3. Measurement: 56 ns. Compilation API work: 650 ns (includes reference; summed work, not wall time).
+Records: 3. Measurement: 56000000 ns. Compilation API work: 650 ns (includes reference; summed work, not wall time).
 
 | Rank | Group | Schedule | Median GFLOP/s | 95% CI | Rounds | Drift |
 | --- | --- | --- | ---: | --- | ---: | --- |

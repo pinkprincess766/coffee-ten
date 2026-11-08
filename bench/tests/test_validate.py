@@ -64,12 +64,21 @@ class SchemaTests(unittest.TestCase):
             bad[field] = value
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 schema.validate(bad)
+
         for field, value in [("round_index", True), ("round_index", 1),
                              ("elapsed_ns", 0), ("iterations", -1), ("gflops", float("inf"))]:
             bad = copy.deepcopy(self.row)
             bad["rounds"][0][field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
                 schema.validate(bad)
+
+    def test_rounds_must_meet_the_declared_minimum_duration(self):
+        bad = copy.deepcopy(self.row)
+        bad["protocol"]["min_sample_ms"] = max(
+            sample["elapsed_ns"] for sample in bad["rounds"]
+        ) // 1_000_000 + 1
+        with self.assertRaisesRegex(ValueError, "minimum"):
+            schema.validate(bad)
 
     def test_strict_json_and_file_line_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:

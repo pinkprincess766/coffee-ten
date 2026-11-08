@@ -137,6 +137,8 @@ def validate(value):
         require(sample["round_index"] == index, "wrong round order")
         for name in ("elapsed_ns", "iterations"):
             uint(sample[name], name, positive=True)
+        require(sample["elapsed_ns"] >= key["min_sample_ms"] * 1_000_000,
+                "raw round is below the protocol minimum duration")
         rate(sample["gflops"], "gflops")
     rates = sorted(sample["gflops"] for sample in raw)
     last = len(rates) - 1
