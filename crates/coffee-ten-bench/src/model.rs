@@ -34,6 +34,7 @@
 
 use crate::BenchError;
 use crate::cli::MAX_N;
+use crate::json;
 use crate::space::matmul_space;
 use crate::stats::summarize;
 use coffee_ten_ir::{Graph, Shape};
@@ -1128,44 +1129,38 @@ const USAGE: &str = "usage: coffee-ten-bench model --n <N> [--from <results.json
        compare: --peak takes the machine from that file's peak line (for results files without \
      one); --group keeps only records whose \"group\" field equals <name> (e.g. random)";
 
-/// The text after `"key":` in a JSON line. The log lines are flat, plus the `{"median":..}`
-/// objects of the peak line, so this finds the key and is not a JSON parser.
-fn after_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let pattern = format!("\"{key}\":");
-    let start = line.find(&pattern)? + pattern.len();
-    Some(&line[start..])
-}
-
-/// The number after `"key":`; `None` for a missing key or `null`.
+/// Read a numeric field without depending on JSON spacing or key order.
 fn number_after(line: &str, key: &str) -> Option<f64> {
-    let rest = after_key(line, key)?;
-    rest[..rest.find([',', '}']).unwrap_or(rest.len())]
-        .trim()
-        .parse()
-        .ok()
+    json::parse(line).ok()?.get(key).ok()?.number().ok()
 }
 
 /// `"median"` inside the object `"key":{...}`.
 fn median_after(line: &str, key: &str) -> Option<f64> {
-    let rest = after_key(line, key)?;
-    number_after(&rest[..rest.find('}')?], "median")
+    json::parse(line)
+        .ok()?
+        .get(key)
+        .ok()?
+        .get("median")
+        .ok()?
+        .number()
+        .ok()
 }
 
-/// The string after `"key":`, with `\"`, `\\`, `\n`, `\t` unescaped (as `json_string` writes).
+/// Read a decoded string, including standard JSON escapes.
 fn string_after(line: &str, key: &str) -> Option<String> {
-    let mut chars = after_key(line, key)?.strip_prefix('"')?.chars();
-    let mut out = String::new();
-    loop {
-        match chars.next()? {
-            '"' => return Some(out),
-            '\\' => out.push(match chars.next()? {
-                'n' => '\n',
-                't' => '\t',
-                other => other,
-            }),
-            c => out.push(c),
-        }
-    }
+    Some(
+        json::parse(line)
+            .ok()?
+            .get(key)
+            .ok()?
+            .text()
+            .ok()?
+            .to_owned(),
+    )
+}
+
+fn is_peak_line(line: &str) -> bool {
+    string_after(line, "kind").as_deref() == Some("peak")
 }
 
 /// The machine of the `"kind":"peak"` line of a results file, and whether its `mem_acc` and
@@ -1180,7 +1175,7 @@ fn string_after(line: &str, key: &str) -> Option<String> {
 pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchError> {
     let line = text
         .lines()
-        .find(|line| line.contains("\"kind\":\"peak\""))
+        .find(|line| is_peak_line(line))
         .ok_or_else(|| model_err("no peak line (\"kind\":\"peak\") in the results".to_string()))?;
     let median = |key: &str| {
         median_after(line, key)
@@ -1224,34 +1219,34 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
 /// Whether the peak line of `text` has `fma_mem_acc_scalar_unrolled_gflops`; without it
 /// `mem_acc_scalar_unrolled_gflops` is `PLACEHOLDER_MEM_ACC_SCALAR_UNROLLED_GFLOPS`.
 pub fn scalar_unrolled_measured(text: &str) -> bool {
-    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    let line = text.lines().find(|line| is_peak_line(line));
     line.is_some_and(|line| median_after(line, "fma_mem_acc_scalar_unrolled_gflops").is_some())
 }
 
 /// Whether the peak line of `text` has `fma_col_reload_gflops`; without it `col_reload_gflops` is
 /// `PLACEHOLDER_COL_RELOAD_GFLOPS`.
 pub fn col_reload_measured(text: &str) -> bool {
-    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    let line = text.lines().find(|line| is_peak_line(line));
     line.is_some_and(|line| median_after(line, "fma_col_reload_gflops").is_some())
 }
 
 /// Whether the peak line of `text` has `fma_col_unrolled_gflops`; without it
 /// `col_unrolled_gflops` is `PLACEHOLDER_COL_UNROLLED_GFLOPS`.
 pub fn col_unrolled_measured(text: &str) -> bool {
-    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    let line = text.lines().find(|line| is_peak_line(line));
     line.is_some_and(|line| median_after(line, "fma_col_unrolled_gflops").is_some())
 }
 
 /// Whether the peak line of `text` has `fma_store_gflops`; without it `store_gflops` is
 /// `PLACEHOLDER_STORE_GFLOPS`.
 pub fn store_measured(text: &str) -> bool {
-    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    let line = text.lines().find(|line| is_peak_line(line));
     line.is_some_and(|line| median_after(line, "fma_store_gflops").is_some())
 }
 
 /// Whether the peak line of `text` has `fma_chain_gflops` and `fma_chain256_gflops`.
 pub fn chain_measured(text: &str) -> (bool, bool) {
-    let line = text.lines().find(|line| line.contains("\"kind\":\"peak\""));
+    let line = text.lines().find(|line| is_peak_line(line));
     let has = |key: &str| line.is_some_and(|line| median_after(line, key).is_some());
     (has("fma_chain_gflops"), has("fma_chain256_gflops"))
 }
@@ -1546,7 +1541,7 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
     let (mut measured, mut predicted, mut rows) = (Vec::new(), Vec::new(), String::new());
     let mut by_group: [(Vec<f64>, Vec<f64>); 6] = Default::default();
     for (number, line) in text.lines().enumerate().map(|(i, line)| (i + 1, line)) {
-        if line.trim().is_empty() || line.contains("\"kind\":\"peak\"") {
+        if line.trim().is_empty() || is_peak_line(line) {
             continue;
         }
         let bad = |what: &str| model_err(format!("{source} line {number}: no {what}"));
@@ -1562,8 +1557,10 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
             other_groups += 1;
             continue;
         }
-        let drift = after_key(line, "drift").ok_or_else(|| bad("drift"))?;
-        if drift.starts_with("true") {
+        let drift = json::parse(line)
+            .and_then(|record| record.get("drift")?.boolean())
+            .map_err(|_| bad("boolean drift"))?;
+        if drift {
             drifted += 1;
             continue;
         }
@@ -1723,7 +1720,7 @@ pub fn cli_main<I: IntoIterator<Item = String>>(args: I) -> std::process::ExitCo
                 text.extend(
                     peak_text
                         .lines()
-                        .filter(|l| l.contains("\"kind\":\"peak\""))
+                        .filter(|l| is_peak_line(l))
                         .map(|l| format!("{l}\n")),
                 );
             }
