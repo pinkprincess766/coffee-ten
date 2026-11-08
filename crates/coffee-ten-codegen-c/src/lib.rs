@@ -1,6 +1,8 @@
 //! C99 backend for coffee-ten: prints a loop IR kernel as one C function.
 
-use coffee_ten_loop::{Access, BinaryOp, Buffer, Expr, Kernel, LoopIrError, LoopNest, UnaryOp};
+use coffee_ten_loop::{
+    Access, AffineExpr, BinaryOp, Buffer, Expr, Kernel, LoopIrError, LoopNest, UnaryOp,
+};
 use std::fmt;
 
 mod compile;
@@ -409,10 +411,10 @@ fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
     for guard in &nest.guards {
         depth += 1;
         out.push_str(&format!(
-            "{}if ({} < {}L) {{\n",
+            "{}if ({} < {}) {{\n",
             indent(depth),
-            guard.expr,
-            guard.bound
+            affine_long_c(&guard.expr),
+            long_literal_c(guard.bound)
         ));
     }
     let target = access_c(buffers, &nest.body.target);
@@ -421,6 +423,52 @@ fn nest_c(out: &mut String, buffers: &[Buffer], nest: &LoopNest) {
     for depth in (0..depth).rev() {
         out.push_str(&format!("{}}}\n", indent(depth + 1)));
     }
+}
+
+/// The minimum i64 is not a signed C decimal literal: its positive magnitude is
+/// outside `long`. Build it from representable signed operands instead.
+fn long_literal_c(value: i64) -> String {
+    if value == i64::MIN {
+        "(-9223372036854775807L - 1L)".to_string()
+    } else {
+        format!("{value}L")
+    }
+}
+
+/// Preserve the ordinary IR spelling, but keep MIN constants and coefficients signed.
+fn affine_long_c(expr: &AffineExpr) -> String {
+    if expr.constant != i64::MIN && expr.terms.iter().all(|(_, c)| *c != i64::MIN) {
+        return expr.to_string();
+    }
+    let mut out = String::new();
+    let mut append = |value: i64, name: Option<&str>| {
+        if value == 0 {
+            return;
+        }
+        let (negative, magnitude) = if value == i64::MIN {
+            (false, long_literal_c(value))
+        } else {
+            (value < 0, value.unsigned_abs().to_string())
+        };
+        let body = match name {
+            Some(name) if value.unsigned_abs() == 1 => name.to_string(),
+            Some(name) => format!("{magnitude}*{name}"),
+            None => magnitude,
+        };
+        if out.is_empty() {
+            if negative {
+                out.push('-');
+            }
+        } else {
+            out.push_str(if negative { " - " } else { " + " });
+        }
+        out.push_str(&body);
+    };
+    for (name, coeff) in &expr.terms {
+        append(*coeff, Some(name));
+    }
+    append(expr.constant, None);
+    out
 }
 
 /// `name[e0][e1]...`, one index per dimension; rank 0 prints `name[0]`.
@@ -436,7 +484,11 @@ fn access_c(buffers: &[Buffer], access: &Access) -> String {
     if access.index.is_empty() {
         return format!("{}[0]", buffer.name);
     }
-    let indices: String = access.index.iter().map(|e| format!("[{e}]")).collect();
+    let indices: String = access
+        .index
+        .iter()
+        .map(|e| format!("[{}]", affine_long_c(e)))
+        .collect();
     format!("{}{indices}", buffer.name)
 }
 
