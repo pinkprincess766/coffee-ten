@@ -3,6 +3,13 @@ use coffee_ten_bench::{report, stats::BootstrapConfig};
 const LOG: &str = include_str!("fixtures/report.jsonl");
 
 #[test]
+fn rejects_rounds_shorter_than_the_declared_minimum() {
+    let too_short = LOG.replace("\"min_sample_ms\":1", "\"min_sample_ms\":17");
+    assert_ne!(too_short, LOG);
+    assert!(report::markdown(&too_short, 2, BootstrapConfig::default()).is_err());
+}
+
+#[test]
 fn saved_log_matches_markdown_golden_and_binary_is_read_only() {
     let config = BootstrapConfig {
         resamples: 257,

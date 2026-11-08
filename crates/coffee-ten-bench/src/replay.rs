@@ -566,6 +566,34 @@ mod tests {
         }
     }
     #[test]
+    fn rejects_self_consistent_rounds_below_the_protocol_minimum() {
+        let bad = change_first(|row| {
+            let samples = row.get("samples").unwrap().uint::<usize>().unwrap();
+            let rate = (16.0 / Duration::from_nanos(1).as_secs_f64() / 1e9).to_string();
+            let rounds = (0..samples)
+                .map(|i| {
+                    Value::Object(
+                        [
+                            ("round_index".into(), Value::Number(i.to_string())),
+                            ("elapsed_ns".into(), Value::Number("1".into())),
+                            ("iterations".into(), Value::Number("1".into())),
+                            ("gflops".into(), Value::Number(rate.clone())),
+                        ]
+                        .into(),
+                    )
+                })
+                .collect();
+            row.insert("rounds".into(), Value::Array(rounds));
+            row.insert("measurement_ns".into(), Value::Number(samples.to_string()));
+            for field in ["median", "p25", "p75", "min"] {
+                row.insert(field.into(), Value::Number(rate.clone()));
+            }
+            row.insert("drift".into(), Value::Bool(false));
+        });
+        assert!(from_table(&config(), &metadata(), &bad).is_err());
+    }
+
+    #[test]
     fn rejects_incomplete_duplicate_mixed_and_corrupt_tables() {
         let text = table();
         let lines: Vec<_> = text.lines().collect();
