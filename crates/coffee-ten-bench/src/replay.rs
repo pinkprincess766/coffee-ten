@@ -86,6 +86,9 @@ fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry
         if elapsed == 0 || calls == 0 || round.get("round_index")?.uint::<usize>()? != index {
             return Err("invalid raw round timing or order".into());
         }
+        if u128::from(elapsed) < u128::from(key.min_sample_ms) * 1_000_000 {
+            return Err("raw round is below the protocol minimum duration".into());
+        }
         let flop_per_call = 2.0 * (key.n as f64).powi(3);
         let expected =
             flop_per_call * calls as f64 / Duration::from_nanos(elapsed).as_secs_f64() / 1e9;

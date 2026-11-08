@@ -4,9 +4,17 @@ const LOG: &str = include_str!("fixtures/report.jsonl");
 
 #[test]
 fn rejects_rounds_shorter_than_the_declared_minimum() {
-    let too_short = LOG.replace("\"min_sample_ms\":1", "\"min_sample_ms\":17");
-    assert_ne!(too_short, LOG);
-    assert!(report::markdown(&too_short, 2, BootstrapConfig::default()).is_err());
+    // The shortest fixture round is exactly 2 ms: the lower bound is inclusive.
+    let boundary = LOG.replace("\"min_sample_ms\":1", "\"min_sample_ms\":2");
+    assert!(report::markdown(&boundary, 2, BootstrapConfig::default()).is_ok());
+    for minimum in [3, u64::MAX] {
+        let too_short = LOG.replace(
+            "\"min_sample_ms\":1",
+            &format!("\"min_sample_ms\":{minimum}"),
+        );
+        assert_ne!(too_short, LOG);
+        assert!(report::markdown(&too_short, 2, BootstrapConfig::default()).is_err());
+    }
 }
 
 #[test]
@@ -44,10 +52,10 @@ fn rejects_corrupt_raw_data_costs_and_unsupported_records() {
         "{\"kernel\":\"matmul\"}".into(),
         "{\"kind\":\"replay_curve\"}".into(),
         LOG.replace("\"round_index\":1", "\"round_index\":0"),
-        LOG.replace("\"measurement_ns\":28", "\"measurement_ns\":29"),
+        LOG.replace("\"measurement_ns\":28000000", "\"measurement_ns\":28000001"),
         LOG.replace("\"verified\":true", "\"verified\":false"),
-        LOG.replace("\"median\":1.9999999999999998", "\"median\":3.0"),
-        LOG.replace("\"gflops\":0.9999999999999999", "\"gflops\":1.5"),
+        LOG.replace("\"median\":2.0", "\"median\":3.0"),
+        LOG.replace("\"gflops\":1.0", "\"gflops\":1.5"),
         LOG.replace(
             "\"compilation_ns\":100",
             "\"compilation_ns\":340282366920938463463374607431768211455",
@@ -76,7 +84,7 @@ fn protocol_groups_do_not_pool_rounds_or_rank_incompatible_measurements() {
     let out = report::markdown(&format!("{LOG}{other}"), 1, BootstrapConfig::default()).unwrap();
     assert_eq!(out.matches("## Protocol ").count(), 2);
     assert_eq!(
-        out.matches("Records: 3. Measurement: 56 ns. Compilation API work: 650 ns")
+        out.matches("Records: 3. Measurement: 56000000 ns. Compilation API work: 650 ns")
             .count(),
         2
     );

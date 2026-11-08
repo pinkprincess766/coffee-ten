@@ -66,6 +66,7 @@ fn parse_row(row: &Value) -> Result<Row, String> {
     }
     let mut rounds = Vec::with_capacity(count);
     let mut measurement_ns = 0u128;
+    let minimum_ns = u128::from(protocol.get("min_sample_ms")?.uint::<u64>()?) * 1_000_000;
     for (index, value) in raw.iter().enumerate() {
         let round = RoundSample {
             round_index: value.get("round_index")?.uint()?,
@@ -75,6 +76,9 @@ fn parse_row(row: &Value) -> Result<Row, String> {
         };
         if round.round_index != index || round.elapsed_ns == 0 || round.iterations == 0 {
             return Err("invalid raw round timing or order".into());
+        }
+        if u128::from(round.elapsed_ns) < minimum_ns {
+            return Err("raw round is below the protocol minimum duration".into());
         }
         let expected = 2.0 * (n as f64).powi(3) * round.iterations as f64
             / std::time::Duration::from_nanos(round.elapsed_ns).as_secs_f64()
