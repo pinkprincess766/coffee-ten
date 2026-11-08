@@ -27,12 +27,13 @@ SUMMARY = re.compile(r"Spearman rank correlation (-?[0-9.]+); median \|ln\(predi
 
 
 def compare(binary, peak, run):
-    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-        f.writelines(l for l in open(peak) if json.loads(l).get("kind") == "peak")
-        f.writelines(l for l in open(run) if json.loads(l).get("group") == "random")
-    cmd = (binary + ["model", "compare", "--from", f.name])
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=ROOT).stdout
-    pathlib.Path(f.name).unlink()
+    with tempfile.TemporaryDirectory(prefix="coffee-ten-model-scatter-") as directory:
+        selected = pathlib.Path(directory) / "selected.jsonl"
+        with selected.open("w") as f, open(peak) as peak_file, open(run) as run_file:
+            f.writelines(l for l in peak_file if json.loads(l).get("kind") == "peak")
+            f.writelines(l for l in run_file if json.loads(l).get("group") == "random")
+        cmd = binary + ["model", "compare", "--from", str(selected)]
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=ROOT).stdout
     pts = [(float(m[2]), float(m[3])) for m in map(ROW.match, out.splitlines()) if m]
     s = SUMMARY.search(out)
     v = VERSION.search(out)
