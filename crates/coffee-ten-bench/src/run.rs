@@ -30,7 +30,7 @@ pub fn error_bound(k: usize, scale: f64) -> f64 {
 }
 
 /// `Ok` if every element of `got` is within `error_bound(k, scale[i])` of `naive[i]`.
-/// A NaN in `got` fails.
+/// All three slices must have equal lengths. A NaN in `got` fails.
 pub fn check_outputs(
     variant: &str,
     got: &[f32],
@@ -38,6 +38,14 @@ pub fn check_outputs(
     scales: &[f64],
     k: usize,
 ) -> Result<(), BenchError> {
+    if got.len() != naive.len() || got.len() != scales.len() {
+        return Err(BenchError::Setup(format!(
+            "cannot check {variant}: lengths differ (got {}, naive {}, scales {})",
+            got.len(),
+            naive.len(),
+            scales.len()
+        )));
+    }
     for (index, ((&g, &r), &scale)) in got.iter().zip(naive).zip(scales).enumerate() {
         let bound = error_bound(k, scale);
         let difference = (f64::from(g) - f64::from(r)).abs();
@@ -691,6 +699,30 @@ mod tests {
         let gamma_4 = 4.0 * u / (1.0 - 4.0 * u);
         let want = 2.0 * (gamma_4 * 2.0 + 3.0 * 2f64.powi(-149));
         assert_eq!(error_bound(3, 2.0), want);
+    }
+
+    #[test]
+    fn check_requires_equal_lengths_including_empty_outputs() {
+        for lengths in [
+            [0, 1, 1],
+            [2, 1, 1],
+            [1, 0, 1],
+            [1, 2, 1],
+            [1, 1, 0],
+            [1, 1, 2],
+        ] {
+            let got = vec![1.0; lengths[0]];
+            let naive = vec![1.0; lengths[1]];
+            let scales = vec![1.0; lengths[2]];
+            assert!(
+                matches!(
+                    check_outputs("v", &got, &naive, &scales, 4),
+                    Err(BenchError::Setup(_))
+                ),
+                "accepted lengths {lengths:?}"
+            );
+        }
+        assert_eq!(check_outputs("v", &[], &[], &[], 4), Ok(()));
     }
 
     #[test]
