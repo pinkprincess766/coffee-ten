@@ -25,12 +25,14 @@ fn gamma(n: usize) -> f64 {
 /// Spec §5.4: how far an f32 `k`-term dot product plus bias may be from the exact value,
 /// doubled so that two results (a variant and the naive kernel) may differ by this much.
 /// `scale` is `sum |a_k * b_k| + |bias|`. FMA contraction does not change the bound.
+/// Requires a finite nonnegative scale and `(k + 1) * UNIT_ROUNDOFF < 1`.
 pub fn error_bound(k: usize, scale: f64) -> f64 {
     2.0 * (gamma(k + 1) * scale + k as f64 * MIN_SUBNORMAL)
 }
 
 /// `Ok` if every element of `got` is within `error_bound(k, scale[i])` of `naive[i]`.
-/// All three slices must have equal lengths. A NaN in `got` fails.
+/// Lengths must match; scales and derived bounds must be finite and nonnegative.
+/// Requires `(k + 1) * UNIT_ROUNDOFF < 1`. Nonfinite outputs fail.
 pub fn check_outputs(
     variant: &str,
     got: &[f32],
@@ -46,8 +48,25 @@ pub fn check_outputs(
             scales.len()
         )));
     }
+    if k.checked_add(1)
+        .is_none_or(|terms| terms as f64 * UNIT_ROUNDOFF >= 1.0)
+    {
+        return Err(BenchError::Setup(format!(
+            "cannot check {variant}: error bound requires (k + 1) * unit roundoff < 1"
+        )));
+    }
     for (index, ((&g, &r), &scale)) in got.iter().zip(naive).zip(scales).enumerate() {
+        if !scale.is_finite() || scale < 0.0 {
+            return Err(BenchError::Setup(format!(
+                "cannot check {variant}: scale[{index}] must be finite and nonnegative"
+            )));
+        }
         let bound = error_bound(k, scale);
+        if !bound.is_finite() || bound < 0.0 {
+            return Err(BenchError::Setup(format!(
+                "cannot check {variant}: error bound[{index}] must be finite and nonnegative"
+            )));
+        }
         let difference = (f64::from(g) - f64::from(r)).abs();
         if difference.is_nan() || difference > bound {
             return Err(BenchError::Mismatch {
@@ -742,6 +761,48 @@ mod tests {
             other => panic!("expected a mismatch, got {other:?}"),
         }
         assert!(check_outputs("v", &[-outside[0]], &naive, &[scale], k).is_err());
+    }
+
+    #[test]
+    fn check_rejects_invalid_scales() {
+        for scale in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            for got in [1.0, 999.0] {
+                assert!(
+                    matches!(
+                        check_outputs("scale", &[got], &[1.0], &[scale], 1),
+                        Err(BenchError::Setup(_))
+                    ),
+                    "invalid scale {scale:?}, got {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_rejects_overflowed_bounds_from_finite_scales() {
+        // Scalar arithmetic only: no k-sized arrays or loops are created.
+        let k = 1 << 23;
+        assert!(error_bound(k, f64::MAX).is_infinite());
+        assert!(matches!(
+            check_outputs("overflow", &[999.0], &[1.0], &[f64::MAX], k),
+            Err(BenchError::Setup(_))
+        ));
+    }
+
+    #[test]
+    fn check_enforces_the_bound_domain_and_accepts_zero_scales() {
+        for k in [usize::MAX, (1 << 24) - 1, 1 << 24] {
+            assert!(matches!(
+                check_outputs("terms", &[1.0], &[1.0], &[0.0], k),
+                Err(BenchError::Setup(_))
+            ));
+        }
+        for k in [0, 4, (1 << 24) - 2] {
+            assert_eq!(
+                check_outputs("zero", &[0.0, 1.0], &[0.0, 1.0], &[0.0, -0.0], k),
+                Ok(())
+            );
+        }
     }
 
     #[test]
