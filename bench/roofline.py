@@ -24,10 +24,11 @@ def ai(n):
 
 
 def ceilings(path):
-    for line in open(path):
-        r = json.loads(line)
-        if r.get("kind") == "peak":
-            return r["fma_gflops"]["median"], r["triad_gbs"]["median"]
+    with open(path) as source:
+        for line in source:
+            r = json.loads(line)
+            if r.get("kind") == "peak":
+                return r["fma_gflops"]["median"], r["triad_gbs"]["median"]
     sys.exit(f"{path}: no \"kind\":\"peak\" line")
 
 

@@ -23,14 +23,15 @@ def label(schedule):
 
 def load(path):
     series = {}
-    for line in open(path):
-        r = json.loads(line)
-        if r.get("kernel") != "matmul" or not 64 <= r["n"] <= 1024:
-            continue
-        if r.get("unit") != "GFLOP/s" or r.get("verified") is not True:
-            continue
-        series.setdefault(label(r["schedule"]), []).append(
-            (r["n"], r["median"], r["p25"], r["p75"], r.get("drift") is True))
+    with open(path) as source:
+        for line in source:
+            r = json.loads(line)
+            if r.get("kernel") != "matmul" or not 64 <= r["n"] <= 1024:
+                continue
+            if r.get("unit") != "GFLOP/s" or r.get("verified") is not True:
+                continue
+            series.setdefault(label(r["schedule"]), []).append(
+                (r["n"], r["median"], r["p25"], r["p75"], r.get("drift") is True))
     return {k: sorted(v) for k, v in series.items()}
 
 
