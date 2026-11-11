@@ -116,7 +116,10 @@ def main():
               f" = {q:.3f}")
         ax.errorbar([i], [q], yerr=[[q - lo], [hi - q]], fmt="o", capsize=4,
                     color="C2" if q >= 0.9 else "C3")
-        ax.annotate(f"{q:.3f}", (i, q), xytext=(8, -3), textcoords="offset points", fontsize=9)
+        annotation = f"{q:.3f}"
+        if m is r:
+            annotation += "\n(same schedule; no final run)"
+        ax.annotate(annotation, (i, q), xytext=(8, -3), textcoords="offset points", fontsize=9)
     ax.axhline(1.0, color="k", lw=1, label="1.0: model best = random best")
     ax.axhline(0.9, color="grey", ls="--", lw=1, label="0.9: criterion (spec §7.1)")
     ax.set_xticks(range(1, len(results) + 1))
