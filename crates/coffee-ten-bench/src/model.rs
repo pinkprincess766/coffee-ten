@@ -1177,6 +1177,17 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
         .lines()
         .find(|line| is_peak_line(line))
         .ok_or_else(|| model_err("no peak line (\"kind\":\"peak\") in the results".to_string()))?;
+    let parsed = json::parse(line).map_err(model_err)?;
+    let optional_median = |key: &str| -> Result<Option<f64>, BenchError> {
+        match parsed.get(key) {
+            Err(_) => Ok(None),
+            Ok(value) => value
+                .get("median")
+                .and_then(|v| v.number())
+                .map(Some)
+                .map_err(|e| model_err(format!("the peak line has an invalid {key} median: {e}"))),
+        }
+    };
     let median = |key: &str| {
         median_after(line, key)
             .ok_or_else(|| model_err(format!("the peak line has no {key} median")))
@@ -1187,29 +1198,29 @@ pub fn machine_from_results(text: &str) -> Result<(Machine, bool, bool), BenchEr
         l2_gbs: median("triad_l2_gbs")?,
         ..Machine::assumed_m5()
     };
-    let mem_acc = median_after(line, "fma_mem_acc_gflops");
+    let mem_acc = optional_median("fma_mem_acc_gflops")?;
     if let Some(gflops) = mem_acc {
         machine.mem_acc_gflops = gflops;
     }
-    let mem_acc_scalar = median_after(line, "fma_mem_acc_scalar_gflops");
+    let mem_acc_scalar = optional_median("fma_mem_acc_scalar_gflops")?;
     machine.mem_acc_scalar_gflops =
         mem_acc_scalar.unwrap_or(machine.mem_acc_gflops / machine.lanes as f64);
-    if let Some(gflops) = median_after(line, "fma_mem_acc_scalar_unrolled_gflops") {
+    if let Some(gflops) = optional_median("fma_mem_acc_scalar_unrolled_gflops")? {
         machine.mem_acc_scalar_unrolled_gflops = gflops;
     }
-    if let Some(gflops) = median_after(line, "fma_col_reload_gflops") {
+    if let Some(gflops) = optional_median("fma_col_reload_gflops")? {
         machine.col_reload_gflops = gflops;
     }
-    if let Some(gflops) = median_after(line, "fma_col_unrolled_gflops") {
+    if let Some(gflops) = optional_median("fma_col_unrolled_gflops")? {
         machine.col_unrolled_gflops = gflops;
     }
-    if let Some(gflops) = median_after(line, "fma_store_gflops") {
+    if let Some(gflops) = optional_median("fma_store_gflops")? {
         machine.store_gflops = gflops;
     }
-    if let Some(gflops) = median_after(line, "fma_chain_gflops") {
+    if let Some(gflops) = optional_median("fma_chain_gflops")? {
         machine.fma_chain_gflops = gflops;
     }
-    if let Some(gflops) = median_after(line, "fma_chain256_gflops") {
+    if let Some(gflops) = optional_median("fma_chain256_gflops")? {
         machine.fma_chain256_gflops = gflops;
     }
     machine.check()?;
