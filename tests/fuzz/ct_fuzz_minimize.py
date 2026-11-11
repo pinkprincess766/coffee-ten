@@ -145,7 +145,7 @@ def rust_driver():
 
 def rust_mismatch(case, driver):
     env = dict(os.environ, COFFEE_TEN_FUZZ_CASE=case.row(), COFFEE_TEN_FUZZ_MINIMIZING="1")
-    result = subprocess.run([str(driver), "--exact", "seeded_generated_programs_match_reference_bits", "--nocapture"],
+    result = subprocess.run([str(Path(driver).resolve()), "--exact", "seeded_generated_programs_match_reference_bits", "--nocapture"],
                             cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     if result.returncode == 0:
         return False
