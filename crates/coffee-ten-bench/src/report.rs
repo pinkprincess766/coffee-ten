@@ -28,10 +28,68 @@ fn error(message: impl std::fmt::Display) -> BenchError {
     BenchError::Setup(format!("report: {message}"))
 }
 
+/// Validate the complete persisted comparison key, including fields not printed below.
+/// Equality between two incomplete objects is not evidence of matching provenance.
+fn validate_protocol(protocol: &Value) -> Result<(), String> {
+    for field in [
+        "kernel",
+        "graph_hash",
+        "space",
+        "space_hash",
+        "source_hash",
+        "cpu",
+        "machine",
+        "os",
+        "arch",
+        "target_os",
+        "clang",
+        "flags",
+        "rustc",
+        "harness_profile",
+        "rustflags",
+    ] {
+        protocol.get(field)?.text()?;
+    }
+    for field in ["warmup_ms", "candidate_warmup_ms"] {
+        protocol.get(field)?.uint::<u64>()?;
+    }
+    match protocol.get("space")?.text()? {
+        "v1" => {}
+        "v2" => {
+            let factors = protocol.get("tile_factors")?.array()?;
+            if factors.is_empty() {
+                return Err("empty tile factors".into());
+            }
+            let mut previous = 0;
+            for factor in factors {
+                let factor = factor.uint::<usize>()?;
+                if factor <= previous {
+                    return Err("tile factors must be positive, sorted and unique".into());
+                }
+                previous = factor;
+            }
+            let cache = protocol.get("cache")?;
+            if cache != &Value::Null
+                && crate::space::CacheInfo::new(
+                    cache.get("l1_bytes")?.uint()?,
+                    cache.get("l2_bytes")?.uint()?,
+                    cache.get("line_bytes")?.uint()?,
+                )
+                .is_none()
+            {
+                return Err("invalid cache sizes".into());
+            }
+        }
+        _ => return Err("unsupported schedule space".into()),
+    }
+    Ok(())
+}
+
 fn parse_row(row: &Value) -> Result<Row, String> {
     let protocol = row.get("protocol").map_err(
         |_| "N1/N2 log required: raw rounds and protocol are unavailable in legacy logs",
     )?;
+    validate_protocol(protocol)?;
     if protocol.get("version")?.uint::<u32>()? != crate::protocol::VERSION {
         return Err("unsupported protocol version".into());
     }

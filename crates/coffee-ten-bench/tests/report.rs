@@ -3,6 +3,55 @@ use coffee_ten_bench::{report, stats::BootstrapConfig};
 const LOG: &str = include_str!("fixtures/report.jsonl");
 
 #[test]
+fn incomplete_or_malformed_protocols_cannot_establish_a_comparison() {
+    let config = BootstrapConfig {
+        resamples: 3,
+        seed: 1,
+    };
+    for (field, value) in [
+        ("source_hash", "\"ffeeddccbbaa9988\""),
+        ("space_hash", "\"0011223344556677\""),
+        ("arch", "\"aarch64\""),
+        ("target_os", "\"macos\""),
+        ("rustc", "\"fixture rustc\""),
+        ("rustflags", "\"\""),
+        ("harness_profile", "\"release\""),
+        ("warmup_ms", "5"),
+        ("candidate_warmup_ms", "5"),
+    ] {
+        let token = format!("\"{field}\":{value}");
+        for bad in [
+            LOG.replace(&format!("{token},"), "")
+                .replace(&format!(",{token}"), ""),
+            LOG.replace(&token, &format!("\"{field}\":null")),
+        ] {
+            assert_ne!(bad, LOG, "fixture must contain {field}");
+            assert!(
+                report::markdown(&bad, 2, config).is_err(),
+                "accepted {field}"
+            );
+            assert!(
+                report::compare(&bad, &bad, config, false).is_err(),
+                "compared {field}"
+            );
+        }
+    }
+    let v2 = LOG.replace(
+        "\"space\":\"v1\"",
+        "\"space\":\"v2\",\"cache\":null,\"tile_factors\":[2,4]",
+    );
+    assert!(report::markdown(&v2, 2, config).is_ok());
+    for bad in [
+        v2.replace("\"cache\":null,", ""),
+        v2.replace("\"tile_factors\":[2,4],", ""),
+        v2.replace("[2,4]", "[4,2]"),
+    ] {
+        assert_ne!(bad, v2);
+        assert!(report::compare(&bad, &bad, config, false).is_err());
+    }
+}
+
+#[test]
 fn rejects_rounds_shorter_than_the_declared_minimum() {
     // The shortest fixture round is exactly 2 ms: the lower bound is inclusive.
     let boundary = LOG.replace("\"min_sample_ms\":1", "\"min_sample_ms\":2");
