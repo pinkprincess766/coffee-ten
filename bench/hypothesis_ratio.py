@@ -36,7 +36,8 @@ DEFAULT = [RES / "2026-10-19-hypothesis-a.jsonl", RES / "2026-10-21-hypothesis-a
 
 def ratio(path):
     """Return model/random records; one shared object means no decision run was needed."""
-    recs = [json.loads(line) for line in open(path)]
+    with open(path) as source:
+        recs = [json.loads(line) for line in source]
     final = [r for r in recs if r.get("group") == "final"]
     if not final:
         random = [r for r in recs if r.get("group") == "random"]
@@ -59,7 +60,8 @@ def first_best(records):
 
 
 def table(path):
-    recs = [json.loads(line) for line in open(path)]
+    with open(path) as source:
+        recs = [json.loads(line) for line in source]
     random = [r for r in recs if r.get("group") == "random"]
     model = [r for r in recs if r.get("group") == "model"]
     m, r = ratio(path)
