@@ -110,7 +110,9 @@ def save_failure(case, fails, directory, *, backend, max_probes=64, seconds=60):
         best, probes, status = minimize(case, fails, max_probes=max_probes, seconds=seconds)
         (directory / "minimal.tsv").write_text(best.row() + "\n")
         report.update(minimal=best.row(), probes=probes, status=status, verified=True)
-    except Exception as error:
+    except BaseException as error:
+        # Native panic wrappers and user interruptions must retain error metadata too.
+        # Re-raise unchanged after recording: the oracle failure is never swallowed.
         report.update(status="error", error=str(error), verified=False)
         raise
     finally:
