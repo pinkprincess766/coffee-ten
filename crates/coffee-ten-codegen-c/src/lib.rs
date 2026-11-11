@@ -68,8 +68,8 @@ const RELU_HELPER: &str =
 const MAX_HELPER: &str =
     "static inline float ct_max(float a, float b) { return a > b ? a : b; }\n\n";
 
-/// Names a kernel, buffer or loop must not take: C99 keywords, our helpers and `expf`.
-const RESERVED: [&str; 41] = [
+/// Names a kernel, buffer or loop must not take: C99 keywords/operators, helpers and `expf`.
+const RESERVED: [&str; 42] = [
     "auto",
     "break",
     "case",
@@ -107,6 +107,7 @@ const RESERVED: [&str; 41] = [
     "_Bool",
     "_Complex",
     "_Imaginary",
+    "_Pragma",
     "ct_relu",
     "ct_max",
     "ct_entry",
@@ -1191,6 +1192,37 @@ mod tests {
         k.nests[0].loops[0].name = "A".to_string();
         k.nests[0].body.target.index[0] = var("A");
         assert_eq!(emit_c(&k), Err(CodegenError::NameClash("A".to_string())));
+    }
+
+    #[test]
+    fn pragma_operator_is_rejected_for_every_identifier_role() {
+        let original = kernel(
+            vec![buf("Y", &[1])],
+            vec![loop_nest(
+                vec![lp("i", 1)],
+                0,
+                vec![cst(0)],
+                Expr::Const(1.0),
+            )],
+        );
+        for role in ["kernel", "buffer", "loop"] {
+            let mut k = original.clone();
+            match role {
+                "kernel" => k.name = "_Pragma".to_string(),
+                "buffer" => k.buffers[0].name = "_Pragma".to_string(),
+                "loop" => k.nests[0].loops[0].name = "_Pragma".to_string(),
+                _ => unreachable!(),
+            }
+            assert_eq!(k.validate(), Ok(()));
+            assert_eq!(
+                emit_c(&k),
+                Err(CodegenError::NameClash("_Pragma".to_string())),
+                "{role}"
+            );
+        }
+        let mut ordinary = original;
+        ordinary.name = "_Pragma_value".to_string();
+        assert!(emit_c(&ordinary).is_ok());
     }
 
     #[test]
