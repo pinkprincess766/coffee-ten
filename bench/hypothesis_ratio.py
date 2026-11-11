@@ -65,9 +65,9 @@ def table(path):
     for x in random:
         best_so_far = max(best_so_far, x["median"])
         curve.append(best_so_far)
-    print("random best-so-far (sequential medians): "
-          + ", ".join(f"{curve[k - 1]:.2f} after {k}" for k in CURVE_M)
-          + f", {curve[-1]:.2f} from {n_best} on")
+    points = [f"{curve[k - 1]:.2f} after {k}" for k in CURVE_M if k <= len(curve)]
+    points.append(f"{curve[-1]:.2f} from {n_best} on")
+    print("random best-so-far (sequential medians): " + ", ".join(points))
 
 
 def main():
