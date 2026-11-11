@@ -57,7 +57,7 @@ pub enum ScheduleError {
         nest: usize,
         reason: &'static str,
     },
-    /// The result failed `Kernel::validate`; this is a bug in `apply` or the input kernel.
+    /// The input or result failed `Kernel::validate`.
     Invalid(LoopIrError),
 }
 
@@ -98,7 +98,7 @@ impl fmt::Display for ScheduleError {
             Self::IllegalUnroll { step, nest, reason } => {
                 write!(f, "step {step}: cannot unroll in nest {nest}: {reason}")
             }
-            Self::Invalid(e) => write!(f, "schedule produced an invalid kernel: {e}"),
+            Self::Invalid(e) => write!(f, "invalid input or scheduled kernel: {e}"),
         }
     }
 }
@@ -130,6 +130,7 @@ pub fn apply_classified(
     kernel: &Kernel,
     schedule: &Schedule,
 ) -> Result<(Kernel, OrderClass), ScheduleError> {
+    kernel.validate().map_err(ScheduleError::Invalid)?;
     let mut result = kernel.clone();
     let mut class = OrderClass::Preserving;
     for (step_no, step) in schedule.steps.iter().enumerate() {
@@ -708,6 +709,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n"
+    }
+
+    #[test]
+    fn invalid_input_cannot_be_repaired_by_split_names() {
+        let input =
+            crate::parse_kernel("kernel k(Y: f32[2])\nfor i in 0..2:\n  Y[j] = 1.0\n").unwrap();
+        assert_refused(
+            &input,
+            &schedule("split(0, i, io, j, 2)"),
+            ScheduleError::Invalid(LoopIrError::UnknownLoop {
+                nest: 0,
+                loop_name: "j".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn duplicate_input_loops_are_rejected_before_reorder() {
+        let input = crate::parse_kernel(
+            "kernel k(Y: f32[1])\nfor i in 0..1:\n  for i in 0..1:\n    Y[0] = 1.0\n",
+        )
+        .unwrap();
+        assert_refused(
+            &input,
+            &schedule("reorder(0, i, j)"),
+            ScheduleError::Invalid(LoopIrError::DuplicateLoop {
+                nest: 0,
+                loop_name: "i".to_string(),
+            }),
+        );
     }
 
     #[test]
