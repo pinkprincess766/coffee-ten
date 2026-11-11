@@ -18,6 +18,10 @@ keeps the earlier: `best_of` in search.rs); the model's rank is the same for the
 records. The best-so-far curve is the running maximum of the `random` sequential medians
 (`best_index_so_far`). The medians in the table are the `final` records', not the sequential
 ones.
+
+If both groups select the same schedule, search omits the decision run and defines the
+ratio as 1. The table labels its shared sequential reference statistics explicitly;
+the plot shows no decision-run error bar for that identity comparison.
 """
 import argparse, json, pathlib, sys
 
@@ -31,8 +35,17 @@ DEFAULT = [RES / "2026-10-19-hypothesis-a.jsonl", RES / "2026-10-21-hypothesis-a
 
 
 def ratio(path):
+    """Return model/random records; one shared object means no decision run was needed."""
     recs = [json.loads(line) for line in open(path)]
     final = [r for r in recs if r.get("group") == "final"]
+    if not final:
+        random = [r for r in recs if r.get("group") == "random"]
+        model = [r for r in recs if r.get("group") == "model"]
+        if random and model:
+            rnd = random[first_best(random) - 1]
+            predicted = model[first_best(model) - 1]
+            if rnd["schedule"] == predicted["schedule"]:
+                return rnd, rnd
     if len(final) != 2:
         sys.exit(f"{path}: expected two final records (best random, best model)")
     rnd, m = final
@@ -55,6 +68,8 @@ def table(path):
     if (r["schedule"], m["schedule"]) != picked:
         sys.exit(f"{path}: the final records are not the best random / best model records")
     print(f"{path}")
+    if m is r:
+        print("same schedule: no final run; shared sequential reference statistics below")
     rows = [(f"best random (candidate {n_best} of {len(random)})", r),
             (f"best of the model's top {len(model)} (rank {rank})", m)]
     for name, rec in rows:
@@ -94,6 +109,9 @@ def main():
         m, r = ratio(path)
         q = m["median"] / r["median"]
         lo, hi = m["p25"] / r["p75"], m["p75"] / r["p25"]
+        if m is r:
+            lo = hi = q
+            print(f"run {i}: same schedule; no final run")
         print(f"run {i} (seed {m['seed']}, {m['commit']}): {m['median']:.2f} / {r['median']:.2f}"
               f" = {q:.3f}")
         ax.errorbar([i], [q], yerr=[[q - lo], [hi - q]], fmt="o", capsize=4,
