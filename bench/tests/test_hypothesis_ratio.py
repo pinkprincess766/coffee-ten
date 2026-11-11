@@ -60,6 +60,7 @@ class SharedWinnerTests(unittest.TestCase):
             ), contextlib.redirect_stdout(io.StringIO()):
                 ratio.main()
             self.assertEqual(axes.errorbar.call_args.kwargs["yerr"], [[0.0], [0.0]])
+            self.assertIn("no final run", axes.annotate.call_args.args[0])
 
     def test_missing_final_run_with_different_winners_is_rejected(self):
         records = [dict(group=group, schedule=group, median=1.0)
