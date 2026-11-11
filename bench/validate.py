@@ -140,6 +140,12 @@ def validate(value):
         require(sample["elapsed_ns"] >= key["min_sample_ms"] * 1_000_000,
                 "raw round is below the protocol minimum duration")
         rate(sample["gflops"], "gflops")
+        seconds, nanos = divmod(sample["elapsed_ns"], 1_000_000_000)
+        # Mirror Rust Duration::as_secs_f64, including its two separate conversions.
+        elapsed_s = float(seconds) + float(nanos) / 1e9
+        n = float(value["n"])
+        expected = 2.0 * ((n * n) * n) * float(sample["iterations"]) / elapsed_s / 1e9
+        require(float(sample["gflops"]) == expected, "raw rate does not match timing")
     rates = sorted(sample["gflops"] for sample in raw)
     last = len(rates) - 1
     for name, index in [("min", 0), ("p25", last // 4), ("median", last // 2), ("p75", 3 * last // 4)]:

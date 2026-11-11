@@ -1,6 +1,8 @@
 import copy
 import importlib.util
 import json
+import math
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,6 +119,39 @@ class SchemaTests(unittest.TestCase):
                 path.write_text(text)
                 with self.subTest(text=text), self.assertRaisesRegex(ValueError, str(path)):
                     schema.validate_file(path)
+
+    def test_self_consistent_rates_must_match_timing(self):
+        bad = copy.deepcopy(self.row)
+        for sample in bad["rounds"]:
+            sample["gflops"] *= 2
+        for field in ["min", "p25", "median", "p75"]:
+            bad[field] *= 2
+        with self.assertRaisesRegex(ValueError, "timing"):
+            schema.validate(bad)
+
+    def test_round_rates_match_rust_duration_conversion_bit_for_bit(self):
+        # Rust rate bits: 16 * 1e6 / Duration::from_nanos(ns).as_secs_f64() / 1e9.
+        for elapsed, bits in [(1_000_000_001, 4580268907422239638),
+                              (1_123_456_789, 4579363436459430692),
+                              (9_007_199_254_740_993, 4476160764943532032),
+                              (5_133_295_621_681_162_413, 4434755519214517698),
+                              (2**64 - 1, 4426621169042456576)]:
+            value = struct.unpack("=d", struct.pack("=Q", bits))[0]
+            row = copy.deepcopy(self.row)
+            row["samples"] = row["protocol"]["samples"] = 1
+            row["rounds"] = [dict(round_index=0, elapsed_ns=elapsed,
+                                  iterations=1_000_000, gflops=value)]
+            row["measurement_ns"] = elapsed
+            for field in ["min", "p25", "median", "p75"]:
+                row[field] = value
+            with self.subTest(elapsed=elapsed):
+                schema.validate(row)
+                corrupted = math.nextafter(value, math.inf)
+                row["rounds"][0]["gflops"] = corrupted
+                for field in ["min", "p25", "median", "p75"]:
+                    row[field] = corrupted
+                with self.assertRaisesRegex(ValueError, "timing"):
+                    schema.validate(row)
 
 
 if __name__ == "__main__":
