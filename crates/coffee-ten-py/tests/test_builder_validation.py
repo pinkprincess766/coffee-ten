@@ -1,4 +1,5 @@
 """N18: current-operation errors are raised before C emission or compiler startup."""
+import math
 import re
 import struct
 
@@ -67,3 +68,22 @@ def test_reusing_one_tensor_is_valid_and_shape_checks_keep_bits():
     for row in values + values:
         expected = expected + row
     np.testing.assert_array_equal(out.view(np.uint32), expected.view(np.uint32))
+
+
+def test_unrepresentable_f32_buffers_fail_at_build_time(monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    # Only metadata is constructed: no input arrays, C compiler or dense buffers.
+    max_bytes = (1 << (struct.calcsize("P") * 8 - 1)) - 1
+    rows = max_bytes // 4 + 1
+    with pytest.raises(ValueError, match="has too many elements"):
+        ct.input("huge", (rows,))
+    a, b = ct.input("a", (rows, 0)), ct.input("b", (0, 1))
+    with pytest.raises(ValueError, match="has too many elements"):
+        a @ b
+    extent = math.isqrt(max_bytes // 4) + 1
+    left, right = ct.input("left", (extent, 1)), ct.input("right", (1, extent))
+    for operation in (lambda: left @ right, lambda: left + right):
+        with pytest.raises(ValueError, match="has too many elements"):
+            operation()
+    assert ct.input("empty", (rows, rows, 0)).shape == (rows, rows, 0)
+    assert ct.input("scalar", ()).shape == ()
