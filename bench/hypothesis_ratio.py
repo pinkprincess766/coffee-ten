@@ -107,6 +107,7 @@ def main():
     except ImportError:
         sys.exit("bench/hypothesis_ratio.py needs matplotlib: pip install matplotlib")
     fig, ax = plt.subplots(figsize=(6, 4.2))
+    ymin, ymax = 0.5, 1.5
     for i, path in enumerate(results, 1):
         m, r = ratio(path)
         q = m["median"] / r["median"]
@@ -114,6 +115,7 @@ def main():
         if m is r:
             lo = hi = q
             print(f"run {i}: same schedule; no final run")
+        ymin, ymax = min(ymin, lo * 0.95), max(ymax, hi * 1.05)
         print(f"run {i} (seed {m['seed']}, {m['commit']}): {m['median']:.2f} / {r['median']:.2f}"
               f" = {q:.3f}")
         ax.errorbar([i], [q], yerr=[[q - lo], [hi - q]], fmt="o", capsize=4,
@@ -128,7 +130,7 @@ def main():
     ax.set_xticklabels([f"run {i}" for i in range(1, len(results) + 1)])
     ax.set_xlim(0.5, len(results) + 0.5)
     ax.set_xlabel("hypothesis A run, N = 256 (seeds 1, 2, 3, 5 for runs 1-4)")
-    ax.set_ylim(0.5, 1.5)
+    ax.set_ylim(ymin, ymax)
     ax.set_ylabel("ratio, model-best / random-best GFLOP/s (dimensionless)")
     ax.set_title("hypothesis A, matmul N = 256: decision-run medians\n"
                  "bars: p25/p75 combined (model p25 / random p75 .. model p75 / random p25)",
