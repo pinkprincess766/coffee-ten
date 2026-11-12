@@ -117,7 +117,7 @@ fn check_depth(depth: usize) -> PyResult<usize> {
     Ok(depth)
 }
 
-/// Reject impossible dense element counts while the expression is built. Any zero
+/// Reject impossible dense element counts or f32 byte capacities at build time. Any zero
 /// dimension makes the tensor empty, irrespective of dimension order.
 fn check_shape_size(shape: &Shape) -> PyResult<()> {
     if !shape.dims().contains(&0)
@@ -125,7 +125,8 @@ fn check_shape_size(shape: &Shape) -> PyResult<()> {
             .dims()
             .iter()
             .try_fold(1usize, |size, &dim| size.checked_mul(dim))
-            .is_none()
+            .and_then(|size| size.checked_mul(std::mem::size_of::<f32>()))
+            .is_none_or(|bytes| bytes > isize::MAX as usize)
     {
         return Err(PyValueError::new_err(format!(
             "shape {shape} has too many elements"
