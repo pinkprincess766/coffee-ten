@@ -3,6 +3,28 @@ use coffee_ten_bench::model::{compare_report, machine_from_results};
 const RUN: &str = include_str!("../../../bench/results/2026-10-18-4928ffa.jsonl");
 
 #[test]
+fn model_comparison_requires_verified_gflops_measurements() {
+    const PEAK: &str = r#"{"kind":"peak","fma_gflops":{"median":100},"triad_gbs":{"median":90},"triad_l2_gbs":{"median":110}}"#;
+    let record = r#"{"kernel":"matmul","n":2,"schedule":"","median":1,"drift":false,"verified":true,"unit":"GFLOP/s"}"#;
+    let valid = format!("{PEAK}\n{record}\n");
+    assert!(compare_report("fixture", &valid, None).is_ok());
+    for bad in [
+        valid.replace("\"verified\":true", "\"verified\":false"),
+        valid.replace("\"verified\":true,", ""),
+        valid.replace("\"verified\":true", "\"verified\":1"),
+        valid.replace("\"unit\":\"GFLOP/s\"", "\"unit\":\"GB/s\""),
+        valid.replace(",\"unit\":\"GFLOP/s\"", ""),
+        valid.replace("\"unit\":\"GFLOP/s\"", "\"unit\":null"),
+    ] {
+        assert_ne!(bad, valid);
+        assert!(
+            compare_report("fixture", &bad, None).is_err(),
+            "accepted {bad}"
+        );
+    }
+}
+
+#[test]
 fn present_optional_peak_measurements_must_have_numeric_medians() {
     const PEAK: &str = r#"{"kind":"peak","fma_gflops":{"median":100},"triad_gbs":{"median":90},"triad_l2_gbs":{"median":110}}"#;
     let baseline = machine_from_results(PEAK).unwrap();
@@ -48,7 +70,7 @@ fn rejects_fractional_sizes_and_nonpositive_measured_rates() {
     let mut accepted = Vec::new();
     for (n, median) in [("2.5", "1"), ("2", "0"), ("2", "-1")] {
         let record = format!(
-            "{peak}\n{{\"kernel\":\"matmul\",\"n\":{n},\"median\":{median},\"schedule\":\"\",\"drift\":false}}\n"
+            "{peak}\n{{\"kernel\":\"matmul\",\"n\":{n},\"median\":{median},\"schedule\":\"\",\"drift\":false,\"verified\":true,\"unit\":\"GFLOP/s\"}}\n"
         );
         if compare_report("fixture", &record, None).is_ok() {
             accepted.push((n, median));
