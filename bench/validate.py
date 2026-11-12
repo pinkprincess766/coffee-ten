@@ -171,15 +171,17 @@ def unique_object(pairs):
 
 def validate_file(path):
     count = 0
-    for index, line in enumerate(Path(path).read_text().splitlines(), 1):
-        try:
-            require(bool(line.strip()), "empty JSONL line")
-            value = json.loads(line, object_pairs_hook=unique_object,
-                               parse_constant=lambda token: (_ for _ in ()).throw(ValueError(f"non-JSON number {token}")))
-            validate(value)
-            count += 1
-        except (ValueError, TypeError, OverflowError) as exc:
-            raise ValueError(f"{path}:{index}: {exc}") from exc
+    # JSONL records are delimited by LF, not Unicode separators inside JSON strings.
+    with Path(path).open(encoding="utf-8", newline="\n") as source:
+        for index, line in enumerate(source, 1):
+            try:
+                require(bool(line.strip()), "empty JSONL line")
+                value = json.loads(line, object_pairs_hook=unique_object,
+                                   parse_constant=lambda token: (_ for _ in ()).throw(ValueError(f"non-JSON number {token}")))
+                validate(value)
+                count += 1
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f"{path}:{index}: {exc}") from exc
     require(count > 0, f"{path}: empty log")
     return count
 
