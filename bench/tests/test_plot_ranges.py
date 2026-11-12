@@ -56,5 +56,23 @@ class PlotRangeTests(unittest.TestCase):
         self.assertEqual(axes.plot.return_value[0].set_data.call_args.args, (limits, limits))
 
 
+class PlotMetadataTests(unittest.TestCase):
+    def test_hypothesis_labels_use_the_recorded_size_and_seed(self):
+        model = dict(median=4.0, p25=3.0, p75=5.0, seed=42, commit="fixture", n=64)
+        random = dict(median=3.0, p25=2.5, p75=3.5)
+        axes = render("hypothesis_ratio", ratio=(model, random))
+        labels = " ".join(axes.set_xticklabels.call_args.args[0])
+        self.assertIn("N=64", labels)
+        self.assertIn("seed=42", labels)
+        self.assertNotIn("256", axes.set_title.call_args.args[0])
+        self.assertNotIn("1, 2, 3, 5", axes.set_xlabel.call_args.args[0])
+
+    def test_scatter_does_not_claim_an_unread_size_or_sample_count(self):
+        axes = render("model_scatter", compare=([(1.0, 2.0)], "0.5", "2.0", "v1.8", "machine"))
+        self.assertNotIn("N =", axes.set_title.call_args.args[0])
+        self.assertNotIn("samples", axes.set_xlabel.call_args.args[0])
+        self.assertIn("median", axes.set_xlabel.call_args.args[0])
+
+
 if __name__ == "__main__":
     unittest.main()

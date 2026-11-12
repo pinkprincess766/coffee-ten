@@ -83,9 +83,9 @@ def main():
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
     ax.set_aspect("equal")
-    ax.set_xlabel("measured, GFLOP/s (median of 5 samples)")
+    ax.set_xlabel("measured, GFLOP/s (recorded medians)")
     ax.set_ylabel(f"predicted by model {version}, GFLOP/s")
-    ax.set_title("matmul N = 256, hypothesis A random candidates\n"
+    ax.set_title("matmul, hypothesis A random candidates\n"
                  f"machine: bench/peak line of {pathlib.Path(a.peak).name}", fontsize=10)
     ax.grid(alpha=0.3, which="both")
     ax.legend(loc="upper left", fontsize=8)
