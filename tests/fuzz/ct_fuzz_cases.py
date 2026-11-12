@@ -47,8 +47,16 @@ class Case:
         if len(fields) != 8:
             raise ValueError("case must have eight TSV fields")
         index, seed, kind, dims, axis, pre, post, digest = fields
-        case = cls(int(index), int(seed, 16), kind, tuple(map(int, dims.split(","))),
-                   int(axis), int(pre), int(post), digest)
+        def number(token, base=10):
+            # Match Rust's unsigned integer grammar, not Python int's extensions.
+            digits = "0123456789abcdefABCDEF" if base == 16 else "0123456789"
+            body = token[1:] if token.startswith("+") else token
+            if not body or any(char not in digits for char in body):
+                raise ValueError("invalid unsigned integer token")
+            return int(token, base)
+        case = cls(number(index), number(seed, 16), kind,
+                   tuple(number(dim) for dim in dims.split(",")),
+                   number(axis), number(pre), number(post), digest)
         rank = 2 if kind in ("matmul", "chain") else len(case.dims)
         if (not 0 <= case.index < 128 or not 0 <= case.seed <= MASK
                 or kind not in KINDS or not 1 <= len(case.dims) <= 3
