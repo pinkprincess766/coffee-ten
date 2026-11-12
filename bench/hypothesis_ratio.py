@@ -108,8 +108,10 @@ def main():
         sys.exit("bench/hypothesis_ratio.py needs matplotlib: pip install matplotlib")
     fig, ax = plt.subplots(figsize=(6, 4.2))
     ymin, ymax = 0.5, 1.5
+    run_labels = []
     for i, path in enumerate(results, 1):
         m, r = ratio(path)
+        run_labels.append(f"run {i}\nN={m.get('n', '?')}, seed={m['seed']}")
         q = m["median"] / r["median"]
         lo, hi = m["p25"] / r["p75"], m["p75"] / r["p25"]
         if m is r:
@@ -127,12 +129,12 @@ def main():
     ax.axhline(1.0, color="k", lw=1, label="1.0: model best = random best")
     ax.axhline(0.9, color="grey", ls="--", lw=1, label="0.9: criterion (spec §7.1)")
     ax.set_xticks(range(1, len(results) + 1))
-    ax.set_xticklabels([f"run {i}" for i in range(1, len(results) + 1)])
+    ax.set_xticklabels(run_labels)
     ax.set_xlim(0.5, len(results) + 0.5)
-    ax.set_xlabel("hypothesis A run, N = 256 (seeds 1, 2, 3, 5 for runs 1-4)")
+    ax.set_xlabel("hypothesis A run")
     ax.set_ylim(ymin, ymax)
     ax.set_ylabel("ratio, model-best / random-best GFLOP/s (dimensionless)")
-    ax.set_title("hypothesis A, matmul N = 256: decision-run medians\n"
+    ax.set_title("hypothesis A, matmul: decision-run medians\n"
                  "bars: p25/p75 combined (model p25 / random p75 .. model p75 / random p25)",
                  fontsize=10)
     ax.grid(alpha=0.3, axis="y")
