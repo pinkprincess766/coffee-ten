@@ -3,6 +3,25 @@ use coffee_ten_bench::model::{compare_report, machine_from_results};
 const RUN: &str = include_str!("../../../bench/results/2026-10-18-4928ffa.jsonl");
 
 #[test]
+fn schedule_grouping_is_independent_of_legal_schedule_whitespace() {
+    const PEAK: &str = r#"{"kind":"peak","fma_gflops":{"median":100},"triad_gbs":{"median":90},"triad_l2_gbs":{"median":110}}"#;
+    let schedule = "split(1, j, jo, ji, 128); reorder(1, i, jo, k, ji); vectorize(1, ji)";
+    let record = |schedule: &str| {
+        format!(
+            "{PEAK}\n{{\"kernel\":\"matmul\",\"n\":128,\"schedule\":\"{schedule}\",\"median\":1,\"drift\":false,\"verified\":true,\"unit\":\"GFLOP/s\"}}\n"
+        )
+    };
+    let expected = compare_report("fixture", &record(schedule), None).unwrap();
+    assert!(expected.contains("vectorized ji = 128"));
+    for equivalent in [schedule.replace(", ", ","), schedule.replace(", ", ",   ")] {
+        assert_eq!(
+            expected,
+            compare_report("fixture", &record(&equivalent), None).unwrap()
+        );
+    }
+}
+
+#[test]
 fn model_comparison_requires_verified_gflops_measurements() {
     const PEAK: &str = r#"{"kind":"peak","fma_gflops":{"median":100},"triad_gbs":{"median":90},"triad_l2_gbs":{"median":110}}"#;
     let record = r#"{"kernel":"matmul","n":2,"schedule":"","median":1,"drift":false,"verified":true,"unit":"GFLOP/s"}"#;
