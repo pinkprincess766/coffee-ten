@@ -64,15 +64,20 @@ def main():
     binary = [a.bin] if a.bin else ["cargo", "run", "-q", "-p", "coffee-ten-bench", "--"]
     fig, ax = plt.subplots(figsize=(6, 5.5))
     lo, hi = 0.5, 200.0
-    ax.plot([lo, hi], [lo, hi], "k-", lw=1, label="y = x")
+    diagonal = ax.plot([lo, hi], [lo, hi], "k-", lw=1, label="y = x")[0]
     for i, path in enumerate(a.input or RUNS):
         name = label(path)
         pts, rho, err, version, machine = compare(binary, a.peak, path)
         meas, pred = zip(*pts)
+        for pair in pts:
+            for value in pair:
+                if value > 0:
+                    lo, hi = min(lo, value * 0.95), max(hi, value * 1.05)
         ax.plot(meas, pred, "o", ms=3, alpha=0.45, mec="none", color=f"C{i}",
                 label=f"{name}: n = {len(pts)}, Spearman {rho}, median error ×{err}")
         print(f"{name}: {len(pts)} points, Spearman {rho}, median error x{err}")
     print(machine)
+    diagonal.set_data([lo, hi], [lo, hi])
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(lo, hi)

@@ -52,10 +52,12 @@ def main():
     ax.text(16, peak * 1.06, f"FMA peak {peak:.1f} GFLOP/s", fontsize=8)
     ax.axvline(peak / bw, color="grey", ls=":", lw=1)
     ax.text(peak / bw * 1.05, 1.2, f"ridge {peak / bw:.2f}", fontsize=8, color="grey")
+    ymin, ymax = 0.8, peak * 1.6
     for i, name in enumerate(ORDER):
         if name not in series:
             continue
         n, med, _, _, drift = zip(*series[name])
+        ymin, ymax = min(ymin, min(med) * 0.95), max(ymax, max(med) * 1.05)
         x = [ai(v) for v in n]
         ax.plot(x, med, "o-", color=f"C{i}", label=name)
         for xv, yv, d in zip(x, med, drift):
@@ -65,7 +67,7 @@ def main():
         ax.annotate(f"N={v}\nAI≤{ai(v):g}", (ai(v), 1.0), ha="center", fontsize=7, color="grey")
     ax.set_xscale("log", base=2)
     ax.set_yscale("log", base=2)
-    ax.set_ylim(0.8, peak * 1.6)
+    ax.set_ylim(ymin, ymax)
     ax.set_xlabel("arithmetic intensity, FLOP/byte (compulsory DRAM traffic: upper bound)")
     ax.set_ylabel("GFLOP/s (median)")
     ax.set_title(f"matmul roofline, single thread — {pathlib.Path(a.input).name}\n"
