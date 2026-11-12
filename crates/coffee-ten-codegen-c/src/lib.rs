@@ -68,8 +68,8 @@ const RELU_HELPER: &str =
 const MAX_HELPER: &str =
     "static inline float ct_max(float a, float b) { return a > b ? a : b; }\n\n";
 
-/// Names a kernel, buffer or loop must not take: C99 keywords/operators, helpers and `expf`.
-const RESERVED: [&str; 42] = [
+/// Names a kernel, buffer or loop must not take: C99 keywords/operators/predefines, helpers and `expf`.
+const RESERVED: [&str; 50] = [
     "auto",
     "break",
     "case",
@@ -108,6 +108,15 @@ const RESERVED: [&str; 42] = [
     "_Complex",
     "_Imaginary",
     "_Pragma",
+    // C99 predefined macros and the predefined function-name identifier.
+    "__LINE__",
+    "__FILE__",
+    "__DATE__",
+    "__TIME__",
+    "__STDC__",
+    "__STDC_HOSTED__",
+    "__STDC_VERSION__",
+    "__func__",
     "ct_relu",
     "ct_max",
     "ct_entry",
@@ -1223,6 +1232,51 @@ mod tests {
         let mut ordinary = original;
         ordinary.name = "_Pragma_value".to_string();
         assert!(emit_c(&ordinary).is_ok());
+    }
+
+    #[test]
+    fn predefined_c_names_are_rejected_in_every_identifier_role() {
+        let original = kernel(
+            vec![buf("Y", &[1])],
+            vec![loop_nest(
+                vec![lp("i", 1)],
+                0,
+                vec![cst(0)],
+                Expr::Const(1.0),
+            )],
+        );
+        for name in [
+            "__LINE__",
+            "__FILE__",
+            "__DATE__",
+            "__TIME__",
+            "__STDC__",
+            "__STDC_HOSTED__",
+            "__STDC_VERSION__",
+            "__func__",
+        ] {
+            for role in ["kernel", "buffer", "loop"] {
+                let mut k = original.clone();
+                match role {
+                    "kernel" => k.name = name.to_string(),
+                    "buffer" => k.buffers[0].name = name.to_string(),
+                    "loop" => k.nests[0].loops[0].name = name.to_string(),
+                    _ => unreachable!(),
+                }
+                assert_eq!(k.validate(), Ok(()));
+                assert_eq!(
+                    emit_c(&k),
+                    Err(CodegenError::NameClash(name.to_string())),
+                    "{name} as {role}"
+                );
+            }
+        }
+        for name in ["__LINE___value", "__func___value", "_Pragma_value"] {
+            let mut k = original.clone();
+            k.name = name.to_string();
+            let source = emit_c(&k).unwrap();
+            assert_clang_accepts(name, &source);
+        }
     }
 
     #[test]
