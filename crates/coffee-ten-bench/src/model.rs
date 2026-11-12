@@ -1595,6 +1595,11 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
             return Err(bad("positive integer n"));
         }
         let schedule = string_after(line, "schedule").ok_or_else(|| bad("schedule"))?;
+        // Group and display the same parsed schedule used by prediction, independent
+        // of legal whitespace in persisted schedule text.
+        let schedule = Schedule::parse(&schedule)
+            .map_err(|e| model_err(e.to_string()))?
+            .to_string();
         let median = number_after(line, "median").ok_or_else(|| bad("median"))?;
         if median <= 0.0 {
             return Err(bad("positive median"));
