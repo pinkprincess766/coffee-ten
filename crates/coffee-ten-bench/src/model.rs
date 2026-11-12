@@ -1546,6 +1546,7 @@ fn schedule_group(schedule: &str) -> usize {
 /// The report of `coffee-ten-bench model compare`: the model against the `matmul` records of
 /// the results file `text` (`source` is its name) that are not flagged `drift`; with `group`,
 /// only the records whose `"group"` field equals it.
+/// Included measurements must be verified and use GFLOP/s.
 pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<String, BenchError> {
     let (machine, mem_acc_measured, mem_acc_scalar_measured) = machine_from_results(text)?;
     let (mut drifted, mut other_kernels, mut other_groups) = (0, 0, 0);
@@ -1574,6 +1575,18 @@ pub fn compare_report(source: &str, text: &str, group: Option<&str>) -> Result<S
         if drift {
             drifted += 1;
             continue;
+        }
+        let record = json::parse(line).map_err(|_| bad("valid JSON record"))?;
+        if record
+            .get("verified")
+            .and_then(|value| value.boolean())
+            .ok()
+            != Some(true)
+        {
+            return Err(bad("verified=true"));
+        }
+        if record.get("unit").and_then(|value| value.text()).ok() != Some("GFLOP/s") {
+            return Err(bad("GFLOP/s unit"));
         }
         let n = json::parse(line)
             .and_then(|record| record.get("n")?.uint::<usize>())
