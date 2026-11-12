@@ -120,6 +120,22 @@ class SchemaTests(unittest.TestCase):
                 with self.subTest(text=text), self.assertRaisesRegex(ValueError, str(path)):
                     schema.validate_file(path)
 
+    def test_jsonl_uses_lf_boundaries_not_unicode_string_characters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unicode.jsonl"
+            for separator in ["\u0085", "\u2028", "\u2029"]:
+                row = copy.deepcopy(self.row)
+                row["cpu"] = row["protocol"]["cpu"] = "fixture" + separator + "CPU"
+                path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+                with self.subTest(separator=ascii(separator)):
+                    self.assertEqual(schema.validate_file(path), 1)
+            first, second = json.dumps(self.row), json.dumps(self.peak)
+            path.write_bytes((first + "\r\n" + second + "\r\n").encode("utf-8"))
+            self.assertEqual(schema.validate_file(path), 2)
+            path.write_bytes((first + "\r" + second).encode("utf-8"))
+            with self.assertRaisesRegex(ValueError, ":1:"):
+                schema.validate_file(path)
+
     def test_self_consistent_rates_must_match_timing(self):
         bad = copy.deepcopy(self.row)
         for sample in bad["rounds"]:
