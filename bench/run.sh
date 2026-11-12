@@ -3,6 +3,7 @@
 # Usage: bench/run.sh [--quick] [--sizes "64 128"] [--pause SECONDS]
 #                     [--dry-run] [--yes] [--allow-dirty]
 set -euo pipefail
+set -f  # --sizes is a whitespace-delimited number list, never a filesystem glob.
 
 cd "$(dirname "$0")/.."
 
@@ -24,6 +25,24 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Reject invalid settings before building, measuring peak, or opening a results log.
+if [[ ! "$pause_s" =~ ^[+]?[0-9]+$ ]]; then
+  echo "error: --pause must be a nonnegative integer number of seconds" >&2
+  exit 2
+fi
+has_sizes=0
+for n in $sizes; do
+  if [[ ! "$n" =~ ^[+]?0*([1-9][0-9]{0,3})$ ]] || ((10#${BASH_REMATCH[1]} > 1024)); then
+    echo "error: --sizes values must be integers in 1..1024, got '$n'" >&2
+    exit 2
+  fi
+  has_sizes=1
+done
+if [[ $has_sizes -eq 0 ]]; then
+  echo "error: --sizes needs at least one size" >&2
+  exit 2
+fi
 
 dirty="$(git status --porcelain --untracked-files=no)"
 if [[ -n "$dirty" ]]; then
@@ -107,8 +126,8 @@ regtile="split(1, i, io, ii, 4); split(1, j, jo, ji, 16); reorder(1, io, jo, k, 
 first=1
 for kernel in matmul relu-matmul-bias; do
   for n in $sizes; do
-    if [[ $first -eq 0 && $pause_s -gt 0 ]]; then
-      run sleep "$pause_s"
+    if [[ $first -eq 0 && ! "$pause_s" =~ ^[+]?0+$ ]]; then
+      run sleep "${pause_s#+}"
     fi
     first=0
     run "$bench_bin" --kernel "$kernel" --n "$n" \
