@@ -182,6 +182,7 @@ fn parse_row(row: &Value) -> Result<Row, String> {
     let protocol = row.get("protocol").map_err(
         |_| "N1/N2 log required: raw rounds and protocol are unavailable in legacy logs",
     )?;
+    check_known_fields(row)?;
     validate_protocol(protocol)?;
     check_metadata(row)?;
     if protocol.get("version")?.uint::<u32>()? != crate::protocol::VERSION {
@@ -249,6 +250,74 @@ fn parse_row(row: &Value) -> Result<Row, String> {
         compilation_ns,
         drift,
     })
+}
+
+/// Every field a current record may carry (`bench/validate.py` `RECORD_FIELDS`, plus the
+/// optional `group`). Like the protocol key, the record, its raw rounds and its reference
+/// compilation are closed: a field nobody checks is rejected rather than ignored.
+const RECORD_FIELDS: [&str; 31] = [
+    "kernel",
+    "n",
+    "graph_hash",
+    "schedule",
+    "order_class",
+    "verified",
+    "quick",
+    "samples",
+    "median",
+    "p25",
+    "p75",
+    "min",
+    "drift",
+    "rounds",
+    "protocol",
+    "measurement_ns",
+    "compilation_ns",
+    "cache_hit",
+    "reference_compilation",
+    "compilation_wall_ns",
+    "unit",
+    "seed",
+    "commit",
+    "dirty",
+    "clang",
+    "flags",
+    "machine",
+    "cpu",
+    "os",
+    "date",
+    "group",
+];
+const ROUND_FIELDS: [&str; 4] = ["round_index", "elapsed_ns", "iterations", "gflops"];
+const REFERENCE_FIELDS: [&str; 2] = ["elapsed_ns", "cache_hit"];
+
+fn unknown_field<'a>(value: &'a Value, known: &[&str]) -> Option<&'a str> {
+    match value {
+        Value::Object(fields) => fields
+            .keys()
+            .map(String::as_str)
+            .find(|key| !known.contains(key)),
+        _ => None,
+    }
+}
+
+fn check_known_fields(row: &Value) -> Result<(), String> {
+    if let Some(key) = unknown_field(row, &RECORD_FIELDS) {
+        return Err(format!("unknown record field {key}"));
+    }
+    if let Ok(reference) = row.get("reference_compilation")
+        && let Some(key) = unknown_field(reference, &REFERENCE_FIELDS)
+    {
+        return Err(format!("unknown reference_compilation field {key}"));
+    }
+    if let Ok(rounds) = row.get("rounds").and_then(Value::array) {
+        for (index, round) in rounds.iter().enumerate() {
+            if let Some(key) = unknown_field(round, &ROUND_FIELDS) {
+                return Err(format!("round {index}: unknown field {key}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {

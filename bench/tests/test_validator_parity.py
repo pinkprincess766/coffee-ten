@@ -39,9 +39,6 @@ BINARY = find_binary()
 PYTHON_ONLY_REJECTS = {
     "blank line between records",
     "malformed peak line",
-    "record: extra field",
-    "round 0: extra field",
-    "reference_compilation: extra field",
     "protocol: source_hash not 16 hex digits",
     "protocol: space_hash not 16 hex digits",
     "protocol: unsupported harness_profile",
