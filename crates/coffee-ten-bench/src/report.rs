@@ -173,21 +173,46 @@ fn parse_row(row: &Value) -> Result<Row, String> {
     }
     let count = row.get("samples")?.uint::<usize>()?;
     let raw = row.get("rounds")?.array()?;
-    if count == 0 || count != raw.len() || count != protocol.get("samples")?.uint::<usize>()? {
-        return Err("wrong raw round count".into());
+    let declared = protocol.get("samples")?.uint::<usize>()?;
+    if count == 0 || count != raw.len() || count != declared {
+        return Err(format!(
+            "wrong raw round count: {} rounds, samples {count}, protocol samples {declared}",
+            raw.len()
+        ));
     }
     let mut rounds = Vec::with_capacity(count);
     let mut measurement_ns = 0u128;
     let minimum_ns = u128::from(protocol.get("min_sample_ms")?.uint::<u64>()?) * 1_000_000;
     for (index, value) in raw.iter().enumerate() {
-        let round = RoundSample {
-            round_index: value.get("round_index")?.uint()?,
-            elapsed_ns: value.get("elapsed_ns")?.uint()?,
-            iterations: value.get("iterations")?.uint()?,
-            gflops: value.get("gflops")?.number()?,
+        let field = |name: &str| {
+            value
+                .get(name)
+                .map_err(|e| format!("round {index} {name}: {e}"))
         };
-        if round.round_index != index || round.elapsed_ns == 0 || round.iterations == 0 {
-            return Err("invalid raw round timing or order".into());
+        let round = RoundSample {
+            round_index: field("round_index")?
+                .uint()
+                .map_err(|e| format!("round {index} round_index: {e}"))?,
+            elapsed_ns: field("elapsed_ns")?
+                .uint()
+                .map_err(|e| format!("round {index} elapsed_ns: {e}"))?,
+            iterations: field("iterations")?
+                .uint()
+                .map_err(|e| format!("round {index} iterations: {e}"))?,
+            gflops: field("gflops")?
+                .number()
+                .map_err(|e| format!("round {index} gflops: {e}"))?,
+        };
+        if round.round_index != index {
+            return Err(format!(
+                "invalid raw round order: round {index} has round_index {}",
+                round.round_index
+            ));
+        }
+        if round.elapsed_ns == 0 || round.iterations == 0 {
+            return Err(format!(
+                "invalid raw round timing: round {index} needs positive elapsed_ns and iterations"
+            ));
         }
         if u128::from(round.elapsed_ns) < minimum_ns {
             return Err("raw round is below the protocol minimum duration".into());
