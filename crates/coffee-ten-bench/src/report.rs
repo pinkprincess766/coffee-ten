@@ -341,6 +341,16 @@ pub fn markdown(text: &str, top: usize, bootstrap: BootstrapConfig) -> Result<St
     Ok(out)
 }
 
+/// A non-negative integer flag value; the error names the flag and the rejected text, as the
+/// main harness does (`cli.rs`), instead of a bare `invalid digit found in string`.
+fn flag_value<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, BenchError> {
+    value.parse().map_err(|_| {
+        error(format!(
+            "{flag} needs a non-negative integer, got {value:?}\n{USAGE}"
+        ))
+    })
+}
+
 pub fn command(args: impl IntoIterator<Item = String>) -> Result<String, BenchError> {
     let mut args = args.into_iter().peekable();
     let comparing = args.peek().map(String::as_str) == Some("--compare");
@@ -372,9 +382,9 @@ pub fn command(args: impl IntoIterator<Item = String>) -> Result<String, BenchEr
             .next()
             .ok_or_else(|| error(format!("{flag} needs a value\n{USAGE}")))?;
         match flag.as_str() {
-            "--top" if !comparing => top = value.parse().map_err(error)?,
-            "--seed" => bootstrap.seed = value.parse().map_err(error)?,
-            "--resamples" => bootstrap.resamples = value.parse().map_err(error)?,
+            "--top" if !comparing => top = flag_value(&flag, &value)?,
+            "--seed" => bootstrap.seed = flag_value(&flag, &value)?,
+            "--resamples" => bootstrap.resamples = flag_value(&flag, &value)?,
             _ => return Err(error(format!("unknown argument {flag}\n{USAGE}"))),
         }
     }
