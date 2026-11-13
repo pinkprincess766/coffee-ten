@@ -15,7 +15,7 @@ use numpy::{
     PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyUntypedArray,
     PyUntypedArrayMethods, ndarray,
 };
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -218,18 +218,43 @@ impl PyTensor {
 }
 
 /// Declares a named input of the given static shape (a tuple of ints >= 0).
+///
+/// Every error names the input, and a bad dimension also its index: a non-integer is a
+/// TypeError, an integer outside 64 bits an OverflowError, a negative one or a shape too
+/// large to allocate a ValueError.
 #[pyfunction]
 fn input(name: String, shape: &Bound<'_, PyTuple>) -> PyResult<PyTensor> {
+    let py = shape.py();
     let dims = shape
         .iter()
-        .map(|dim| {
-            let dim: i64 = dim.extract()?;
-            usize::try_from(dim)
-                .map_err(|_| PyValueError::new_err(format!("negative dimension {dim} in shape")))
+        .enumerate()
+        .map(|(index, dim)| {
+            let value: i64 = dim.extract().map_err(|err: PyErr| {
+                let shown = dim.repr().map_or_else(|_| "?".into(), |r| r.to_string());
+                if err.is_instance_of::<PyOverflowError>(py) {
+                    PyOverflowError::new_err(format!(
+                        "input '{name}': dimension {index} is out of range: {shown}"
+                    ))
+                } else {
+                    let kind = dim
+                        .get_type()
+                        .name()
+                        .map_or_else(|_| "?".into(), |n| n.to_string());
+                    PyTypeError::new_err(format!(
+                        "input '{name}': dimension {index} must be an int, got {kind} {shown}"
+                    ))
+                }
+            })?;
+            usize::try_from(value).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "input '{name}': negative dimension {value} at index {index}"
+                ))
+            })
         })
         .collect::<PyResult<Vec<usize>>>()?;
     let shape = Shape::new(dims);
-    check_shape_size(&shape)?;
+    check_shape_size(&shape)
+        .map_err(|err| PyValueError::new_err(format!("input '{name}': {}", err.value(py))))?;
     let expr = Expr::Input {
         name,
         shape: shape.clone(),
