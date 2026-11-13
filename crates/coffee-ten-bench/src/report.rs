@@ -4,8 +4,8 @@ use crate::{
     json::{self, Value},
     run::{RoundSample, fnv1a_64},
     stats::{
-        BootstrapConfig, bootstrap_independent_ratio, bootstrap_median, bootstrap_paired_ratio,
-        drifted, summarize,
+        BootstrapConfig, MIN_ROUNDS_FOR_DRIFT, bootstrap_independent_ratio, bootstrap_median,
+        bootstrap_paired_ratio, drifted, summarize,
     },
 };
 use std::fmt::Write as _;
@@ -219,6 +219,18 @@ pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {
     Ok(rows)
 }
 
+/// The Drift column. With fewer than `MIN_ROUNDS_FOR_DRIFT` rounds the check never ran, so a
+/// stored `false` would read as "no drift" when nothing was tested.
+fn drift_cell(row: &Row) -> &'static str {
+    if row.rounds.len() < MIN_ROUNDS_FOR_DRIFT {
+        "not evaluated"
+    } else if row.drift {
+        "true"
+    } else {
+        "false"
+    }
+}
+
 fn cell(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -300,7 +312,7 @@ pub fn markdown(text: &str, top: usize, bootstrap: BootstrapConfig) -> Result<St
                 ci.lower,
                 ci.upper,
                 row.rounds.len(),
-                row.drift
+                drift_cell(row)
             )
             .unwrap();
         }
@@ -415,7 +427,7 @@ pub fn compare(
             },
             row.median,
             row.rounds.len(),
-            row.drift
+            drift_cell(row)
         )
         .unwrap();
     }
