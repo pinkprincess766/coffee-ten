@@ -36,10 +36,24 @@ fn err(message: impl Into<String>) -> BenchError {
     BenchError::Setup(format!("replay: {}", message.into()))
 }
 
+/// One field of raw round `index`, with errors that name both.
+fn round_field<T>(
+    round: &Value,
+    index: usize,
+    name: &str,
+    read: impl FnOnce(&Value) -> Result<T, String>,
+) -> Result<T, String> {
+    round
+        .get(name)
+        .and_then(read)
+        .map_err(|e| format!("round {index} {name}: {e}"))
+}
+
 fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry, String> {
     let expected = json::parse(&key.to_json())?;
-    if row.get("protocol")? != &expected {
-        return Err("protocol key mismatch".into());
+    let protocol = row.get("protocol")?;
+    if protocol != &expected {
+        return Err(key_mismatch(protocol, &expected));
     }
     for (field, value) in [
         ("kernel", key.kernel.as_str()),
@@ -62,38 +76,61 @@ fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry
             return Err(format!("inconsistent {field}"));
         }
     }
-    if row.get("n")?.uint::<usize>()? != key.n
-        || row.get("samples")?.uint::<usize>()? != key.samples
-        || row.get("seed")?.uint::<u64>()? != key.input_seed
-        || row.get("quick")?.boolean()? != key.quick
-        || !row.get("verified")?.boolean()?
-    {
-        return Err("inconsistent measurement metadata".into());
+    for (field, consistent) in [
+        ("n", row.get("n")?.uint::<usize>()? == key.n),
+        (
+            "samples",
+            row.get("samples")?.uint::<usize>()? == key.samples,
+        ),
+        ("seed", row.get("seed")?.uint::<u64>()? == key.input_seed),
+        ("quick", row.get("quick")?.boolean()? == key.quick),
+        ("verified", row.get("verified")?.boolean()?),
+    ] {
+        if !consistent {
+            return Err(format!("inconsistent measurement metadata: {field}"));
+        }
     }
     if row.get("compilation_wall_ns")? != &Value::Null {
         return Err("unsupported compilation wall accounting".into());
     }
     let rounds = row.get("rounds")?.array()?;
     if rounds.len() != key.samples || rounds.is_empty() {
-        return Err("wrong raw round count".into());
+        return Err(format!(
+            "wrong raw round count: {} rounds, protocol samples {}",
+            rounds.len(),
+            key.samples
+        ));
     }
     let mut rates = Vec::with_capacity(rounds.len());
     let mut measurement_ns = 0u128;
     for (index, round) in rounds.iter().enumerate() {
-        let elapsed: u64 = round.get("elapsed_ns")?.uint()?;
-        let calls: u64 = round.get("iterations")?.uint()?;
-        let rate = round.get("gflops")?.number()?;
-        if elapsed == 0 || calls == 0 || round.get("round_index")?.uint::<usize>()? != index {
-            return Err("invalid raw round timing or order".into());
+        let elapsed: u64 = round_field(round, index, "elapsed_ns", Value::uint)?;
+        let calls: u64 = round_field(round, index, "iterations", Value::uint)?;
+        let rate = round_field(round, index, "gflops", Value::number)?;
+        let round_index: usize = round_field(round, index, "round_index", Value::uint)?;
+        if round_index != index {
+            return Err(format!(
+                "invalid raw round order: round {index} has round_index {round_index}"
+            ));
+        }
+        if elapsed == 0 || calls == 0 {
+            return Err(format!(
+                "invalid raw round timing: round {index} needs positive elapsed_ns and iterations"
+            ));
         }
         if u128::from(elapsed) < u128::from(key.min_sample_ms) * 1_000_000 {
-            return Err("raw round is below the protocol minimum duration".into());
+            return Err(format!(
+                "raw round is below the protocol minimum duration: round {index} took {elapsed} ns, minimum {} ms",
+                key.min_sample_ms
+            ));
         }
         let flop_per_call = 2.0 * (key.n as f64).powi(3);
         let expected =
             flop_per_call * calls as f64 / Duration::from_nanos(elapsed).as_secs_f64() / 1e9;
         if rate <= 0.0 || rate.to_bits() != expected.to_bits() {
-            return Err("raw rate does not match timing".into());
+            return Err(format!(
+                "raw rate does not match timing: round {index} stores {rate:?}, timing gives {expected:?}"
+            ));
         }
         measurement_ns = measurement_ns
             .checked_add(u128::from(elapsed))
@@ -111,10 +148,14 @@ fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry
             return Err(format!("{field} differs from raw rounds"));
         }
     }
-    if row.get("measurement_ns")?.uint::<u128>()? != measurement_ns
-        || row.get("drift")?.boolean()? != drifted(&rates)
-    {
-        return Err("inconsistent measurement cost or drift".into());
+    let stored_ns = row.get("measurement_ns")?.uint::<u128>()?;
+    if stored_ns != measurement_ns {
+        return Err(format!(
+            "inconsistent measurement cost: measurement_ns {stored_ns}, raw rounds sum to {measurement_ns}"
+        ));
+    }
+    if row.get("drift")?.boolean()? != drifted(&rates) {
+        return Err("inconsistent drift: stored flag differs from raw rounds".into());
     }
     Ok(Entry {
         schedule: row.get("schedule")?.text()?.into(),
@@ -123,6 +164,24 @@ fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry
         compilation_ns: row.get("compilation_ns")?.uint()?,
         cache_hit: row.get("cache_hit")?.boolean()?,
     })
+}
+
+/// Names the key fields that differ, so a wrong `--samples`, `--n`, `--space` or a table from
+/// another machine is diagnosed without diffing JSON by hand. Values are not printed: some are
+/// long (`flags`, `cpu`), and the field names are enough to find the flag or file to fix.
+fn key_mismatch(found: &Value, expected: &Value) -> String {
+    let (Value::Object(found), Value::Object(expected)) = (found, expected) else {
+        return "protocol key mismatch: protocol must be an object".into();
+    };
+    let mut fields: Vec<&str> = expected
+        .keys()
+        .chain(found.keys())
+        .map(String::as_str)
+        .filter(|k| found.get(*k) != expected.get(*k))
+        .collect();
+    fields.sort_unstable();
+    fields.dedup();
+    format!("protocol key mismatch: {}", fields.join(", "))
 }
 
 /// Validates the entire table before selecting any candidates. Does not compile or run C.
@@ -788,5 +847,139 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&input).unwrap(), table());
         assert_eq!(REFERENCES_BUILT.with(std::cell::Cell::get), before);
+    }
+
+    fn error_of(text: &str) -> String {
+        from_table(&config(), &metadata(), text)
+            .unwrap_err()
+            .to_string()
+    }
+    fn change_round(field: &str, value: Value) -> String {
+        change_first(|row| {
+            let Value::Array(rounds) = row.get_mut("rounds").unwrap() else {
+                panic!()
+            };
+            let Value::Object(round) = &mut rounds[0] else {
+                panic!()
+            };
+            round.insert(field.into(), value.clone());
+        })
+    }
+    #[test]
+    fn errors_name_the_round_the_field_and_the_counts() {
+        let samples = config().samples;
+        for (bad, expected) in [
+            (
+                change_round("elapsed_ns", Value::Number("0".into())),
+                "round 0 needs positive elapsed_ns and iterations".to_string(),
+            ),
+            (
+                change_round("iterations", Value::Number("0".into())),
+                "round 0 needs positive elapsed_ns and iterations".into(),
+            ),
+            (
+                change_round("round_index", Value::Number("1".into())),
+                "invalid raw round order: round 0 has round_index 1".into(),
+            ),
+            (
+                change_round("gflops", Value::Null),
+                "round 0 gflops: expected finite number".into(),
+            ),
+            (
+                change_round("gflops", Value::Number("1.5".into())),
+                "raw rate does not match timing: round 0 stores 1.5".into(),
+            ),
+            (
+                change_first(|row| {
+                    let Value::Array(rounds) = row.get_mut("rounds").unwrap() else {
+                        panic!()
+                    };
+                    let Value::Object(round) = &mut rounds[0] else {
+                        panic!()
+                    };
+                    round.remove("iterations");
+                }),
+                "round 0 iterations: missing iterations".into(),
+            ),
+            (
+                change_first(|row| {
+                    let Value::Array(rounds) = row.get_mut("rounds").unwrap() else {
+                        panic!()
+                    };
+                    rounds.pop();
+                }),
+                format!(
+                    "wrong raw round count: {} rounds, protocol samples {samples}",
+                    samples - 1
+                ),
+            ),
+            (
+                change_first(|row| {
+                    row.insert("seed".into(), Value::Number("18".into()));
+                }),
+                "inconsistent measurement metadata: seed".into(),
+            ),
+            (
+                change_first(|row| {
+                    row.insert("verified".into(), Value::Bool(false));
+                }),
+                "inconsistent measurement metadata: verified".into(),
+            ),
+            (
+                change_first(|row| {
+                    row.insert("measurement_ns".into(), Value::Number("1".into()));
+                }),
+                "inconsistent measurement cost: measurement_ns 1, raw rounds sum to".into(),
+            ),
+            (
+                change_first(|row| {
+                    let drift = row.get("drift").unwrap().boolean().unwrap();
+                    row.insert("drift".into(), Value::Bool(!drift));
+                }),
+                "inconsistent drift: stored flag differs from raw rounds".into(),
+            ),
+        ] {
+            let err = error_of(&bad);
+            assert!(err.starts_with("replay: line 1: "), "{err}");
+            assert!(err.contains(&expected), "{expected}: {err}");
+        }
+    }
+    #[test]
+    fn a_protocol_mismatch_names_the_differing_fields() {
+        let text = table();
+        // A replay run with other flags than the table's acquisition.
+        let mut more_samples = config();
+        more_samples.samples += 1;
+        let err = from_table(&more_samples, &metadata(), text)
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("protocol key mismatch: samples"), "{err}");
+        let mut slower = config();
+        slower.min_sample_ms += 1;
+        let err = from_table(&slower, &metadata(), text)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.ends_with("protocol key mismatch: min_sample_ms"),
+            "{err}"
+        );
+        // Several fields, in sorted order; extra or missing fields are named too.
+        let mut other = metadata();
+        other.cpu_brand = "other-CPU".into();
+        other.os_version = "other-OS".into();
+        let err = from_table(&config(), &other, text).unwrap_err().to_string();
+        assert!(err.ends_with("protocol key mismatch: cpu, os"), "{err}");
+        let bad = change_first(|row| {
+            let Value::Object(protocol) = row.get_mut("protocol").unwrap() else {
+                panic!()
+            };
+            protocol.remove("rustc");
+            protocol.insert("extra".into(), Value::Null);
+        });
+        assert!(
+            error_of(&bad).ends_with("protocol key mismatch: extra, rustc"),
+            "{}",
+            error_of(&bad)
+        );
     }
 }
