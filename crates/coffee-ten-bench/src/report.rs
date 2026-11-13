@@ -315,6 +315,14 @@ pub fn markdown(text: &str, top: usize, bootstrap: BootstrapConfig) -> Result<St
             out.push_str("\n**Quick smoke data; not a performance measurement.**\n");
         }
         writeln!(out, "\nRecords: {}. Measurement: {measured} ns. Compilation API work: {compiled} ns (includes reference; summed work, not wall time).\n", entries.len()).unwrap();
+        // Costs above cover every record; say how many of them the table below ranks.
+        writeln!(
+            out,
+            "Showing {} of {} records (--top {top}).\n",
+            top.min(entries.len()),
+            entries.len()
+        )
+        .unwrap();
         out.push_str("| Rank | Group | Schedule | Median GFLOP/s | 95% CI | Rounds | Drift |\n| --- | --- | --- | ---: | --- | ---: | --- |\n");
         entries.sort_by(|a, b| b.median.total_cmp(&a.median));
         for (rank, row) in entries.into_iter().take(top).enumerate() {

@@ -18,7 +18,8 @@ ranking of the supplied rows, not a new search decision.
 
 The 95% percentile bootstrap uses N4, with defaults `--seed 1 --resamples 10000`.
 Intervals cover uncertainty across the supplied rounds, not independent process restarts
-or the effect of choosing the best observed candidate. `--top` defaults to 10. Quick
+or the effect of choosing the best observed candidate. `--top` defaults to 10; each table states
+`Showing k of m records` so a truncated table is not mistaken for the whole run. Quick
 logs carry a prominent smoke-data label. Drift flags are retained; with fewer than 10
 rounds (two disjoint windows of 5) the check cannot run, and the Drift column says
 `not evaluated` instead of `false`. Markdown table text is escaped, and an input-byte fingerprint identifies the exact log.

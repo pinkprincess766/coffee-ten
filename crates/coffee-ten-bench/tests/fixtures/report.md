@@ -17,6 +17,8 @@ Input fingerprint: `cd0e590f0c28fdc1`.
 
 Records: 3. Measurement: 56000000 ns. Compilation API work: 650 ns (includes reference; summed work, not wall time).
 
+Showing 2 of 3 records (--top 2).
+
 | Rank | Group | Schedule | Median GFLOP/s | 95% CI | Rounds | Drift |
 | --- | --- | --- | ---: | --- | ---: | --- |
 | 1 | random | vectorize(1, j) | 4.000000 | [2.000000, 8.000000] | 3 | not evaluated |
