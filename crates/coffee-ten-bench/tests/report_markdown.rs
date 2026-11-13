@@ -12,8 +12,9 @@ const HOSTILE: &str = r#"a|b `c` <i>d</i> &amp; *e* _f_ [g](h) \\ ~~i~~ \nj"#;
 const ESCAPED: &str = "a&#124;b &#96;c&#96; &lt;i&gt;d&lt;/i&gt; &amp;amp; &#42;e&#42; &#95;f&#95; &#91;g&#93;(h) &#92; &#126;&#126;i&#126;&#126;  j";
 
 fn hostile_log() -> String {
+    // `group` is no longer free text (one of naive/random/model/local/final), so it cannot
+    // carry hostile text; see `hostile_group_is_rejected_not_rendered`.
     let text = LOG
-        .replace("\"group\":\"random\"", &format!("\"group\":\"{HOSTILE}\""))
         .replace(
             "\"schedule\":\"vectorize(1, j)\"",
             &format!("\"schedule\":\"{HOSTILE}\""),
@@ -43,21 +44,23 @@ fn report_escapes_every_copied_field() {
         "{out}"
     );
     assert!(out.contains(&format!("- cpu: {ESCAPED}\n")), "{out}");
-    // Group and schedule cells of the two random rows.
+    // Group and schedule cells of the random row whose schedule was replaced.
     assert_eq!(
-        out.matches(&format!("| {ESCAPED} | {ESCAPED} |")).count(),
+        out.matches(&format!("| random | {ESCAPED} |")).count(),
         1,
         "{out}"
-    );
-    assert_eq!(
-        out.matches(&format!("| {ESCAPED} | split(1, j, jo, ji, 2) |"))
-            .count(),
-        1
     );
     assert_tables_intact(&out, 7);
     for raw in ["<i>", "`c`", "*e*", "_f_", "[g]", "~~i~~", "a|b"] {
         assert!(!out.contains(raw), "{raw} leaked: {out}");
     }
+}
+
+#[test]
+fn hostile_group_is_rejected_not_rendered() {
+    let text = LOG.replace("\"group\":\"random\"", &format!("\"group\":\"{HOSTILE}\""));
+    let err = report::markdown(&text, 10, CONFIG).unwrap_err().to_string();
+    assert!(err.contains("invalid group"), "{err}");
 }
 
 #[test]
