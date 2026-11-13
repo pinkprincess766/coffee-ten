@@ -84,7 +84,7 @@ fn every_line_must_be_one_json_object() {
 }
 
 #[test]
-fn record_kinds_are_strings_and_only_peak_rows_are_skipped() {
+fn record_kinds_are_strings_and_only_peak_rows_are_left_out() {
     assert_eq!(
         error(&format!("{LOG}{{\"kind\":1}}\n")),
         "report: line 5: kind: expected string"
@@ -96,9 +96,11 @@ fn record_kinds_are_strings_and_only_peak_rows_are_skipped() {
             "{kind}"
         );
     }
-    // A peak row is skipped whatever else it carries; a log of only peaks has no records.
-    let peaks = "{\"kind\":\"peak\",\"anything\":[1,{}]}\n{\"kind\":\"peak\"}\n";
-    assert_eq!(error(peaks), "report: no measurement records");
+    // A valid peak row is checked, then left out of the tables; a log of only peaks has no
+    // records. Malformed peak rows are covered in `report_peak.rs`.
+    let peak = LOG.lines().next().unwrap();
+    let peaks = format!("{peak}\n{peak}\n");
+    assert_eq!(error(&peaks), "report: no measurement records");
     let with_peaks = report::markdown(&format!("{peaks}{LOG}"), 2, CONFIG).unwrap();
     assert_eq!(
         body(&with_peaks),

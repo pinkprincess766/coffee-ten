@@ -231,6 +231,7 @@ pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {
             }
             if let Ok(kind) = value.get("kind") {
                 if kind.text().map_err(|e| format!("kind: {e}"))? == "peak" {
+                    check_peak(&value)?;
                     return Ok(None);
                 }
                 return Err("expected live measurements, not offline curve records".into());
@@ -245,6 +246,83 @@ pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {
         return Err(error("no measurement records"));
     }
     Ok(rows)
+}
+
+/// `bench/peak` statistics a peak line carries (`bench/validate.py` `PEAK_STATS`).
+const PEAK_STATS: [&str; 11] = [
+    "fma_gflops",
+    "triad_gbs",
+    "triad_l2_gbs",
+    "fma_mem_acc_gflops",
+    "fma_mem_acc_scalar_gflops",
+    "fma_chain_gflops",
+    "fma_chain256_gflops",
+    "fma_store_gflops",
+    "fma_mem_acc_scalar_unrolled_gflops",
+    "fma_col_reload_gflops",
+    "fma_col_unrolled_gflops",
+];
+/// Positive problem sizes of the peak benchmarks (`PEAK_INTS`).
+const PEAK_INTS: [&str; 4] = ["fma_chains", "triad_n", "triad_l2_n", "mem_acc_n"];
+const PEAK_STAT_FIELDS: [&str; 5] = ["median", "p25", "p75", "min", "n"];
+
+/// The report ranks no peak line, but it checks one as `bench/validate.py` does instead of
+/// skipping it unread: exactly the current fields, positive sizes and ordered statistics.
+fn check_peak(peak: &Value) -> Result<(), String> {
+    let Value::Object(fields) = peak else {
+        return Err("peak: expected object".into());
+    };
+    let known = |key: &str| key == "kind" || PEAK_STATS.contains(&key) || PEAK_INTS.contains(&key);
+    if let Some(key) = fields.keys().find(|key| !known(key)) {
+        return Err(format!("peak: unknown field {key}"));
+    }
+    for name in PEAK_INTS {
+        let value = peak
+            .get(name)
+            .map_err(|e| format!("peak: {e}"))?
+            .uint::<u64>()
+            .map_err(|e| format!("peak {name}: {e}"))?;
+        if value == 0 {
+            return Err(format!("peak {name}: expected positive integer"));
+        }
+    }
+    for name in PEAK_STATS {
+        let stats = peak.get(name).map_err(|e| format!("peak: {e}"))?;
+        let Value::Object(fields) = stats else {
+            return Err(format!("peak {name}: expected object"));
+        };
+        if let Some(key) = fields
+            .keys()
+            .find(|key| !PEAK_STAT_FIELDS.contains(&key.as_str()))
+        {
+            return Err(format!("peak {name}: unknown field {key}"));
+        }
+        let count = stats
+            .get("n")
+            .map_err(|e| format!("peak {name}: {e}"))?
+            .uint::<u64>()
+            .map_err(|e| format!("peak {name} n: {e}"))?;
+        if count == 0 {
+            return Err(format!("peak {name} n: expected positive integer"));
+        }
+        let mut rates = [0.0; 4];
+        for (rate, field) in rates.iter_mut().zip(["min", "p25", "median", "p75"]) {
+            *rate = stats
+                .get(field)
+                .map_err(|e| format!("peak {name}: {e}"))?
+                .number()
+                .map_err(|e| format!("peak {name} {field}: {e}"))?;
+            if *rate <= 0.0 {
+                return Err(format!(
+                    "peak {name} {field}: expected finite positive rate"
+                ));
+            }
+        }
+        if !rates.is_sorted() {
+            return Err(format!("peak {name}: unordered statistics"));
+        }
+    }
+    Ok(())
 }
 
 /// The Drift column. With fewer than `MIN_ROUNDS_FOR_DRIFT` rounds the check never ran, so a

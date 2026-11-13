@@ -1,6 +1,6 @@
 # Run report
 
-Input fingerprint: `cd0e590f0c28fdc1`.
+Input fingerprint: `607f6a4ff4823fc0`.
 
 95% percentile bootstrap: 257 resamples, seed 42. Intervals describe supplied rounds, not process restarts or winner-selection uncertainty.
 
