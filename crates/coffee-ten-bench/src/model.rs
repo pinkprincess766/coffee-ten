@@ -1336,8 +1336,22 @@ fn from_note(
     note
 }
 
-fn read_results(path: &str) -> Result<String, BenchError> {
-    std::fs::read_to_string(path).map_err(|e| model_err(format!("cannot read {path}: {e}")))
+/// The text of the file `path` given to `flag`. An empty path is a usage error; a file
+/// with nothing but whitespace is refused here, so the error names the file.
+fn read_results(flag: &str, path: &str) -> Result<String, BenchError> {
+    if path.is_empty() {
+        return Err(BenchError::Usage(format!(
+            "{flag} needs a file path, got \"\"\n{USAGE}"
+        )));
+    }
+    let text =
+        std::fs::read_to_string(path).map_err(|e| model_err(format!("cannot read {path}: {e}")))?;
+    if text.trim().is_empty() {
+        return Err(model_err(format!(
+            "{flag} {path}: the file is empty, so it has no peak line and no records"
+        )));
+    }
+    Ok(text)
 }
 
 /// Parses the arguments after `model`.
@@ -1356,7 +1370,7 @@ pub fn parse_model_args<I: IntoIterator<Item = String>>(
         let speed = || match value.parse::<f64>() {
             Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
             _ => Err(usage(format!(
-                "{flag} needs a positive number, got {value:?}"
+                "{flag} needs a finite number greater than 0, got {value:?}"
             ))),
         };
         match flag.as_str() {
@@ -1366,7 +1380,7 @@ pub fn parse_model_args<I: IntoIterator<Item = String>>(
                 })?);
             }
             "--from" => {
-                let text = read_results(&value)?;
+                let text = read_results("--from", &value)?;
                 let (from, vector, scalar) = machine_from_results(&text)?;
                 machine = from;
                 source = from_note(
@@ -1751,7 +1765,7 @@ pub fn cli_main<I: IntoIterator<Item = String>>(args: I) -> std::process::ExitCo
             // --peak: the machine comes from that file's peak line instead of --from's.
             let mut text = String::new();
             if let Some(peak) = &peak {
-                let peak_text = read_results(peak)?;
+                let peak_text = read_results("--peak", peak)?;
                 // Validate the selected source before adding a run with its own peak.
                 machine_from_results(&peak_text)?;
                 text.extend(
@@ -1761,7 +1775,7 @@ pub fn cli_main<I: IntoIterator<Item = String>>(args: I) -> std::process::ExitCo
                         .map(|l| format!("{l}\n")),
                 );
             }
-            text.push_str(&read_results(&from)?);
+            text.push_str(&read_results("--from", &from)?);
             let source = match &peak {
                 Some(peak) => format!("{from} (peak line from {peak})"),
                 None => from,
