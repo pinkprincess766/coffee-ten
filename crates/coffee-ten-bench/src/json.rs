@@ -279,4 +279,58 @@ mod tests {
         assert!(parse(&"[".repeat(34)).is_err());
         assert!(parse("1e999").unwrap().number().is_err());
     }
+    #[test]
+    fn nesting_limit_is_exactly_33_levels() {
+        // Depth 0 is the outer value; depths 0..=32 are allowed.
+        let ok = format!("{}{}", "[".repeat(33), "]".repeat(33));
+        assert!(parse(&ok).is_ok());
+        let deep = format!("{}{}", "[".repeat(34), "]".repeat(34));
+        assert_eq!(parse(&deep).unwrap_err(), "JSON nesting limit");
+    }
+    #[test]
+    fn unicode_escapes_must_be_complete_scalar_values() {
+        for s in [
+            r#""\uDC00""#,       // lone low surrogate
+            r#""\uD800\u0041""#, // high surrogate followed by a non-surrogate
+            r#""\uD800x""#,      // high surrogate without a second escape
+            r#""\u12""#,         // short escape
+            r#""\u12G4""#,       // non-hex digit
+            r#""\u00é0""#,       // non-ASCII inside the escape
+            "\"abc",             // unterminated
+        ] {
+            assert!(parse(s).is_err(), "{s}");
+        }
+        assert_eq!(parse(r#""\u00e9\/""#).unwrap(), Value::String("é/".into()));
+    }
+    #[test]
+    fn unsigned_integers_are_digits_only_and_range_checked() {
+        let n = |s: &str| parse(s).unwrap();
+        assert_eq!(n("18446744073709551615").uint::<u64>(), Ok(u64::MAX));
+        assert_eq!(
+            n("18446744073709551616").uint::<u64>(),
+            Err("integer out of range".into())
+        );
+        for s in ["-1", "-0", "1.0", "1e3", "0.5"] {
+            assert!(n(s).uint::<u64>().is_err(), "{s}");
+            assert!(n(s).number().is_ok(), "{s}");
+        }
+        assert_eq!(n("0").uint::<u64>(), Ok(0));
+        assert!(n("\"1\"").uint::<u64>().is_err());
+        assert!(n("true").number().is_err());
+    }
+    #[test]
+    fn whitespace_empty_input_and_keys() {
+        assert_eq!(
+            parse(" \t\r\n{ } \n").unwrap(),
+            Value::Object(BTreeMap::new())
+        );
+        for s in ["", "   ", "{1:2}", "{\"a\" 1}", "{\"a\":}", "nul", "tru"] {
+            assert!(parse(s).is_err(), "{s:?}");
+        }
+        // Keys are compared after decoding, so an escaped duplicate is still a duplicate.
+        assert_eq!(
+            parse(r#"{"a":1,"\u0061":2}"#).unwrap_err(),
+            "duplicate JSON key"
+        );
+    }
 }

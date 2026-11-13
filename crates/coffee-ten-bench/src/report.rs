@@ -201,8 +201,11 @@ pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {
         }
         let parse = || -> Result<Option<Row>, String> {
             let value = json::parse(line)?;
+            if !matches!(value, Value::Object(_)) {
+                return Err("expected one JSON object per line".into());
+            }
             if let Ok(kind) = value.get("kind") {
-                if kind.text()? == "peak" {
+                if kind.text().map_err(|e| format!("kind: {e}"))? == "peak" {
                     return Ok(None);
                 }
                 return Err("expected live measurements, not offline curve records".into());
