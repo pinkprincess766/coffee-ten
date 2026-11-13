@@ -259,12 +259,20 @@ fn drift_cell(row: &Row) -> &'static str {
     }
 }
 
+/// Text from the log as inert Markdown: no HTML, no table breaks, no code spans, no
+/// emphasis, no links. Every special character becomes a numeric entity that renders as itself.
 fn cell(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('|', "&#124;")
         .replace('`', "&#96;")
+        .replace('\\', "&#92;")
+        .replace('*', "&#42;")
+        .replace('_', "&#95;")
+        .replace('[', "&#91;")
+        .replace(']', "&#93;")
+        .replace('~', "&#126;")
         .replace(['\n', '\r'], " ")
 }
 
