@@ -64,6 +64,50 @@ the report. Paired mode uses N4's shared-index resampling and checks matching in
 `--seed` and `--resamples` apply to either mode. Neither interval corrects winner-selection
 bias or captures variation across process restarts. No search/acquisition behavior changes.
 
+### Example
+
+The golden `crates/coffee-ten-bench/tests/fixtures/report-compare.md`, pinned byte for byte
+through the API and the binary by `tests/report_compare_golden.rs`, is the output of:
+
+```sh
+cargo run --release -p coffee-ten-bench -- report --compare \
+  crates/coffee-ten-bench/tests/fixtures/report-b.jsonl \
+  crates/coffee-ten-bench/tests/fixtures/report.jsonl --resamples 257 --seed 42
+```
+
+```markdown
+# Run comparison
+
+A fingerprint: `081ee30d6c09ae9c`. B fingerprint: `607f6a4ff4823fc0`.
+
+**Quick smoke data; not a performance measurement.**
+
+Ratio: median(best A) / median(best B). 95% percentile bootstrap, 257 resamples, seed 42, independent resampling.
+
+| Run | Best schedule | Median GFLOP/s | Rounds | Drift |
+| --- | --- | ---: | ---: | --- |
+| A | vectorize(1, j) | 8.000000 | 3 | not evaluated |
+| B | vectorize(1, j) | 4.000000 | 3 | not evaluated |
+
+Median ratio A/B: 2.000000; 95% CI [0.500000, 8.000000].
+
+Intervals are conditional on the selected winners and supplied rounds; they do not adjust for winner selection or independent process restarts.
+```
+
+- The fingerprints identify the exact bytes of each input file, as in a single-run report.
+- The bold smoke-data line appears when the shared protocol key has `quick: true`.
+- **Run**: `A` is the first file, `B` the second.
+- **Best schedule**: the winner of that file, the first row with the highest lower median;
+  `(naive)` for the empty schedule.
+- **Median GFLOP/s**: the winner's recorded lower median.
+- **Rounds**: how many raw rounds the winner has; these are what the bootstrap resamples.
+- **Drift**: the winner's drift flag, or `not evaluated` with fewer than 10 rounds, as in a
+  single-run report.
+- **Median ratio A/B**: `median(best A) / median(best B)` and its 95% interval. With
+  `--paired` the same inputs give the golden `report-compare-paired.md`: the method reads
+  `paired (asserted by caller) resampling` and the interval is `[2.000000, 2.000000]`,
+  because the fixture's rounds are exactly proportional.
+
 ## Exit status
 
 `report` and `curve` exit 0 on success, 2 when the command line is wrong (the message ends
