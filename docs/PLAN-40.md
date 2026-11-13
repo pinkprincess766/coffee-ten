@@ -9,6 +9,82 @@
 С 24.10 мерж — после ревью Ники и зелёного CI. «Ок» Никиты нужен для новых зависимостей,
 замеров на Маке и отклонений от протокола.
 
+## Статус на 13.11.2026
+
+Все пункты P1–P40 и вставка V1–V5 сделаны отдельными PR; статус — на момент этого PR
+(P37 идёт последним). План — #199.
+
+| Пункт | PR | Статус | Суть |
+| --- | --- | --- | --- |
+| P1 | [#195](https://github.com/pinkprincess766/coffee-ten/pull/195) | слит | Полный и закрытый ключ протокола |
+| P2 | [#194](https://github.com/pinkprincess766/coffee-ten/pull/194) | слит | Drift `not evaluated` при < 10 раундах |
+| P3 | [#196](https://github.com/pinkprincess766/coffee-ten/pull/196) | слит | JSON/JSONL-ридер |
+| P4 | [#197](https://github.com/pinkprincess766/coffee-ten/pull/197) | слит | Краевые случаи статистики |
+| P5 | [#198](https://github.com/pinkprincess766/coffee-ten/pull/198) | слит | Несовпадающие ключи |
+| P6 | [#200](https://github.com/pinkprincess766/coffee-ten/pull/200) | слит | `replay.rs`: понятные ошибки |
+| P7 | [#204](https://github.com/pinkprincess766/coffee-ten/pull/204) | слит | Общий валидатор сырых раундов |
+| P8 | [#201](https://github.com/pinkprincess766/coffee-ten/pull/201) | слит | `report`: ошибки чисел называют флаг |
+| P9 | [#202](https://github.com/pinkprincess766/coffee-ten/pull/202) | слит | `--help`/`-h` |
+| P10 | [#203](https://github.com/pinkprincess766/coffee-ten/pull/203) | слит | `curve`: свой usage |
+| P11 | [#205](https://github.com/pinkprincess766/coffee-ten/pull/205) | слит | Коды возврата 2/1 |
+| P12 | [#206](https://github.com/pinkprincess766/coffee-ten/pull/206) | слит | `--compare`: разошедшиеся поля ключа |
+| P13 | [#207](https://github.com/pinkprincess766/coffee-ten/pull/207) | слит | `Showing k of m records` |
+| P14 | [#208](https://github.com/pinkprincess766/coffee-ten/pull/208) | слит | `--paired`: ошибка несовпадающих раундов |
+| P15 | [#209](https://github.com/pinkprincess766/coffee-ten/pull/209) | слит | Экранирование Markdown |
+| P16 | [#210](https://github.com/pinkprincess766/coffee-ten/pull/210) | слит | Golden `--compare` |
+| P17 | [#211](https://github.com/pinkprincess766/coffee-ten/pull/211) | слит | Ранги перцентилей при малом B |
+| P18 | [#212](https://github.com/pinkprincess766/coffee-ten/pull/212) | слит | `json_string` ↔ `json::parse` |
+| P19 | [#213](https://github.com/pinkprincess766/coffee-ten/pull/213) | слит | `append_lines`: ошибки |
+| P20 | [#214](https://github.com/pinkprincess766/coffee-ten/pull/214) | слит | Паритет `validate.py` ↔ `report` |
+| P21 | [#215](https://github.com/pinkprincess766/coffee-ten/pull/215) | слит | Граница дрейфа 5 % |
+| P22 | [#216](https://github.com/pinkprincess766/coffee-ten/pull/216) | слит | Графики: дрейф не оценён |
+| P23 | [#217](https://github.com/pinkprincess766/coffee-ten/pull/217) | слит | `input()`: проверки формы |
+| P24 | [#218](https://github.com/pinkprincess766/coffee-ten/pull/218) | слит | `run()`: входы |
+| P25 | [#219](https://github.com/pinkprincess766/coffee-ten/pull/219) | слит | Оси reduce |
+| V1 | [#220](https://github.com/pinkprincess766/coffee-ten/pull/220) | слит | Метаданные записи |
+| V2 | [#221](https://github.com/pinkprincess766/coffee-ten/pull/221) | слит | Закрытые наборы полей |
+| V3 | [#222](https://github.com/pinkprincess766/coffee-ten/pull/222) | слит | Пустые строки JSONL |
+| V4 | [#223](https://github.com/pinkprincess766/coffee-ten/pull/223) | слит | Проверка peak-строк |
+| V5 | [#224](https://github.com/pinkprincess766/coffee-ten/pull/224) | слит | `MaskedArray` в Python API |
+| P26 | [#225](https://github.com/pinkprincess766/coffee-ten/pull/225) | слит | Операторы с неподдерживаемыми типами |
+| P27 | [#226](https://github.com/pinkprincess766/coffee-ten/pull/226) | слит | Глубина и размер графа |
+| P28 | [#227](https://github.com/pinkprincess766/coffee-ten/pull/227) | слит | Golden C |
+| P29 | [#228](https://github.com/pinkprincess766/coffee-ten/pull/228) | слит | Ошибка clang |
+| P30 | [#229](https://github.com/pinkprincess766/coffee-ten/pull/229) | слит | Позиция ошибки в тексте расписания |
+| P31 | [#230](https://github.com/pinkprincess766/coffee-ten/pull/230) | слит | `space`: ошибки аргументов |
+| P32 | [#231](https://github.com/pinkprincess766/coffee-ten/pull/231) | слит | `model`: `--peak` и `--from` |
+| P33 | [#234](https://github.com/pinkprincess766/coffee-ten/pull/234) | открыт | Пример `--compare` в `docs/reports.md` |
+| P34 | [#235](https://github.com/pinkprincess766/coffee-ten/pull/235) | открыт | Схема раунда и ошибки |
+| P35 | [#236](https://github.com/pinkprincess766/coffee-ten/pull/236) | открыт | Команды в README |
+| P36 | [#237](https://github.com/pinkprincess766/coffee-ten/pull/237) | открыт | `MIN_ROUNDS_FOR_DRIFT` в `docs/protocol.md` |
+| P37 | этот PR | открыт | Этот статус и бэклог |
+| P38 | [#232](https://github.com/pinkprincess766/coffee-ten/pull/232) | слит | CI: `cargo doc` |
+| P39 | [#238](https://github.com/pinkprincess766/coffee-ten/pull/238) | открыт | CI: golden отчёта N20, отчёт перегенерирован |
+| P40 | [#233](https://github.com/pinkprincess766/coffee-ten/pull/233) | открыт | CI: `compileall` и `bench/tests` |
+
+## Бэклог после плана (каждое — только с «ок» Никиты)
+
+Найдено при работе над планом, в 40 не входит; новых задач без согласования не берём.
+
+- Валидатор (#214): формат `source_hash`/`space_hash` (16 строчных hex-цифр) и допустимые значения
+  `harness_profile` — `report` проверяет только наличие и тип; касается ключа протокола N2.
+- `compile()` глубоких выражений: C вкладывает скобки на каждую операцию, clang отказывает
+  глубже 256 (`-fbracket-depth`), хотя билдер (1000 уровней) и lowering (1000 узлов) их
+  пропускают (#226). Варианты: временные переменные только выше ~200 уровней вложенности,
+  чтобы C всех текущих ядер остался байт в байт; или `-fbracket-depth` — это смена флагов,
+  то есть протокола.
+- CSE при lowering: `MAX_EXPR_NODES` считает узлы дерева, переиспользованное поддерево —
+  при каждом использовании (`y + y` девять раз — 1023 узла при глубине 10, #226).
+- `--peak` в `model` — число (GFLOP/s), а в `model compare` — путь к файлу с peak-строкой.
+- `curve` не может выполнить «каждая команда из README запускается» вне Мака: replay требует
+  точного ключа машины/тулчейна/исходников (#236).
+- `bench/README.md` разрешает `rounds[].gflops` = `null`, а `report`/`replay` его отклоняют
+  (`expected finite number`, #235).
+- Граница дрейфа 5 % в плавающей точке: `1.0 → 1.05` помечается, `3.0 → 3.15` — нет
+  (#215). Смена порога или арифметики — изменение протокола.
+- Манифест `bench/results/2026-11-07-n20-manifest.json` хранит SHA-256 и размер старого
+  `…n256.report.md`; после слияния P39 (#238) запись устареет.
+
 ## Общие ограничения (для всех P)
 
 - Автор и коммиттер — `Cursor Agent <cursoragent@cursor.com>`, без `Co-authored-by`.
@@ -47,8 +123,8 @@ C9 — кэш расписаний; потоки; GP и любые модели 
 - **V4** — peak-строки проверяются, а не пропускаются.
 - **V5** — Python API: `numpy.ma.MaskedArray` на входе `run()`/`Kernel` — `TypeError`
   вместо тихого игнорирования маски.
-- Позже, только с «ок» Никиты: формат `source_hash`/`space_hash` и `harness_profile`
-  (касается ключа протокола).
+- Формат `source_hash`/`space_hash` и `harness_profile` (касается ключа протокола) — в
+  бэклоге, см. «Бэклог после плана».
 
 ## Пакет 1 — слит (#194–#198)
 
@@ -71,8 +147,8 @@ C9 — кэш расписаний; потоки; GP и любые модели 
 - Изменение: колонка Drift в обеих таблицах печатает `not evaluated`.
 - Приёмка: 3 и 9 раундов → `not evaluated`; 10 ровных → `false`; 10 со скачком → `true`; golden обновлён.
 - Ограничения: только отображение; флаг `drift` в JSONL и его проверка не меняются.
-- После #194 сохранённый `bench/results/2026-11-07-n20-v1-n256.report.md` устарел в колонке
-  Drift (там `false` вместо `not evaluated`). Перегенерировать его — только с «ок» Никиты.
+- Сохранённый `bench/results/2026-11-07-n20-v1-n256.report.md` перегенерируется в P39
+  ([#238](https://github.com/pinkprincess766/coffee-ten/pull/238), открыт на момент P37) с «ок» Никиты.
 
 ### P3 — JSON/JSONL-ридер (Вера)
 - Цель: закрепить поведение на CRLF, пустых строках, обрезанной последней записи, BOM, склеенных записях.
@@ -97,7 +173,7 @@ C9 — кэш расписаний; потоки; GP и любые модели 
 | P | PR | Примечание |
 | --- | --- | --- |
 | P6 | [#200](https://github.com/pinkprincess766/coffee-ten/pull/200) | |
-| P7 | [#204](https://github.com/pinkprincess766/coffee-ten/pull/204) | поверх #200, мержить после него |
+| P7 | [#204](https://github.com/pinkprincess766/coffee-ten/pull/204) | слит после #200 |
 | P8 | [#201](https://github.com/pinkprincess766/coffee-ten/pull/201) | |
 | P9 | [#202](https://github.com/pinkprincess766/coffee-ten/pull/202) | |
 | P10 | [#203](https://github.com/pinkprincess766/coffee-ten/pull/203) | |
@@ -301,9 +377,9 @@ C9 — кэш расписаний; потоки; GP и любые модели 
 ### P39 — CI: golden отчёта по реальному логу N20
 - Цель: `report` на `bench/results/2026-11-07-n20-v1-n256.jsonl` совпадает с сохранённым `.report.md`.
 - Приёмка: шаг падает при расхождении.
-- Ограничения: после #194 сохранённый `bench/results/2026-11-07-n20-v1-n256.report.md` устарел
-  в колонке Drift (`false` вместо `not evaluated`), поэтому шаг включается только после его
-  перегенерации, а перегенерация — только с «ок» Никиты.
+- [#238](https://github.com/pinkprincess766/coffee-ten/pull/238) (открыт на момент P37): отчёт перегенерирован
+  с «ок» Никиты (Drift `false` → `not evaluated` и строка `Showing 10 of 7335 records`),
+  шаг в bench-smoke сравнивает его с выводом `report`.
 
 ### P40 — CI: `python -m compileall bench` и `bench/tests` в job `python`
 - Цель: синтаксические ошибки скриптов `bench/` ловятся не только в bench-smoke.
