@@ -214,14 +214,15 @@ reorder(1, io, jo, k, ii, ji);
 vectorize(1, ji)
 ```
 
-A syntax error carries the byte offset in the text:
+A syntax error names its line and column (1-based, in characters), what was expected there
+and what was found:
 
 ```schedule bad
 vectorize(1, j);
 ```
 
 ```error
-schedule text at byte 16: expected identifier
+schedule text line 1, column 17: expected step (split, reorder, vectorize or unroll), found end of text
 ```
 
 ```schedule bad
@@ -229,7 +230,7 @@ split(1, j, jo, ji, 0)
 ```
 
 ```error
-schedule text at byte 20: factor must be at least 1
+schedule text line 1, column 21: factor must be at least 1
 ```
 
 ```schedule bad
@@ -237,7 +238,7 @@ split(1, j, j, ji, 4)
 ```
 
 ```error
-schedule text at byte 12: repeated loop name
+schedule text line 1, column 13: repeated loop name 'j'
 ```
 
 ### 2.2 Steps and nest numbering
@@ -263,7 +264,7 @@ float sums (`preserving`) and which do not (`reordering`).
 ### 2.3 Legality
 
 `apply` refuses a step with a `ScheduleError`. `step` counts from 0 in the schedule. The error
-text has the step number and the nest, but no byte offset: the schedule was already parsed.
+text has the step number and the nest, but no line or column: the schedule was already parsed.
 
 | Error kind | Text | When |
 |---|---|---|

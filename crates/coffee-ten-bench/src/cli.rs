@@ -74,8 +74,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Ben
             "--variant" => {
                 let schedule = Schedule::parse(&value).map_err(|e| {
                     usage(format!(
-                        "--variant {value:?}: {} (at byte {})",
-                        e.msg, e.pos
+                        "--variant {value:?}: {} (line {}, column {})",
+                        e.msg, e.line, e.column
                     ))
                 })?;
                 variants.push((value, schedule));

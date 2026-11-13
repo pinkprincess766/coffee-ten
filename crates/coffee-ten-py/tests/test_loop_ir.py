@@ -50,7 +50,7 @@ def test_compiled_kernel_stores_the_loop_ir_after_the_schedule(tmp_path):
 
 
 def test_bad_schedule_text_is_a_value_error():
-    with pytest.raises(ValueError, match="byte"):
+    with pytest.raises(ValueError, match="^schedule text line 1, column 7: expected number"):
         ct.loop_ir(matmul_expr(), schedule="split(!")
 
 

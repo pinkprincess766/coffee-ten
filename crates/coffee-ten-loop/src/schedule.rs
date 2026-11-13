@@ -35,10 +35,14 @@ pub struct Schedule {
     pub steps: Vec<Step>,
 }
 
-/// `pos` is the byte offset in the input text.
+/// A syntax error in schedule text. `pos` is the byte offset in the text; `line` and `column`
+/// are 1-based, with `column` counted in characters. `msg` names what was expected and what
+/// was found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduleParseError {
     pub pos: usize,
+    pub line: usize,
+    pub column: usize,
     pub msg: String,
 }
 
@@ -61,7 +65,7 @@ impl Schedule {
             p.pos += 1;
         }
         if p.peek().is_some() {
-            return Err(error_at(p.pos, "expected ';' or end of text"));
+            return Err(p.expected("';' or end of text"));
         }
         Ok(Schedule { steps })
     }
@@ -96,18 +100,18 @@ fn write_step(f: &mut fmt::Formatter<'_>, step: &Step) -> fmt::Result {
 
 impl fmt::Display for ScheduleParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "schedule text at byte {}: {}", self.pos, self.msg)
+        write!(
+            f,
+            "schedule text line {}, column {}: {}",
+            self.line, self.column, self.msg
+        )
     }
 }
 
 impl std::error::Error for ScheduleParseError {}
 
-fn error_at(pos: usize, msg: &str) -> ScheduleParseError {
-    ScheduleParseError {
-        pos,
-        msg: msg.to_string(),
-    }
-}
+/// The step names, as listed in errors.
+const STEPS: &str = "split, reorder, vectorize or unroll";
 
 /// Cursor over the text. `pos` only moves over ASCII bytes, so it is always a char boundary.
 struct Parser<'a> {
@@ -116,6 +120,37 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
+    fn error_at(&self, pos: usize, msg: String) -> ScheduleParseError {
+        let before = &self.text[..pos];
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        ScheduleParseError {
+            pos,
+            line: before.matches('\n').count() + 1,
+            column: before[line_start..].chars().count() + 1,
+            msg,
+        }
+    }
+
+    /// `expected <what>, found <the token at pos>`.
+    fn expected(&self, what: &str) -> ScheduleParseError {
+        self.error_at(self.pos, format!("expected {what}, found {}", self.found()))
+    }
+
+    /// The token at `pos`: a quoted word (letters, digits and `_`) or character, or
+    /// `end of text`.
+    fn found(&self) -> String {
+        let rest = &self.text[self.pos..];
+        let word_len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        match rest.chars().next() {
+            None => "end of text".to_string(),
+            Some(_) if word_len > 0 => format!("'{}'", &rest[..word_len]),
+            Some(c) => format!("'{c}'"),
+        }
+    }
+
     fn peek(&self) -> Option<u8> {
         self.text.as_bytes().get(self.pos).copied()
     }
@@ -133,19 +168,20 @@ impl Parser<'_> {
             self.pos += 1;
             Ok(())
         } else {
-            Err(error_at(self.pos, &format!("expected '{}'", char::from(c))))
+            Err(self.expected(&format!("'{}'", char::from(c))))
         }
     }
 
-    fn ident(&mut self) -> Result<String, ScheduleParseError> {
+    /// An identifier; `what` names it in the error.
+    fn ident(&mut self, what: &str) -> Result<String, ScheduleParseError> {
         self.skip_ws();
-        let start = self.pos;
         if !self
             .peek()
             .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
         {
-            return Err(error_at(start, "expected identifier"));
+            return Err(self.expected(what));
         }
+        let start = self.pos;
         while self
             .peek()
             .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -159,9 +195,9 @@ impl Parser<'_> {
     fn loop_name(&mut self, seen: &[&str]) -> Result<String, ScheduleParseError> {
         self.skip_ws();
         let start = self.pos;
-        let name = self.ident()?;
+        let name = self.ident("loop name")?;
         if seen.contains(&name.as_str()) {
-            return Err(error_at(start, "repeated loop name"));
+            return Err(self.error_at(start, format!("repeated loop name '{name}'")));
         }
         Ok(name)
     }
@@ -173,11 +209,11 @@ impl Parser<'_> {
             self.pos += 1;
         }
         if self.pos == start {
-            return Err(error_at(start, "expected number"));
+            return Err(self.expected("number"));
         }
         self.text[start..self.pos]
             .parse()
-            .map_err(|_| error_at(start, "number too large"))
+            .map_err(|_| self.error_at(start, format!("number too large (at most {})", usize::MAX)))
     }
 
     fn factor(&mut self) -> Result<usize, ScheduleParseError> {
@@ -185,7 +221,7 @@ impl Parser<'_> {
         let start = self.pos;
         let factor = self.number()?;
         if factor == 0 {
-            return Err(error_at(start, "factor must be at least 1"));
+            return Err(self.error_at(start, "factor must be at least 1".to_string()));
         }
         Ok(factor)
     }
@@ -193,12 +229,12 @@ impl Parser<'_> {
     fn step(&mut self) -> Result<Step, ScheduleParseError> {
         self.skip_ws();
         let start = self.pos;
-        match self.ident()?.as_str() {
+        match self.ident(&format!("step ({STEPS})"))?.as_str() {
             "split" => self.split(),
             "reorder" => self.reorder(),
             "vectorize" => self.vectorize(),
             "unroll" => self.unroll(),
-            _ => Err(error_at(start, "unknown step")),
+            name => Err(self.error_at(start, format!("unknown step '{name}', expected {STEPS}"))),
         }
     }
 
@@ -233,8 +269,10 @@ impl Parser<'_> {
             let name = self.loop_name(&seen)?;
             order.push(name);
             self.skip_ws();
-            if self.peek() != Some(b',') {
-                break;
+            match self.peek() {
+                Some(b',') => {}
+                Some(b')') => break,
+                _ => return Err(self.expected("',' or ')'")),
             }
         }
         self.expect(b')')?;
@@ -292,6 +330,21 @@ mod tests {
         Schedule::parse(text).expect_err(text)
     }
 
+    /// Asserts the error of `text`: its byte offset, its column on line 1 and its `Display`.
+    #[track_caller]
+    fn assert_error(text: &str, pos: usize, column: usize, msg: &str) {
+        let e = parse_error(text);
+        assert_eq!(
+            (e.pos, e.line, e.column, e.msg.as_str()),
+            (pos, 1, column, msg),
+            "{text}"
+        );
+        assert_eq!(
+            e.to_string(),
+            format!("schedule text line 1, column {column}: {msg}")
+        );
+    }
+
     #[test]
     fn example_parses_and_prints_back() {
         let s = Schedule::parse(EXAMPLE).expect("example is valid");
@@ -344,120 +397,182 @@ mod tests {
         let s = Schedule::parse(&format!("vectorize({max}, j)")).expect("usize::MAX is valid");
         assert_eq!(s.to_string(), format!("vectorize({max}, j)"));
         let too_big = (usize::MAX as u128 + 1).to_string();
-        assert_eq!(
-            Schedule::parse(&format!("vectorize({too_big}, j)")).expect_err("one past usize::MAX"),
-            ScheduleParseError {
-                pos: 10,
-                msg: "number too large".to_string(),
-            }
+        assert_error(
+            &format!("vectorize({too_big}, j)"),
+            10,
+            11,
+            &format!("number too large (at most {max})"),
         );
     }
 
     #[test]
     fn zero_factor_is_rejected() {
-        // `split(1, k, ko, ki, ` is 20 bytes, so the factor `0` is at byte 20.
-        assert_eq!(
-            parse_error("split(1, k, ko, ki, 0)"),
-            ScheduleParseError {
-                pos: 20,
-                msg: "factor must be at least 1".to_string(),
-            }
+        // `split(1, k, ko, ki, ` is 20 bytes, so the factor `0` is at byte 20, column 21.
+        assert_error(
+            "split(1, k, ko, ki, 0)",
+            20,
+            21,
+            "factor must be at least 1",
         );
     }
 
     #[test]
     fn unknown_step_is_rejected() {
         // `splt` starts at byte 0.
-        assert_eq!(
-            parse_error("splt(1, k)"),
-            ScheduleParseError {
-                pos: 0,
-                msg: "unknown step".to_string(),
-            }
+        assert_error(
+            "splt(1, k)",
+            0,
+            1,
+            "unknown step 'splt', expected split, reorder, vectorize or unroll",
+        );
+        // Step names are case-sensitive.
+        assert_error(
+            "Vectorize(1, j)",
+            0,
+            1,
+            "unknown step 'Vectorize', expected split, reorder, vectorize or unroll",
         );
     }
 
     #[test]
     fn missing_close_paren_is_rejected_at_end() {
         // `vectorize(1, j` is 14 bytes; the error is at end of input.
-        assert_eq!(
-            parse_error("vectorize(1, j"),
-            ScheduleParseError {
-                pos: 14,
-                msg: "expected ')'".to_string(),
-            }
-        );
+        assert_error("vectorize(1, j", 14, 15, "expected ')', found end of text");
     }
 
     #[test]
     fn trailing_semicolon_is_rejected_at_end() {
         // `vectorize(1, j);` is 16 bytes; the step expected after `;` is at end of input.
-        assert_eq!(
-            parse_error("vectorize(1, j);"),
-            ScheduleParseError {
-                pos: 16,
-                msg: "expected identifier".to_string(),
-            }
+        assert_error(
+            "vectorize(1, j);",
+            16,
+            17,
+            "expected step (split, reorder, vectorize or unroll), found end of text",
         );
     }
 
     #[test]
     fn reorder_without_loops_is_rejected() {
         // `reorder(1` is 9 bytes; the `)` at byte 9 is where a `,` is expected.
-        assert_eq!(
-            parse_error("reorder(1)"),
-            ScheduleParseError {
-                pos: 9,
-                msg: "expected ','".to_string(),
-            }
-        );
+        assert_error("reorder(1)", 9, 10, "expected ',', found ')'");
     }
 
     #[test]
     fn repeated_reorder_loop_is_rejected() {
         // `reorder(1, i, ` is 14 bytes; the second `i` is at byte 14.
-        assert_eq!(
-            parse_error("reorder(1, i, i)"),
-            ScheduleParseError {
-                pos: 14,
-                msg: "repeated loop name".to_string(),
-            }
-        );
+        assert_error("reorder(1, i, i)", 14, 15, "repeated loop name 'i'");
     }
 
     #[test]
     fn split_names_must_differ() {
         // `split(1, k, ` is 12 bytes; `outer` = `k` repeats `loop_name` at byte 12.
-        assert_eq!(
-            parse_error("split(1, k, k, ki, 4)"),
-            ScheduleParseError {
-                pos: 12,
-                msg: "repeated loop name".to_string(),
-            }
-        );
+        assert_error("split(1, k, k, ki, 4)", 12, 13, "repeated loop name 'k'");
     }
 
     #[test]
     fn identifier_cannot_start_with_digit() {
         // `vectorize(1, ` is 13 bytes; `1j` starts at byte 13.
-        assert_eq!(
-            parse_error("vectorize(1, 1j)"),
-            ScheduleParseError {
-                pos: 13,
-                msg: "expected identifier".to_string(),
-            }
-        );
+        assert_error("vectorize(1, 1j)", 13, 14, "expected loop name, found '1j'");
     }
 
     #[test]
     fn number_overflow_is_rejected() {
         // `vectorize(` is 10 bytes; the nest number starts at byte 10.
+        assert_error(
+            "vectorize(99999999999999999999, j)",
+            10,
+            11,
+            &format!("number too large (at most {})", usize::MAX),
+        );
+    }
+
+    #[test]
+    fn typical_typos_name_the_expected_token() {
+        let cases = [
+            // A missing comma between arguments.
+            ("split(1 k, ko, ki, 4)", 8, "expected ',', found 'k'"),
+            // `:` or `,` instead of `;` between steps.
+            (
+                "vectorize(1, j): unroll(1, i)",
+                15,
+                "expected ';' or end of text, found ':'",
+            ),
+            (
+                "vectorize(1, j), unroll(1, i)",
+                15,
+                "expected ';' or end of text, found ','",
+            ),
+            // Two steps without a separator.
+            (
+                "vectorize(1, j) unroll(1, i)",
+                16,
+                "expected ';' or end of text, found 'unroll'",
+            ),
+            // A doubled `)`.
+            (
+                "vectorize(1, j))",
+                15,
+                "expected ';' or end of text, found ')'",
+            ),
+            // A missing `(`.
+            ("vectorize 1, j)", 10, "expected '(', found '1'"),
+            // A missing `)` before the next step.
+            (
+                "vectorize(1, j; unroll(1, i)",
+                14,
+                "expected ')', found ';'",
+            ),
+            // An empty argument.
+            ("split(1, , ko, ki, 4)", 9, "expected loop name, found ','"),
+            // A loop name where the nest number goes.
+            ("vectorize(j)", 10, "expected number, found 'j'"),
+            // A loop name where the factor goes.
+            ("split(1, k, ko, ki, f)", 20, "expected number, found 'f'"),
+            // A missing factor.
+            ("split(1, k, ko, ki)", 18, "expected ',', found ')'"),
+            // Too many arguments.
+            ("vectorize(1, j, i)", 14, "expected ')', found ','"),
+            // A reorder list cut off by the next step.
+            (
+                "reorder(1, i, j; vectorize(1, j)",
+                15,
+                "expected ',' or ')', found ';'",
+            ),
+            ("reorder(1, i j)", 13, "expected ',' or ')', found 'j'"),
+            // Something that is not a word or punctuation.
+            ("vectorize(1, -j)", 13, "expected loop name, found '-'"),
+            (
+                "+",
+                0,
+                "expected step (split, reorder, vectorize or unroll), found '+'",
+            ),
+        ];
+        for (text, pos, msg) in cases {
+            assert_error(text, pos, pos + 1, msg);
+        }
+    }
+
+    #[test]
+    fn line_and_column_count_lines_and_characters() {
+        // The error is at the end of line 3: `\t` is one column, then 11 more.
+        let e = parse_error("split(1, k, ko, ki, 4);\nvectorize(1, j);\n\tunroll(1, x");
+        assert_eq!((e.pos, e.line, e.column), (53, 3, 13));
         assert_eq!(
-            parse_error("vectorize(99999999999999999999, j)"),
-            ScheduleParseError {
-                pos: 10,
-                msg: "number too large".to_string(),
-            }
+            e.to_string(),
+            "schedule text line 3, column 13: expected ')', found end of text"
+        );
+        // A non-ASCII character is one column however many bytes it has.
+        let e = parse_error("vectorize(1, é)");
+        assert_eq!((e.pos, e.line, e.column), (13, 1, 14));
+        assert_eq!(e.msg, "expected loop name, found 'é'");
+        let e = parse_error("vectorize(1, é é)");
+        assert_eq!((e.pos, e.line, e.column), (13, 1, 14));
+        // `\r\n` line ends: the `\r` is whitespace before the newline, not a column.
+        let e = parse_error("vectorize(1, j);\r\nunrol(1, i)");
+        assert_eq!((e.pos, e.line, e.column), (18, 2, 1));
+        assert_eq!(
+            e.msg,
+            "unknown step 'unrol', expected split, reorder, vectorize or unroll"
         );
     }
 }
