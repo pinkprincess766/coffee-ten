@@ -305,15 +305,16 @@ coffee-ten-bench space reduce --shape <D0,D1,...> --axis <AXIS> [--op sum|max] [
 pub fn parse_space_config_args<I: IntoIterator<Item = String>>(
     args: I,
 ) -> Result<SpaceArgs, crate::BenchError> {
+    let usage = |msg: String| crate::BenchError::Usage(format!("{msg}\n{SPACE_USAGE}"));
     let mut legacy = Vec::new();
     let mut args = args.into_iter();
     let mut space = SpaceConfig::V1;
     while let Some(flag) = args.next() {
         let value = args
             .next()
-            .ok_or_else(|| crate::BenchError::Usage(format!("{flag} needs a value")))?;
+            .ok_or_else(|| usage(format!("{flag} needs a value")))?;
         if flag == "--space" {
-            space = SpaceConfig::from_arg(&value)?;
+            space = SpaceConfig::from_arg(&value).map_err(|e| usage(e.to_string()))?;
         } else {
             legacy.extend([flag, value]);
         }
@@ -342,7 +343,11 @@ pub fn parse_space_args<I: IntoIterator<Item = String>>(
                 })?;
                 n = Some(parsed);
             }
-            _ => return Err(usage(format!("unknown argument {flag}"))),
+            _ => {
+                return Err(usage(format!(
+                    "unknown argument {flag}, expected --n or --space"
+                )));
+            }
         }
     }
     let n = n.ok_or_else(|| usage("--n is required".to_string()))?;
