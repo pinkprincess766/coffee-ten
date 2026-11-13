@@ -4,6 +4,8 @@ Compiled code and the interpreter do the same f32 operations in the same order, 
 comparisons are bit for bit; only a reordering schedule is compared with a tolerance.
 """
 
+import re
+
 import numpy as np
 import pytest
 from test_diff_numpy import gamma
@@ -131,8 +133,9 @@ def test_reordering_schedule_is_within_the_float64_bound(tmp_path):
 # --- Errors ---------------------------------------------------------------------------
 
 
-def test_schedule_text_error_has_the_byte_offset(tmp_path):
-    with pytest.raises(ValueError, match="byte"):
+def test_schedule_text_error_has_the_line_and_column(tmp_path):
+    message = "schedule text line 1, column 7: expected number, found '!'"
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         ct.compile(matmul_expr(4, 3, 2), schedule="split(!", cache_dir=tmp_path)
 
 

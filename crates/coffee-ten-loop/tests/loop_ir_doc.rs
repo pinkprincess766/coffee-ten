@@ -14,8 +14,8 @@
 //!   is either a `loop-ir` block, which must equal the printed result, or an `error` block,
 //!   which must equal the `Display` of the `apply` error.
 //! - `schedule bad`: schedule text that must fail to parse. The next block is an `error` block.
-//!   Schedule text is the block without its last newline, so a byte offset in an error counts
-//!   from the first character of the block.
+//!   Schedule text is the block without its last newline, so the line and column in an error
+//!   count from the first character of the block.
 //! - `error`: the expected one-line error text. It must follow a block that asks for it.
 //! - `grammar`: reference text; not checked.
 
