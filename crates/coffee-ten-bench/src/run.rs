@@ -947,6 +947,40 @@ mod tests {
         assert_eq!(json_string("\u{1f} "), r#""\u001f ""#);
     }
 
+    /// Every scalar written by `json_string` reads back unchanged through `json::parse`, alone,
+    /// next to its neighbours, and as a value inside a one-line object like a log record.
+    #[test]
+    fn json_string_round_trips_through_the_log_parser() {
+        let latin1 = (0u32..=0xff).filter_map(char::from_u32);
+        // Plane boundaries, the last scalar before and first after the surrogates, line and
+        // paragraph separators, BOM, replacement character, and astral plane samples.
+        let others = [
+            0x100, 0x7ff, 0x800, 0x2028, 0x2029, 0xd7ff, 0xe000, 0xfeff, 0xfffd, 0xffff, 0x1_0000,
+            0x1_f408, 0x1_f600, 0xe_0001, 0x10_ffff,
+        ]
+        .map(|code| char::from_u32(code).unwrap());
+        let chars: Vec<char> = latin1.chain(others).collect();
+        assert_eq!(chars.len(), 256 + 15);
+        let read =
+            |text: &str| crate::json::parse(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+        for &c in &chars {
+            let text = format!("{c}x{c}{c}\"{c}\\");
+            let encoded = json_string(&text);
+            // No raw control character reaches the line; the parser would reject it.
+            assert!(
+                !encoded.chars().any(|e| (e as u32) < 0x20),
+                "U+{:04X}",
+                c as u32
+            );
+            assert_eq!(read(&encoded).text().unwrap(), text, "U+{:04X}", c as u32);
+        }
+        let all: String = chars.iter().collect();
+        let line = format!("{{\"kind\":\"record\",\"schedule\":{}}}", json_string(&all));
+        assert!(!line.contains('\n'), "a record must stay on one JSONL line");
+        assert_eq!(read(&line).get("schedule").unwrap().text().unwrap(), all);
+        assert_eq!(read(&json_string("")).text().unwrap(), "");
+    }
+
     #[test]
     fn non_finite_numbers_become_null() {
         assert_eq!(json_number(f64::NAN), "null");
