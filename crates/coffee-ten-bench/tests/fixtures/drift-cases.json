@@ -1,0 +1,19 @@
+{
+ "comment": "Drift fixtures shared by stats::drifted (Rust) and bench/validate.py (Python). n = 2, every round 16 ms; a round's rate is 2 n^3 iterations / elapsed / 1e9, computed as the harness does. Expected flags were computed in IEEE doubles, so nominal 5% changes land on either side of the limit.",
+ "n": 2,
+ "elapsed_ns": 16000000,
+ "cases": [
+  {"name": "nine rounds are never checked, even at 2x", "iterations": [1000000, 1000000, 1000000, 1000000, 1000000, 2000000, 2000000, 2000000, 2000000], "drift": false},
+  {"name": "nominal +5% at 1.0 GFLOP/s rounds above the limit", "iterations": [1000000, 1000000, 1000000, 1000000, 1000000, 1050000, 1050000, 1050000, 1050000, 1050000], "drift": true},
+  {"name": "nominal -5% at 1.0 GFLOP/s rounds above the limit", "iterations": [1000000, 1000000, 1000000, 1000000, 1000000, 950000, 950000, 950000, 950000, 950000], "drift": true},
+  {"name": "nominal +5% at 3.0 GFLOP/s rounds below the limit", "iterations": [3000000, 3000000, 3000000, 3000000, 3000000, 3150000, 3150000, 3150000, 3150000, 3150000], "drift": false},
+  {"name": "nominal -5% at 3.0 GFLOP/s rounds below the limit", "iterations": [3000000, 3000000, 3000000, 3000000, 3000000, 2850000, 2850000, 2850000, 2850000, 2850000], "drift": false},
+  {"name": "exactly 0.05 at 20.0 GFLOP/s is not more than the limit", "iterations": [20000000, 20000000, 20000000, 20000000, 20000000, 21000000, 21000000, 21000000, 21000000, 21000000], "drift": false},
+  {"name": "nominal +5% at 11.0 GFLOP/s rounds above the limit", "iterations": [11000000, 11000000, 11000000, 11000000, 11000000, 11550000, 11550000, 11550000, 11550000, 11550000], "drift": true},
+  {"name": "one iteration over 5% at 1.0 GFLOP/s", "iterations": [1000000, 1000000, 1000000, 1000000, 1000000, 1050001, 1050001, 1050001, 1050001, 1050001], "drift": true},
+  {"name": "4.9% stays unflagged", "iterations": [1000000, 1000000, 1000000, 1000000, 1000000, 1049000, 1049000, 1049000, 1049000, 1049000], "drift": false},
+  {"name": "rounds between the windows are ignored", "iterations": [1000000, 1000000, 1000000, 1000000, 1000000, 3000000, 1040000, 1040000, 1040000, 1040000, 1040000], "drift": false},
+  {"name": "window medians, not first and last rounds", "iterations": [900000, 1000000, 1100000, 1000000, 2000000, 1060000, 100000, 1060000, 5000000, 1060000], "drift": true},
+  {"name": "outliers inside a window do not move its median", "iterations": [1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 10000000, 10000000], "drift": false}
+ ]
+}

@@ -256,4 +256,36 @@ mod tests {
             assert!((-1.0..1.0).contains(&x), "{x}");
         }
     }
+
+    /// The same cases as `bench/tests/test_validate.py`, so the Rust flag and the Python
+    /// recomputation in `bench/validate.py` cannot disagree on the 5% boundary.
+    #[test]
+    fn drift_cases_shared_with_validate_py() {
+        let fixture =
+            crate::json::parse(include_str!("../tests/fixtures/drift-cases.json")).unwrap();
+        let n = fixture.get("n").unwrap().uint::<u32>().unwrap();
+        let elapsed = std::time::Duration::from_nanos(
+            fixture.get("elapsed_ns").unwrap().uint::<u64>().unwrap(),
+        );
+        let cases = fixture.get("cases").unwrap().array().unwrap();
+        assert_eq!(cases.len(), 12);
+        for case in cases {
+            let name = case.get("name").unwrap().text().unwrap();
+            // Same expression and evaluation order as the harness (`run::time_sample`).
+            let rates: Vec<f64> = case
+                .get("iterations")
+                .unwrap()
+                .array()
+                .unwrap()
+                .iter()
+                .map(|it| {
+                    2.0 * f64::from(n).powi(3) * it.uint::<u64>().unwrap() as f64
+                        / elapsed.as_secs_f64()
+                        / 1e9
+                })
+                .collect();
+            let expected = case.get("drift").unwrap().boolean().unwrap();
+            assert_eq!(drifted(&rates), expected, "{name}");
+        }
+    }
 }

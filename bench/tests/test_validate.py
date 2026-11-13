@@ -110,6 +110,42 @@ class SchemaTests(unittest.TestCase):
             with self.subTest(rates=rates, flag=not expected), self.assertRaisesRegex(ValueError, "drift"):
                 schema.validate(row)
 
+    def test_drift_boundary_cases_shared_with_rust(self):
+        # stats::drifted reads the same file (drift_cases_shared_with_validate_py), so both
+        # sides must flag exactly these cases, including nominal 5% changes that IEEE
+        # rounding puts just above or just below the limit.
+        fixture = json.loads((ROOT / "crates/coffee-ten-bench/tests/fixtures/drift-cases.json").read_text())
+        self.assertEqual(fixture["n"], self.row["n"])
+        seconds, nanos = divmod(fixture["elapsed_ns"], 1_000_000_000)
+        elapsed_s = float(seconds) + float(nanos) / 1e9
+        n = float(fixture["n"])
+        flags = []
+        for case in fixture["cases"]:
+            iterations = case["iterations"]
+            rates = [2.0 * ((n * n) * n) * float(it) / elapsed_s / 1e9 for it in iterations]
+            row = copy.deepcopy(self.row)
+            row["samples"] = row["protocol"]["samples"] = len(rates)
+            row["rounds"] = [dict(round_index=i, elapsed_ns=fixture["elapsed_ns"],
+                                  iterations=it, gflops=rate)
+                             for i, (it, rate) in enumerate(zip(iterations, rates))]
+            row["measurement_ns"] = fixture["elapsed_ns"] * len(rates)
+            ordered = sorted(rates)
+            last = len(rates) - 1
+            for field, index in [("min", 0), ("p25", last // 4),
+                                 ("median", last // 2), ("p75", 3 * last // 4)]:
+                row[field] = ordered[index]
+            row["drift"] = case["drift"]
+            with self.subTest(case=case["name"]):
+                schema.validate(row)
+            row["drift"] = not case["drift"]
+            with self.subTest(case=case["name"], flipped=True), self.assertRaisesRegex(ValueError, "drift"):
+                schema.validate(row)
+            flags.append(case["drift"])
+        # Both outcomes are covered, and so are the short-run and exact-0.05 cases.
+        self.assertIn(True, flags)
+        self.assertIn(False, flags)
+        self.assertTrue(any(len(c["iterations"]) < 10 for c in fixture["cases"]))
+
     def test_strict_json_and_file_line_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "input.jsonl"
