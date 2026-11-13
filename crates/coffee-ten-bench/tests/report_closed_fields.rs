@@ -69,3 +69,15 @@ fn every_written_field_is_still_accepted() {
     report::markdown(LOG, 10, CONFIG).unwrap();
     report::markdown(&with_line_2(",\"group\":\"naive\"", ""), 10, CONFIG).unwrap();
 }
+
+#[test]
+fn legacy_log_with_extra_field_still_gets_the_legacy_error() {
+    // Legacy rows carry fields current records do not (here `gflops`); the missing protocol
+    // is the real problem, so it is reported before any unknown field.
+    let legacy =
+        "{\"kernel\":\"matmul\",\"n\":64,\"schedule\":\"\",\"gflops\":1.5,\"median\":1.5}\n";
+    assert_eq!(
+        rejected(legacy),
+        "report: line 1: N1/N2 log required: raw rounds and protocol are unavailable in legacy logs"
+    );
+}

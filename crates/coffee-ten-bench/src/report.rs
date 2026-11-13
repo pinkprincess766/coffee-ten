@@ -146,12 +146,45 @@ fn validate_protocol(protocol: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Record metadata that the report does not use but `bench/validate.py` requires, checked
+/// with the same rules so the two validators accept the same logs.
+const ORDER_CLASSES: [&str; 2] = ["preserving", "reordering"];
+const GROUPS: [&str; 5] = ["naive", "random", "model", "local", "final"];
+
+fn check_metadata(row: &Value) -> Result<(), String> {
+    for name in ["commit", "date"] {
+        row.get(name)?.text().map_err(|e| format!("{name}: {e}"))?;
+    }
+    let dirty = row.get("dirty")?;
+    if dirty != &Value::Null && dirty.boolean().is_err() {
+        return Err("dirty: expected bool or null".into());
+    }
+    let order_class = row
+        .get("order_class")?
+        .text()
+        .map_err(|e| format!("order_class: {e}"))?;
+    if !ORDER_CLASSES.contains(&order_class) {
+        return Err(format!("invalid order_class {order_class:?}"));
+    }
+    if let Ok(group) = row.get("group") {
+        let group = group.text().map_err(|e| format!("group: {e}"))?;
+        if !GROUPS.contains(&group) {
+            return Err(format!("invalid group {group:?}"));
+        }
+        if group == "naive" && !row.get("schedule")?.text()?.is_empty() {
+            return Err("naive schedule must be empty".into());
+        }
+    }
+    Ok(())
+}
+
 fn parse_row(row: &Value) -> Result<Row, String> {
-    check_known_fields(row)?;
     let protocol = row.get("protocol").map_err(
         |_| "N1/N2 log required: raw rounds and protocol are unavailable in legacy logs",
     )?;
+    check_known_fields(row)?;
     validate_protocol(protocol)?;
+    check_metadata(row)?;
     if protocol.get("version")?.uint::<u32>()? != crate::protocol::VERSION {
         return Err("unsupported protocol version".into());
     }
