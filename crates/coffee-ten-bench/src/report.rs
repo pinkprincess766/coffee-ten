@@ -146,11 +146,45 @@ fn validate_protocol(protocol: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Record metadata that the report does not use but `bench/validate.py` requires, checked
+/// with the same rules so the two validators accept the same logs.
+const ORDER_CLASSES: [&str; 2] = ["preserving", "reordering"];
+const GROUPS: [&str; 5] = ["naive", "random", "model", "local", "final"];
+
+fn check_metadata(row: &Value) -> Result<(), String> {
+    for name in ["commit", "date"] {
+        row.get(name)?.text().map_err(|e| format!("{name}: {e}"))?;
+    }
+    let dirty = row.get("dirty")?;
+    if dirty != &Value::Null && dirty.boolean().is_err() {
+        return Err("dirty: expected bool or null".into());
+    }
+    let order_class = row
+        .get("order_class")?
+        .text()
+        .map_err(|e| format!("order_class: {e}"))?;
+    if !ORDER_CLASSES.contains(&order_class) {
+        return Err(format!("invalid order_class {order_class:?}"));
+    }
+    if let Ok(group) = row.get("group") {
+        let group = group.text().map_err(|e| format!("group: {e}"))?;
+        if !GROUPS.contains(&group) {
+            return Err(format!("invalid group {group:?}"));
+        }
+        if group == "naive" && !row.get("schedule")?.text()?.is_empty() {
+            return Err("naive schedule must be empty".into());
+        }
+    }
+    Ok(())
+}
+
 fn parse_row(row: &Value) -> Result<Row, String> {
     let protocol = row.get("protocol").map_err(
         |_| "N1/N2 log required: raw rounds and protocol are unavailable in legacy logs",
     )?;
+    check_known_fields(row)?;
     validate_protocol(protocol)?;
+    check_metadata(row)?;
     if protocol.get("version")?.uint::<u32>()? != crate::protocol::VERSION {
         return Err("unsupported protocol version".into());
     }
@@ -216,6 +250,74 @@ fn parse_row(row: &Value) -> Result<Row, String> {
         compilation_ns,
         drift,
     })
+}
+
+/// Every field a current record may carry (`bench/validate.py` `RECORD_FIELDS`, plus the
+/// optional `group`). Like the protocol key, the record, its raw rounds and its reference
+/// compilation are closed: a field nobody checks is rejected rather than ignored.
+const RECORD_FIELDS: [&str; 31] = [
+    "kernel",
+    "n",
+    "graph_hash",
+    "schedule",
+    "order_class",
+    "verified",
+    "quick",
+    "samples",
+    "median",
+    "p25",
+    "p75",
+    "min",
+    "drift",
+    "rounds",
+    "protocol",
+    "measurement_ns",
+    "compilation_ns",
+    "cache_hit",
+    "reference_compilation",
+    "compilation_wall_ns",
+    "unit",
+    "seed",
+    "commit",
+    "dirty",
+    "clang",
+    "flags",
+    "machine",
+    "cpu",
+    "os",
+    "date",
+    "group",
+];
+const ROUND_FIELDS: [&str; 4] = ["round_index", "elapsed_ns", "iterations", "gflops"];
+const REFERENCE_FIELDS: [&str; 2] = ["elapsed_ns", "cache_hit"];
+
+fn unknown_field<'a>(value: &'a Value, known: &[&str]) -> Option<&'a str> {
+    match value {
+        Value::Object(fields) => fields
+            .keys()
+            .map(String::as_str)
+            .find(|key| !known.contains(key)),
+        _ => None,
+    }
+}
+
+fn check_known_fields(row: &Value) -> Result<(), String> {
+    if let Some(key) = unknown_field(row, &RECORD_FIELDS) {
+        return Err(format!("unknown record field {key}"));
+    }
+    if let Ok(reference) = row.get("reference_compilation")
+        && let Some(key) = unknown_field(reference, &REFERENCE_FIELDS)
+    {
+        return Err(format!("unknown reference_compilation field {key}"));
+    }
+    if let Ok(rounds) = row.get("rounds").and_then(Value::array) {
+        for (index, round) in rounds.iter().enumerate() {
+            if let Some(key) = unknown_field(round, &ROUND_FIELDS) {
+                return Err(format!("round {index}: unknown field {key}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {

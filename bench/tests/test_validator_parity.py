@@ -38,18 +38,6 @@ BINARY = find_binary()
 # harness_profile for presence and type, not format. Closing a gap: move it out of here.
 PYTHON_ONLY_REJECTS = {
     "malformed peak line",
-    "record: missing commit",
-    "record: missing date",
-    "record: missing dirty",
-    "record: missing order_class",
-    "record: extra field",
-    "record: bad commit type",
-    "record: bad date type",
-    "record: bad dirty type",
-    "record: bad order_class",
-    "record: bad group",
-    "round 0: extra field",
-    "reference_compilation: extra field",
     "protocol: source_hash not 16 hex digits",
     "protocol: space_hash not 16 hex digits",
     "protocol: unsupported harness_profile",
