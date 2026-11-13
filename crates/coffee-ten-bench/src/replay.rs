@@ -9,10 +9,9 @@ use crate::{
     run::{RunInfo, build_kernel, fnv1a_64, json_string},
     search::{SearchConfig, best_index_so_far, sample},
     space::matmul_space_for,
-    stats::{drifted, summarize},
 };
 use coffee_ten_loop::OrderClass;
-use std::{collections::HashMap, fmt::Write as _, time::Duration};
+use std::{collections::HashMap, fmt::Write as _};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -34,19 +33,6 @@ pub struct Replay {
 }
 fn err(message: impl Into<String>) -> BenchError {
     BenchError::Setup(format!("replay: {}", message.into()))
-}
-
-/// One field of raw round `index`, with errors that name both.
-fn round_field<T>(
-    round: &Value,
-    index: usize,
-    name: &str,
-    read: impl FnOnce(&Value) -> Result<T, String>,
-) -> Result<T, String> {
-    round
-        .get(name)
-        .and_then(read)
-        .map_err(|e| format!("round {index} {name}: {e}"))
 }
 
 fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry, String> {
@@ -101,66 +87,12 @@ fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry
             key.samples
         ));
     }
-    let mut rates = Vec::with_capacity(rounds.len());
-    let mut measurement_ns = 0u128;
-    for (index, round) in rounds.iter().enumerate() {
-        let elapsed: u64 = round_field(round, index, "elapsed_ns", Value::uint)?;
-        let calls: u64 = round_field(round, index, "iterations", Value::uint)?;
-        let rate = round_field(round, index, "gflops", Value::number)?;
-        let round_index: usize = round_field(round, index, "round_index", Value::uint)?;
-        if round_index != index {
-            return Err(format!(
-                "invalid raw round order: round {index} has round_index {round_index}"
-            ));
-        }
-        if elapsed == 0 || calls == 0 {
-            return Err(format!(
-                "invalid raw round timing: round {index} needs positive elapsed_ns and iterations"
-            ));
-        }
-        if u128::from(elapsed) < u128::from(key.min_sample_ms) * 1_000_000 {
-            return Err(format!(
-                "raw round is below the protocol minimum duration: round {index} took {elapsed} ns, minimum {} ms",
-                key.min_sample_ms
-            ));
-        }
-        let flop_per_call = 2.0 * (key.n as f64).powi(3);
-        let expected =
-            flop_per_call * calls as f64 / Duration::from_nanos(elapsed).as_secs_f64() / 1e9;
-        if rate <= 0.0 || rate.to_bits() != expected.to_bits() {
-            return Err(format!(
-                "raw rate does not match timing: round {index} stores {rate:?}, timing gives {expected:?}"
-            ));
-        }
-        measurement_ns = measurement_ns
-            .checked_add(u128::from(elapsed))
-            .ok_or("measurement time overflow")?;
-        rates.push(rate);
-    }
-    let stats = summarize(&rates).ok_or("empty rounds")?;
-    for (field, expected) in [
-        ("median", stats.median),
-        ("p25", stats.p25),
-        ("p75", stats.p75),
-        ("min", stats.min),
-    ] {
-        if row.get(field)?.number()?.to_bits() != expected.to_bits() {
-            return Err(format!("{field} differs from raw rounds"));
-        }
-    }
-    let stored_ns = row.get("measurement_ns")?.uint::<u128>()?;
-    if stored_ns != measurement_ns {
-        return Err(format!(
-            "inconsistent measurement cost: measurement_ns {stored_ns}, raw rounds sum to {measurement_ns}"
-        ));
-    }
-    if row.get("drift")?.boolean()? != drifted(&rates) {
-        return Err("inconsistent drift: stored flag differs from raw rounds".into());
-    }
+    let checked = crate::rounds::validate(rounds, key.n, key.min_sample_ms)?;
+    crate::rounds::check_aggregates(row, &checked)?;
     Ok(Entry {
         schedule: row.get("schedule")?.text()?.into(),
-        median: stats.median,
-        measurement_ns,
+        median: checked.stats.median,
+        measurement_ns: checked.measurement_ns,
         compilation_ns: row.get("compilation_ns")?.uint()?,
         cache_hit: row.get("cache_hit")?.boolean()?,
     })
@@ -631,7 +563,7 @@ mod tests {
     fn rejects_self_consistent_rounds_below_the_protocol_minimum() {
         let bad = change_first(|row| {
             let samples = row.get("samples").unwrap().uint::<usize>().unwrap();
-            let rate = (16.0 / Duration::from_nanos(1).as_secs_f64() / 1e9).to_string();
+            let rate = (16.0 / std::time::Duration::from_nanos(1).as_secs_f64() / 1e9).to_string();
             let rounds = (0..samples)
                 .map(|i| {
                     Value::Object(

@@ -13,6 +13,7 @@ pub mod model;
 pub mod protocol;
 pub mod replay;
 pub mod report;
+mod rounds;
 pub mod run;
 pub mod search;
 pub mod space;
