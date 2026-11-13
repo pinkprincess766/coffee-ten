@@ -180,9 +180,6 @@ pub fn bootstrap_median(
     Ok(interval(estimate, rates.len(), config, distribution))
 }
 
-/// Bootstrap `median(numerator) / median(denominator)`, drawing the same round IDs
-/// for both sides of every replicate. This is not the median of per-round ratios.
-/// Missing/duplicate IDs are errors; no intersection, truncation or independent draws.
 /// The smallest round ID in exactly one of two ID-sorted, duplicate-free lists, and whether it
 /// is in `a`. `None` when the ID sets are equal.
 fn first_unmatched(a: &[&RoundSample], b: &[&RoundSample]) -> Option<(usize, bool)> {
@@ -201,6 +198,9 @@ fn first_unmatched(a: &[&RoundSample], b: &[&RoundSample]) -> Option<(usize, boo
     }
 }
 
+/// Bootstrap `median(numerator) / median(denominator)`, drawing the same round IDs
+/// for both sides of every replicate. This is not the median of per-round ratios.
+/// Missing/duplicate IDs are errors; no intersection, truncation or independent draws.
 /// The caller must establish that equal IDs represent genuinely paired observations
 /// and validate log/protocol provenance; equal counters from unrelated runs do not do so.
 pub fn bootstrap_paired_ratio(
