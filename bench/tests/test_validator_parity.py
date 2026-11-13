@@ -34,10 +34,9 @@ def find_binary():
 BINARY = find_binary()
 
 # validate.py rejects these, report accepts them. report only needs the fields it reads,
-# skips blank lines and peak lines unread, and checks protocol fingerprints and
+# skips peak lines unread, and checks protocol fingerprints and
 # harness_profile for presence and type, not format. Closing a gap: move it out of here.
 PYTHON_ONLY_REJECTS = {
-    "blank line between records",
     "malformed peak line",
     "protocol: source_hash not 16 hex digits",
     "protocol: space_hash not 16 hex digits",
