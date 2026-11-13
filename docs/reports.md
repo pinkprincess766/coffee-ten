@@ -35,6 +35,8 @@ mark); errors cite the physical line number, blank lines included.
 
 The saved synthetic fixture `crates/coffee-ten-bench/tests/fixtures/report.jsonl` is
 checked against a Markdown golden through both the API and the actual command in CI.
+`report --compare` of `report-b.jsonl` against it is pinned the same way, independent
+(`report-compare.md`) and paired (`report-compare-paired.md`).
 
 ## Comparing runs (N12)
 
