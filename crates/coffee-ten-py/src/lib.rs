@@ -147,16 +147,40 @@ fn runtime_error(err: impl Display) -> PyErr {
 #[derive(FromPyObject)]
 enum Operand<'py> {
     Tensor(PyRef<'py, PyTensor>),
-    Scalar(f64),
+    Scalar(PlainScalar),
 }
 
 impl Operand<'_> {
     fn into_tensor(self) -> PyTensor {
         match self {
             Operand::Tensor(tensor) => (*tensor).clone(),
-            Operand::Scalar(value) => PyTensor::constant(value as f32),
+            Operand::Scalar(PlainScalar(value)) => PyTensor::constant(value as f32),
         }
     }
+}
+
+/// A number operand. NumPy converts a masked scalar (`numpy.ma.masked`) to nan with only a
+/// warning, so masked arrays are refused here as they are for inputs.
+struct PlainScalar(f64);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for PlainScalar {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if is_masked_array(&obj)? {
+            return Err(PyTypeError::new_err(
+                "a numpy.ma.MaskedArray operand is not supported: its mask would be ignored",
+            ));
+        }
+        Ok(PlainScalar(obj.extract()?))
+    }
+}
+
+/// `numpy.ma.MaskedArray` (or a subclass): its data can be read as an ndarray or a number
+/// with the mask silently dropped.
+fn is_masked_array(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let masked = value.py().import("numpy.ma")?.getattr("MaskedArray")?;
+    value.is_instance(&masked)
 }
 
 #[pymethods]
@@ -444,6 +468,15 @@ fn read_input(name: &str, value: &Bound<'_, PyAny>) -> PyResult<DenseTensor<f32>
             "input {name} must be a numpy.ndarray of dtype float32, got {type_name}"
         )));
     };
+    // A masked array is an ndarray whose data would be read with the mask silently dropped,
+    // so masked elements would enter the result: a wrong answer, not an error. Refuse it.
+    if is_masked_array(value)? {
+        return Err(PyTypeError::new_err(format!(
+            "input {name} is a numpy.ma.MaskedArray, whose mask would be ignored; pass \
+             {name}.filled(fill_value) to choose the masked values, or numpy.asarray({name}) \
+             to use the underlying data deliberately"
+        )));
+    }
     let dtype = untyped.dtype();
     if !dtype.is_equiv_to(&numpy::dtype::<f32>(value.py())) {
         return Err(PyTypeError::new_err(format!(
