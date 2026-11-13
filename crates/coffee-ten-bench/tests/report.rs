@@ -188,3 +188,57 @@ fn compares_best_candidates_with_explicit_pairing_and_exact_protocol_match() {
     assert!(report::command(["--compare", path].map(str::to_string)).is_err());
     assert!(report::command(["--compare", path, path, "--top", "1"].map(str::to_string)).is_err());
 }
+
+/// Every field of the fixture's V1 protocol key, read from the fixture itself so a field added
+/// to the writer and the fixture is covered without editing this list.
+fn fixture_protocol_fields() -> Vec<String> {
+    let line = LOG.lines().nth(1).unwrap();
+    let start = line.find("\"protocol\":{").unwrap() + "\"protocol\":{".len();
+    let end = start + line[start..].find('}').unwrap();
+    line[start..end]
+        .split(',')
+        .map(|field| field.to_string())
+        .collect()
+}
+
+#[test]
+fn removing_any_protocol_field_from_both_logs_is_rejected_by_name() {
+    let config = BootstrapConfig {
+        resamples: 3,
+        seed: 1,
+    };
+    let fields = fixture_protocol_fields();
+    assert_eq!(fields.len(), 23, "{fields:?}");
+    for field in fields {
+        let name = field
+            .split(':')
+            .next()
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        let bad = LOG
+            .replace(&format!("{field},"), "")
+            .replace(&format!(",{field}}}"), "}");
+        assert_ne!(bad, LOG, "fixture must contain {field}");
+        // Both A and B lack the field: equal incomplete keys are still not comparable.
+        let err = report::compare(&bad, &bad, config, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&name), "{name}: {err}");
+        assert!(report::markdown(&bad, 2, config).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn an_unknown_protocol_field_in_both_logs_is_rejected() {
+    let config = BootstrapConfig {
+        resamples: 3,
+        seed: 1,
+    };
+    let bad = LOG.replace("\"protocol\":{", "\"protocol\":{\"extra\":\"x\",");
+    assert_ne!(bad, LOG);
+    let err = report::compare(&bad, &bad, config, false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown protocol field extra"), "{err}");
+}
