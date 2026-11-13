@@ -134,15 +134,15 @@ def test_max_nan_differs_from_numpy_as_documented():
 
 def test_sum_and_max_shape_errors_come_at_op_time():
     for reduce in (ct.sum, ct.max):
-        with pytest.raises(ValueError, match=r"^cannot reduce shape \(\) over its last axis$"):
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(\) over its last axis: a rank 0 tensor has no axes$"):
             reduce(ct.input("s", ()))
-        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 0\) over its last axis$"):
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 0\) over its last axis: that axis has size 0$"):
             reduce(ct.input("e", (2, 0)))
         with pytest.raises(TypeError):
             reduce(1.0)
         with pytest.raises(TypeError):
             reduce(A_VALUES)
-    with pytest.raises(ValueError, match=r"^cannot reduce shape \(\) over its last axis$"):
+    with pytest.raises(ValueError, match=r"^cannot reduce shape \(\) over its last axis: a rank 0 tensor has no axes$"):
         ct.softmax(ct.input("s", ()))
     with pytest.raises(TypeError):
         ct.exp(1.0)
@@ -170,13 +170,13 @@ def test_sum_and_max_over_a_chosen_axis():
 
 def test_sum_and_max_axis_errors_name_the_axis():
     for reduce in (ct.sum, ct.max):
-        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 3\) over axis 2$"):
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 3\) over axis 2: rank 2 allows axes -2\.\.=1$"):
             reduce(ct.input("a", (2, 3)), axis=2)
-        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 3\) over axis -3$"):
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 3\) over axis -3: rank 2 allows axes -2\.\.=1$"):
             reduce(ct.input("a", (2, 3)), axis=-3)
-        with pytest.raises(ValueError, match=r"^cannot reduce shape \(0, 3\) over axis 0$"):
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(0, 3\) over axis 0: that axis has size 0$"):
             reduce(ct.input("e", (0, 3)), axis=0)
-        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 0\) over its last axis$"):
+        with pytest.raises(ValueError, match=r"^cannot reduce shape \(2, 0\) over its last axis: that axis has size 0$"):
             reduce(ct.input("e", (2, 0)), axis=1)
     # An empty axis that is not the reduced one is kept.
     assert ct.sum(ct.input("e", (0, 3)), axis=1).shape == (0, 1)
