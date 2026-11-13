@@ -5,7 +5,7 @@ use crate::{
     run::{RoundSample, fnv1a_64},
     stats::{
         BootstrapConfig, MIN_ROUNDS_FOR_DRIFT, bootstrap_independent_ratio, bootstrap_median,
-        bootstrap_paired_ratio, drifted, summarize,
+        bootstrap_paired_ratio,
     },
 };
 use std::fmt::Write as _;
@@ -180,70 +180,9 @@ fn parse_row(row: &Value) -> Result<Row, String> {
             raw.len()
         ));
     }
-    let mut rounds = Vec::with_capacity(count);
-    let mut measurement_ns = 0u128;
-    let minimum_ns = u128::from(protocol.get("min_sample_ms")?.uint::<u64>()?) * 1_000_000;
-    for (index, value) in raw.iter().enumerate() {
-        let field = |name: &str| {
-            value
-                .get(name)
-                .map_err(|e| format!("round {index} {name}: {e}"))
-        };
-        let round = RoundSample {
-            round_index: field("round_index")?
-                .uint()
-                .map_err(|e| format!("round {index} round_index: {e}"))?,
-            elapsed_ns: field("elapsed_ns")?
-                .uint()
-                .map_err(|e| format!("round {index} elapsed_ns: {e}"))?,
-            iterations: field("iterations")?
-                .uint()
-                .map_err(|e| format!("round {index} iterations: {e}"))?,
-            gflops: field("gflops")?
-                .number()
-                .map_err(|e| format!("round {index} gflops: {e}"))?,
-        };
-        if round.round_index != index {
-            return Err(format!(
-                "invalid raw round order: round {index} has round_index {}",
-                round.round_index
-            ));
-        }
-        if round.elapsed_ns == 0 || round.iterations == 0 {
-            return Err(format!(
-                "invalid raw round timing: round {index} needs positive elapsed_ns and iterations"
-            ));
-        }
-        if u128::from(round.elapsed_ns) < minimum_ns {
-            return Err("raw round is below the protocol minimum duration".into());
-        }
-        let expected = 2.0 * (n as f64).powi(3) * round.iterations as f64
-            / std::time::Duration::from_nanos(round.elapsed_ns).as_secs_f64()
-            / 1e9;
-        if round.gflops <= 0.0 || round.gflops.to_bits() != expected.to_bits() {
-            return Err("raw rate does not match timing".into());
-        }
-        measurement_ns = measurement_ns
-            .checked_add(u128::from(round.elapsed_ns))
-            .ok_or("measurement cost overflow")?;
-        rounds.push(round);
-    }
-    let rates: Vec<_> = rounds.iter().map(|r| r.gflops).collect();
-    let stats = summarize(&rates).ok_or("empty rounds")?;
-    for (field, expected) in [
-        ("median", stats.median),
-        ("p25", stats.p25),
-        ("p75", stats.p75),
-        ("min", stats.min),
-    ] {
-        if row.get(field)?.number()?.to_bits() != expected.to_bits() {
-            return Err(format!("{field} differs from raw rounds"));
-        }
-    }
+    let checked = crate::rounds::validate(raw, n, protocol.get("min_sample_ms")?.uint::<u64>()?)?;
+    crate::rounds::check_aggregates(row, &checked)?;
     let drift = row.get("drift")?.boolean()?;
-    if drift != drifted(&rates) || measurement_ns != row.get("measurement_ns")?.uint::<u128>()? {
-        return Err("inconsistent measurement cost or drift".into());
-    }
     if row.get("compilation_wall_ns")? != &Value::Null {
         return Err("unsupported compilation wall accounting".into());
     }
@@ -264,9 +203,9 @@ fn parse_row(row: &Value) -> Result<Row, String> {
         protocol: protocol.clone(),
         schedule: row.get("schedule")?.text()?.into(),
         group: group.into(),
-        rounds,
-        median: stats.median,
-        measurement_ns,
+        rounds: checked.rounds,
+        median: checked.stats.median,
+        measurement_ns: checked.measurement_ns,
         compilation_ns,
         drift,
     })
