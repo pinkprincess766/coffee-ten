@@ -111,8 +111,32 @@ fn search_main(args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// The usage for `--help`/`-h` anywhere on the command line, chosen by subcommand; `None`
+/// without a help flag. `curve` parses its own arguments and is not covered here.
+fn help_text(args: &[String]) -> Option<String> {
+    if !args.iter().any(|a| a == "--help" || a == "-h") {
+        return None;
+    }
+    Some(match args.first().map(String::as_str) {
+        Some("report") => coffee_ten_bench::report::USAGE.to_string(),
+        Some("search") => coffee_ten_bench::search::SEARCH_USAGE.to_string(),
+        Some("space") => coffee_ten_bench::space::SPACE_USAGE.to_string(),
+        Some("model") => coffee_ten_bench::model::USAGE.to_string(),
+        Some("curve") => return None,
+        _ => format!(
+            "{}\nsubcommands: report, search, space, model, curve (each takes --help)",
+            coffee_ten_bench::cli::USAGE
+        ),
+    })
+}
+
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1).peekable();
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(text) = help_text(&all) {
+        println!("{text}");
+        return ExitCode::SUCCESS;
+    }
+    let mut args = all.into_iter().peekable();
     if args.peek().map(String::as_str) == Some("curve") {
         args.next();
         return match coffee_ten_bench::curves::command(args) {

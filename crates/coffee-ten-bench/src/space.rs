@@ -297,6 +297,10 @@ pub struct SpaceArgs {
     pub space: SpaceConfig,
 }
 
+/// `coffee-ten-bench space` usage, printed on errors and for `--help`.
+pub const SPACE_USAGE: &str = "usage: coffee-ten-bench space --n <N> [--space v1|v2]\n       \
+coffee-ten-bench space reduce --shape <D0,D1,...> --axis <AXIS> [--op sum|max] [--space v1|v2]";
+
 /// Version-aware CLI; the legacy parser below continues to return only a V1 size.
 pub fn parse_space_config_args<I: IntoIterator<Item = String>>(
     args: I,
@@ -324,9 +328,7 @@ pub fn parse_space_config_args<I: IntoIterator<Item = String>>(
 pub fn parse_space_args<I: IntoIterator<Item = String>>(
     args: I,
 ) -> Result<usize, crate::BenchError> {
-    let usage = |msg: String| {
-        crate::BenchError::Usage(format!("{msg}\nusage: coffee-ten-bench space --n <N>"))
-    };
+    let usage = |msg: String| crate::BenchError::Usage(format!("{msg}\n{SPACE_USAGE}"));
     let mut args = args.into_iter();
     let mut n = None;
     while let Some(flag) = args.next() {

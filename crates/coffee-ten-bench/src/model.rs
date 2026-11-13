@@ -1123,7 +1123,7 @@ pub fn rank_matmul(machine: &Machine, n: usize) -> Result<Vec<Ranked>, BenchErro
     Ok(ranked)
 }
 
-const USAGE: &str = "usage: coffee-ten-bench model --n <N> [--from <results.jsonl>] [--peak <GFLOPS>] \
+pub const USAGE: &str = "usage: coffee-ten-bench model --n <N> [--from <results.jsonl>] [--peak <GFLOPS>] \
      [--mem-gbs <GBS>] [--l2-gbs <GBS>]  (flags after --from override it)\n       \
      coffee-ten-bench model compare --from <results.jsonl> [--peak <peak.jsonl>] [--group <name>]\n       \
        compare: --peak takes the machine from that file's peak line (for results files without \

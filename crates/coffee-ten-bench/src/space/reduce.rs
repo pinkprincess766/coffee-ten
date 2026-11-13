@@ -64,11 +64,7 @@ pub fn enumerate_reduce(
 
 /// `space reduce --shape 2,7,5 --axis 1 [--op sum|max] [--space v2]`.
 pub fn reduce_command(args: impl Iterator<Item = String>) -> Result<String, BenchError> {
-    let usage = |s: &str| {
-        BenchError::Usage(format!(
-            "{s}\nusage: coffee-ten-bench space reduce --shape <D0,D1,...> --axis <AXIS> [--op sum|max] [--space v1|v2]"
-        ))
-    };
+    let usage = |s: &str| BenchError::Usage(format!("{s}\n{}", crate::space::SPACE_USAGE));
     let mut args = args;
     let (mut dims, mut axis, mut op, mut config) = (None, None, ReduceOp::Sum, SpaceConfig::V1);
     while let Some(flag) = args.next() {
