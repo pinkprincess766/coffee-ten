@@ -67,36 +67,60 @@ pub fn csv(replays: &[Replay]) -> Result<String, BenchError> {
 }
 
 /// Uses the same complete-table validation and seeded sample as N3. No timing or log writes.
+/// `coffee-ten-bench curve` usage. Errors print this, not the `search` usage the arguments are
+/// partly parsed with.
+pub const USAGE: &str = "usage: coffee-ten-bench curve --n <N> --budget <M> --replay <complete-table.jsonl> \
+[--seeds <S1,S2,...>] [--samples <S>] [--min-sample-ms <MS>] [--quick] [--space v1|v2]\n\
+writes CSV to stdout; compiles and measures nothing, writes no log; --seeds defaults to 1";
+
+fn usage(msg: impl std::fmt::Display) -> BenchError {
+    BenchError::Usage(format!("curve: {msg}\n{USAGE}"))
+}
+
 pub fn command(args: impl IntoIterator<Item = String>) -> Result<String, BenchError> {
+    let args: Vec<String> = args.into_iter().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(format!("{USAGE}\n"));
+    }
     let mut args = args.into_iter();
     let mut search_args = Vec::new();
     let mut seeds = vec![1];
     while let Some(arg) = args.next() {
         if arg == "--seeds" {
-            let text = args
-                .next()
-                .ok_or_else(|| error("--seeds needs comma-separated integers"))?;
+            let text = args.next().ok_or_else(|| usage("--seeds needs a value"))?;
             seeds = text
                 .split(',')
-                .map(|s| s.parse::<u64>().map_err(error))
-                .collect::<Result<_, _>>()?;
+                .map(|s| s.parse::<u64>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| {
+                    usage(format!(
+                        "--seeds needs comma-separated non-negative integers, got {text:?}"
+                    ))
+                })?;
         } else {
             if matches!(
                 arg.as_str(),
                 "--log" | "--seed" | "--local" | "--model-top" | "--from"
             ) {
-                return Err(error(
-                    "use --seeds and --replay; live modes and log writes are unavailable",
-                ));
+                return Err(usage(format!(
+                    "{arg} is not available: use --seeds and --replay; live modes and log writes are unavailable"
+                )));
             }
             search_args.push(arg);
         }
     }
-    let mut config = parse_search_args(search_args)?;
+    let search_args = parse_search_args(search_args).map_err(|e| match e {
+        BenchError::Usage(msg) => BenchError::Usage(format!(
+            "curve: {}",
+            msg.replace(crate::search::SEARCH_USAGE, USAGE)
+        )),
+        other => other,
+    });
+    let mut config = search_args?;
     let path = config
         .replay
         .as_ref()
-        .ok_or_else(|| error("--replay <complete-table.jsonl> is required"))?;
+        .ok_or_else(|| usage("--replay <complete-table.jsonl> is required"))?;
     let table = std::fs::read_to_string(path).map_err(error)?;
     let metadata = meta::collect(config.seed);
     let replays = seeds
@@ -203,6 +227,57 @@ mod tests {
             vec!["--seed", "2"],
         ] {
             assert!(command(args.into_iter().map(str::to_string)).is_err());
+        }
+    }
+
+    fn error_of(args: &[&str]) -> String {
+        command(args.iter().map(|s| s.to_string()))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn errors_print_the_curve_usage_not_the_search_usage() {
+        for (args, message) in [
+            (&[][..], "curve: --n is required\n"),
+            (
+                &["--n", "2", "--budget", "3"],
+                "curve: --replay <complete-table.jsonl> is required\n",
+            ),
+            (
+                &["--n", "x"],
+                "curve: --n needs a non-negative integer, got \"x\"\n",
+            ),
+            (&["--seeds"], "curve: --seeds needs a value\n"),
+            (
+                &["--seeds", "1,,2"],
+                "curve: --seeds needs comma-separated non-negative integers, got \"1,,2\"\n",
+            ),
+            (
+                &["--seeds", "-1"],
+                "curve: --seeds needs comma-separated non-negative integers, got \"-1\"\n",
+            ),
+            (
+                &["--log", "out"],
+                "curve: --log is not available: use --seeds and --replay",
+            ),
+            (&["--seed", "2"], "curve: --seed is not available"),
+            (&["--bogus", "1"], "curve: unknown argument --bogus\n"),
+        ] {
+            let err = error_of(args);
+            assert!(err.starts_with(message), "{args:?}: {err}");
+            assert!(err.ends_with(USAGE), "{args:?}: {err}");
+            assert!(!err.contains("coffee-ten-bench search"), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn help_returns_the_usage_without_reading_anything() {
+        for help in ["--help", "-h"] {
+            // Even next to a table path that does not exist: nothing is opened.
+            let out = command(["--replay", "/nonexistent/table.jsonl", help].map(str::to_string))
+                .unwrap();
+            assert_eq!(out, format!("{USAGE}\n"));
         }
     }
 }
