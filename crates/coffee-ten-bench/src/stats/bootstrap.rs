@@ -396,6 +396,51 @@ mod tests {
     }
 
     #[test]
+    fn percentile_ranks_at_small_and_boundary_resample_counts() {
+        // Ranks worked out by hand from floor((B-1)/40) and floor((B-1)*39/40):
+        // B = 1, 2: both 0. B = 39: 38*39 = 1482, /40 = 37.05. B = 40: 1521/40 = 38.025.
+        // B = 41 is the first B whose lower rank leaves 0. B = 10_000 is the default.
+        for (resamples, lower, upper) in [
+            (1, 0, 0),
+            (2, 0, 0),
+            (39, 0, 37),
+            (40, 0, 38),
+            (41, 1, 39),
+            (10_000, 249, 9_749),
+        ] {
+            // Reversed, so the ranks are taken after sorting, not from input order.
+            let distribution: Vec<_> = (0..resamples).rev().map(|r| r as f64).collect();
+            let config = BootstrapConfig { resamples, seed: 1 };
+            let ci = interval(0.5, 3, config, distribution);
+            assert_eq!(
+                (ci.lower, ci.upper),
+                (lower as f64, upper as f64),
+                "B = {resamples}"
+            );
+            assert!(ci.lower <= ci.upper);
+        }
+    }
+
+    #[test]
+    fn one_or_two_resamples_give_an_ordered_interval_from_drawn_values() {
+        let input = rounds(&[1.0, 2.0, 3.0, 5.0, 8.0]);
+        for resamples in [1, 2] {
+            let config = BootstrapConfig { resamples, seed: 7 };
+            for ci in [
+                bootstrap_median(&input, config).unwrap(),
+                bootstrap_paired_ratio(&input, &input, config).unwrap(),
+                bootstrap_independent_ratio(&input, &input, config).unwrap(),
+            ] {
+                // With B <= 40 both endpoints are rank 0: the smallest replicate.
+                assert_eq!(ci.lower, ci.upper, "B = {resamples}");
+                assert_eq!(ci.resamples, resamples);
+            }
+            let ci = bootstrap_median(&input, config).unwrap();
+            assert!([1.0, 2.0, 3.0, 5.0, 8.0].contains(&ci.lower));
+        }
+    }
+
+    #[test]
     fn independent_runs_do_not_cancel_shared_counter_variation() {
         let a = rounds(&[1.0, 2.0, 16.0, 32.0, 128.0]);
         let config = BootstrapConfig {
