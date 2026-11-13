@@ -147,16 +147,40 @@ fn runtime_error(err: impl Display) -> PyErr {
 #[derive(FromPyObject)]
 enum Operand<'py> {
     Tensor(PyRef<'py, PyTensor>),
-    Scalar(f64),
+    Scalar(PlainScalar),
 }
 
 impl Operand<'_> {
     fn into_tensor(self) -> PyTensor {
         match self {
             Operand::Tensor(tensor) => (*tensor).clone(),
-            Operand::Scalar(value) => PyTensor::constant(value as f32),
+            Operand::Scalar(PlainScalar(value)) => PyTensor::constant(value as f32),
         }
     }
+}
+
+/// A number operand. NumPy converts a masked scalar (`numpy.ma.masked`) to nan with only a
+/// warning, so masked arrays are refused here as they are for inputs.
+struct PlainScalar(f64);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for PlainScalar {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if is_masked_array(&obj)? {
+            return Err(PyTypeError::new_err(
+                "a numpy.ma.MaskedArray operand is not supported: its mask would be ignored",
+            ));
+        }
+        Ok(PlainScalar(obj.extract()?))
+    }
+}
+
+/// `numpy.ma.MaskedArray` (or a subclass): its data can be read as an ndarray or a number
+/// with the mask silently dropped.
+fn is_masked_array(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let masked = value.py().import("numpy.ma")?.getattr("MaskedArray")?;
+    value.is_instance(&masked)
 }
 
 #[pymethods]
@@ -353,7 +377,15 @@ fn run<'py>(
     let mut graph = Graph::new();
     let output_id = lower(&output.expr, &mut graph, &mut HashMap::new()).map_err(value_error)?;
 
-    let arrays = read_inputs(inputs)?;
+    let known: Vec<&str> = graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Input { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let arrays = read_inputs(inputs, &known)?;
     let named_arrays: Vec<(&str, &DenseTensor<f32>)> = arrays
         .iter()
         .map(|(name, array)| (name.as_str(), array))
@@ -364,16 +396,31 @@ fn run<'py>(
 }
 
 /// Reads the keyword arguments of `run` or `Kernel.__call__`: name and float32 array.
-fn read_inputs(inputs: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, DenseTensor<f32>)>> {
-    let mut arrays = Vec::new();
-    if let Some(inputs) = inputs {
-        for (key, value) in inputs.iter() {
-            let name: String = key.extract()?;
-            let array = read_input(&name, &value)?;
-            arrays.push((name, array));
+///
+/// Names are checked against `known` before any array is read, so a misspelled input is
+/// reported as `unknown input` even when its array would also be rejected.
+fn read_inputs(
+    inputs: Option<&Bound<'_, PyDict>>,
+    known: &[&str],
+) -> PyResult<Vec<(String, DenseTensor<f32>)>> {
+    let Some(inputs) = inputs else {
+        return Ok(Vec::new());
+    };
+    let mut named = Vec::with_capacity(inputs.len());
+    for (key, value) in inputs.iter() {
+        let name: String = key.extract()?;
+        if !known.contains(&name.as_str()) {
+            return Err(value_error(format!("unknown input {name}")));
         }
+        named.push((name, value));
     }
-    Ok(arrays)
+    named
+        .into_iter()
+        .map(|(name, value)| {
+            let array = read_input(&name, &value)?;
+            Ok((name, array))
+        })
+        .collect()
 }
 
 /// Builds the graph node of `expr`; a subtree shared by `Arc` becomes one node.
@@ -421,6 +468,15 @@ fn read_input(name: &str, value: &Bound<'_, PyAny>) -> PyResult<DenseTensor<f32>
             "input {name} must be a numpy.ndarray of dtype float32, got {type_name}"
         )));
     };
+    // A masked array is an ndarray whose data would be read with the mask silently dropped,
+    // so masked elements would enter the result: a wrong answer, not an error. Refuse it.
+    if is_masked_array(value)? {
+        return Err(PyTypeError::new_err(format!(
+            "input {name} is a numpy.ma.MaskedArray, whose mask would be ignored; pass \
+             {name}.filled(fill_value) to choose the masked values, or numpy.asarray({name}) \
+             to use the underlying data deliberately"
+        )));
+    }
     let dtype = untyped.dtype();
     if !dtype.is_equiv_to(&numpy::dtype::<f32>(value.py())) {
         return Err(PyTypeError::new_err(format!(
@@ -489,13 +545,8 @@ impl PyKernel {
         inputs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         let (input_buffers, other_buffers) = self.buffers.split_at(self.input_count);
-        let mut arrays = read_inputs(inputs)?;
-        if let Some((name, _)) = arrays
-            .iter()
-            .find(|(name, _)| !input_buffers.iter().any(|buffer| &buffer.name == name))
-        {
-            return Err(value_error(format!("unknown input {name}")));
-        }
+        let known: Vec<&str> = input_buffers.iter().map(|b| b.name.as_str()).collect();
+        let mut arrays = read_inputs(inputs, &known)?;
 
         let mut storage: Vec<Vec<f32>> = Vec::with_capacity(self.buffers.len());
         for buffer in input_buffers {

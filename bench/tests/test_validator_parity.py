@@ -33,21 +33,11 @@ def find_binary():
 
 BINARY = find_binary()
 
-# validate.py rejects these, report accepts them. Closing a gap: move it out of here.
+# validate.py rejects these, report accepts them. report skips blank lines and checks
+# protocol fingerprints and harness_profile for presence and type, not format. Closing a gap:
+# move it out of here.
 PYTHON_ONLY_REJECTS = {
     "blank line between records",
-    "record: missing commit",
-    "record: missing date",
-    "record: missing dirty",
-    "record: missing order_class",
-    "record: extra field",
-    "record: bad commit type",
-    "record: bad date type",
-    "record: bad dirty type",
-    "record: bad order_class",
-    "record: bad group",
-    "round 0: extra field",
-    "reference_compilation: extra field",
     "protocol: source_hash not 16 hex digits",
     "protocol: space_hash not 16 hex digits",
     "protocol: unsupported harness_profile",
