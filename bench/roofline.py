@@ -16,7 +16,7 @@ Dev-only tool; needs matplotlib (not a project dependency).
 import argparse, json, pathlib, sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from plot import DEFAULT, ORDER, ROOT, load  # noqa: E402
+from plot import DEFAULT, NOT_EVALUATED_NOTE, ORDER, ROOT, load  # noqa: E402
 
 
 def ai(n):
@@ -45,6 +45,7 @@ def main():
         sys.exit("bench/roofline.py needs matplotlib: pip install matplotlib")
     peak, bw = ceilings(a.input)
     series = load(a.input)
+    unevaluated = any(p[4] is None for points in series.values() for p in points)
     fig, ax = plt.subplots(figsize=(7.5, 4.8))
     xs = sorted([2**e for e in range(-3, 8)] + [peak / bw])
     ax.plot(xs, [min(peak, bw * x) for x in xs], "k-", lw=1.5, label="_nolegend_")
@@ -63,6 +64,8 @@ def main():
         for xv, yv, d in zip(x, med, drift):
             if d:
                 ax.plot([xv], [yv], "o", mfc="white", mec=f"C{i}", mew=1.5, zorder=3)
+            elif d is None:
+                ax.plot([xv], [yv], "x", color="black", ms=5, zorder=4)
     for v in [64, 128, 256, 512, 1024]:
         ax.annotate(f"N={v}\nAI≤{ai(v):g}", (ai(v), 1.0), ha="center", fontsize=7, color="grey")
     ax.set_xscale("log", base=2)
@@ -71,8 +74,11 @@ def main():
     ax.set_xlabel("arithmetic intensity, FLOP/byte (compulsory DRAM traffic: upper bound)")
     ax.set_ylabel("GFLOP/s (median)")
     ax.set_title(f"matmul roofline, single thread — {pathlib.Path(a.input).name}\n"
-                 "ceilings: bench/peak medians of the same session; hollow = drift", fontsize=10)
+                 "ceilings: bench/peak medians of the same session; hollow = drift"
+                 + (f"; {NOT_EVALUATED_NOTE}" if unevaluated else ""), fontsize=10)
     ax.grid(alpha=0.3, which="both")
+    if unevaluated:
+        ax.plot([], [], "x", color="black", label="drift not evaluated (< 10 rounds)")
     ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
     fig.tight_layout()
     pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
