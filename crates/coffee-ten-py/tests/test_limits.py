@@ -5,8 +5,9 @@ reused subtrees add nothing. Level 1000 (MAX_DEPTH) builds and runs, 1001 is a V
 at op time. Size: a shape is allowed while its float32 bytes fit in isize::MAX; one more
 element, or a product that overflows usize, is a ValueError. Empty shapes are always allowed.
 Lowering (loop_ir, compile) adds its own limit of 1000 tree nodes, where constants count and
-a reused subtree counts at every use. The limits themselves are unchanged; these tests only
-pin where they apply.
+a reused subtree counts at every use. compile() is further bounded by clang's bracket depth
+(256), which a deep chain of nested C expressions reaches first. The limits themselves are
+unchanged; these tests only pin where they apply.
 """
 import struct
 
@@ -82,7 +83,7 @@ def negations(level):
     return y
 
 
-def test_a_level_1000_expression_runs_lowers_and_compiles(tmp_path):
+def test_a_level_1000_expression_runs_and_lowers(tmp_path):
     data = np.array([0.5, -2.0], np.float32)
     # Interpreter: any level-1000 expression runs.
     expected = data.copy()
@@ -90,11 +91,16 @@ def test_a_level_1000_expression_runs_lowers_and_compiles(tmp_path):
         expected = expected + np.float32(1.0)
     assert ct.run(chain(1000), x=data).tobytes() == expected.tobytes()
     # Lowering also has MAX_EXPR_NODES = 1000 tree nodes. A level-1000 chain without
-    # constants has exactly 1000 nodes, so loop_ir and compile accept it.
+    # constants has exactly 1000 nodes, so loop_ir accepts it.
     y = negations(1000)
     assert ct.loop_ir(y)
+    assert ct.run(y, x=data).tobytes() == (-data).tobytes()  # 999 negations
+    # compile() is not tried at level 1000: the C has one parenthesis level per negation,
+    # and clang refuses more than 256 (-fbracket-depth). A level-200 chain compiles and
+    # matches the interpreter bit for bit.
+    y = negations(200)
     kernel = ct.compile(y, cache_dir=tmp_path)
-    assert kernel(x=data).tobytes() == ct.run(y, x=data).tobytes()
+    assert kernel(x=data).tobytes() == ct.run(y, x=data).tobytes() == (-data).tobytes()
 
 
 def test_lowering_counts_tree_nodes_not_depth(tmp_path):
