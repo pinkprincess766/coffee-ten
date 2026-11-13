@@ -421,11 +421,35 @@ pub fn command(args: impl IntoIterator<Item = String>) -> Result<String, BenchEr
     }
 }
 
-fn best(rows: &[Row]) -> Result<&Row, BenchError> {
+/// Each differing protocol field with both values as JSON, sorted by field name, so a mismatch
+/// says what to fix (a different build, machine, flag or sampling) without diffing logs by hand.
+fn key_diff(a: &Value, a_name: &str, b: &Value, b_name: &str) -> String {
+    let show = |key: &Value, field: &str| {
+        key.get(field)
+            .map_or_else(|_| "missing".to_string(), Value::to_json)
+    };
+    a.differing_keys(b)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|field| {
+            format!(
+                "{field} ({a_name}: {}, {b_name}: {})",
+                show(a, field),
+                show(b, field)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn best<'a>(rows: &'a [Row], file: &str) -> Result<&'a Row, BenchError> {
     let mut best = &rows[0];
     for row in &rows[1..] {
-        if row.protocol != best.protocol {
-            return Err(error("comparison requires exactly one protocol per file"));
+        if row.protocol != rows[0].protocol {
+            return Err(error(format!(
+                "comparison requires exactly one protocol per file; {file} mixes keys: {}",
+                key_diff(&rows[0].protocol, "first", &row.protocol, "later")
+            )));
         }
         if row.median > best.median {
             best = row;
@@ -444,10 +468,13 @@ pub fn compare(
 ) -> Result<String, BenchError> {
     let a_rows = read(a)?;
     let b_rows = read(b)?;
-    let a_best = best(&a_rows)?;
-    let b_best = best(&b_rows)?;
+    let a_best = best(&a_rows, "A")?;
+    let b_best = best(&b_rows, "B")?;
     if a_best.protocol != b_best.protocol {
-        return Err(error("protocol key mismatch between A and B"));
+        return Err(error(format!(
+            "protocol key mismatch between A and B: {}",
+            key_diff(&a_best.protocol, "A", &b_best.protocol, "B")
+        )));
     }
     let bootstrap = if paired {
         bootstrap_paired_ratio

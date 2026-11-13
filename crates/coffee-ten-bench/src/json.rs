@@ -48,6 +48,47 @@ impl Value {
             Err("expected boolean".into())
         }
     }
+    /// Keys whose values differ between two objects, sorted; keys present in only one count.
+    /// `None` unless both are objects.
+    pub fn differing_keys<'a>(&'a self, other: &'a Self) -> Option<Vec<&'a str>> {
+        let (Self::Object(a), Self::Object(b)) = (self, other) else {
+            return None;
+        };
+        let mut keys: Vec<&str> = a
+            .keys()
+            .chain(b.keys())
+            .map(String::as_str)
+            .filter(|k| a.get(*k) != b.get(*k))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Some(keys)
+    }
+    /// Compact JSON text of the value (object keys sorted), for error messages.
+    pub fn to_json(&self) -> String {
+        match self {
+            Self::Null => "null".into(),
+            Self::Bool(b) => b.to_string(),
+            Self::Number(n) => n.clone(),
+            Self::String(s) => crate::run::json_string(s),
+            Self::Array(items) => format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(Self::to_json)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Self::Object(fields) => format!(
+                "{{{}}}",
+                fields
+                    .iter()
+                    .map(|(k, v)| format!("{}:{}", crate::run::json_string(k), v.to_json()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
     pub fn array(&self) -> Result<&[Self], String> {
         if let Self::Array(a) = self {
             Ok(a)
@@ -332,5 +373,19 @@ mod tests {
             parse(r#"{"a":1,"\u0061":2}"#).unwrap_err(),
             "duplicate JSON key"
         );
+    }
+    #[test]
+    fn differing_keys_and_compact_json() {
+        let a = parse(r#"{"x":1,"y":"a","z":[1,{"k":null}]}"#).unwrap();
+        let b = parse(r#"{"z":[1,{"k":null}],"y":"b","w":true}"#).unwrap();
+        assert_eq!(a.differing_keys(&b), Some(vec!["w", "x", "y"]));
+        assert_eq!(a.differing_keys(&a), Some(vec![]));
+        assert_eq!(a.differing_keys(&Value::Null), None);
+        // Round trip: the encoding parses back to the same value, keys sorted.
+        let text = a.to_json();
+        assert_eq!(text, r#"{"x":1,"y":"a","z":[1,{"k":null}]}"#);
+        assert_eq!(parse(&text).unwrap(), a);
+        let s = parse(r#""q\"\\\n\u0001é""#).unwrap();
+        assert_eq!(parse(&s.to_json()).unwrap(), s);
     }
 }

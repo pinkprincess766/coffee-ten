@@ -47,7 +47,9 @@ The key must also be complete and closed: every field `ProtocolKey::to_json` wri
 required with its type (`cache` and `tile_factors` only for non-V1 spaces), and an unknown
 field is rejected. Two files that both lack, say, `source_hash` are therefore not comparable,
 even though their incomplete keys are equal. Errors name the offending field.
-Mixed-key files are rejected rather than silently choosing a compatible subset. The first
+Mixed-key files are rejected rather than silently choosing a compatible subset. Both errors
+list every differing key field with its two values as JSON, e.g.
+`source_hash (A: "ffee…", B: "1111…")`. The first
 row with the highest lower median is the winner of each file. The reported ratio is
 `median(best A) / median(best B)`, with the 95% bootstrap interval and both schedules.
 
