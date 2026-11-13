@@ -431,7 +431,8 @@ mod tests {
                 bootstrap_paired_ratio(&input, &input, config).unwrap(),
                 bootstrap_independent_ratio(&input, &input, config).unwrap(),
             ] {
-                // With B <= 40 both endpoints are rank 0: the smallest replicate.
+                // For B <= 2 both endpoints are rank 0, the smallest replicate. (The lower end
+                // stays rank 0 up to B = 40; the upper end moves from B = 3 on.)
                 assert_eq!(ci.lower, ci.upper, "B = {resamples}");
                 assert_eq!(ci.resamples, resamples);
             }
