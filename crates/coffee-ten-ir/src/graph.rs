@@ -554,7 +554,10 @@ mod tests {
                 axis: -1,
             }
         );
-        assert_eq!(err.to_string(), "cannot reduce shape () over its last axis: a rank 0 tensor has no axes");
+        assert_eq!(
+            err.to_string(),
+            "cannot reduce shape () over its last axis: a rank 0 tensor has no axes"
+        );
         let err = g.reduce(ReduceOp::Max, empty).unwrap_err();
         assert_eq!(
             err,
@@ -643,12 +646,21 @@ mod tests {
                 axis: 2,
             }
         );
-        assert_eq!(err.to_string(), "cannot reduce shape (2, 3) over axis 2: rank 2 allows axes -2..=1");
+        assert_eq!(
+            err.to_string(),
+            "cannot reduce shape (2, 3) over axis 2: rank 2 allows axes -2..=1"
+        );
         let err = g.reduce_axis(ReduceOp::Max, a, -3).unwrap_err();
-        assert_eq!(err.to_string(), "cannot reduce shape (2, 3) over axis -3: rank 2 allows axes -2..=1");
+        assert_eq!(
+            err.to_string(),
+            "cannot reduce shape (2, 3) over axis -3: rank 2 allows axes -2..=1"
+        );
         // Axis 0 is empty; axis 1 is not, and an empty neighbour is allowed.
         let err = g.reduce_axis(ReduceOp::Sum, empty, 0).unwrap_err();
-        assert_eq!(err.to_string(), "cannot reduce shape (0, 3) over axis 0: that axis has size 0");
+        assert_eq!(
+            err.to_string(),
+            "cannot reduce shape (0, 3) over axis 0: that axis has size 0"
+        );
         let kept = g.reduce_axis(ReduceOp::Sum, empty, 1).unwrap();
         assert_eq!(g.get(kept).unwrap().shape, shape(&[0, 1]));
         // The explicit last axis of an empty row uses the same sentence as `reduce`.
