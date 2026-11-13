@@ -23,7 +23,7 @@ pub struct Stats {
 }
 
 /// Sorted `r`, integer indices, no interpolation (as `bench/peak/peak.c`):
-/// min = r[0], p25 = r[(n-1)/4], median = r[(n-1)/2], p75 = r[3*(n-1)/4].
+/// min = `r[0]`, p25 = `r[(n-1)/4]`, median = `r[(n-1)/2]`, p75 = `r[3*(n-1)/4]`.
 /// `None` for an empty slice.
 pub fn summarize(rates: &[f64]) -> Option<Stats> {
     if rates.is_empty() {
