@@ -56,3 +56,9 @@ design actually paired the observations; this is an explicit caller assertion, p
 the report. Paired mode uses N4's shared-index resampling and checks matching index sets.
 `--seed` and `--resamples` apply to either mode. Neither interval corrects winner-selection
 bias or captures variation across process restarts. No search/acquisition behavior changes.
+
+## Exit status
+
+`report` and `curve` exit 0 on success, 2 when the command line is wrong (the message ends
+with the usage), and 1 when the input is rejected (unreadable file, invalid record, protocol
+mismatch, or a value such as `--top 0` that parses but is refused by the analysis).
