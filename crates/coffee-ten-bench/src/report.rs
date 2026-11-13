@@ -4,8 +4,8 @@ use crate::{
     json::{self, Value},
     run::{RoundSample, fnv1a_64},
     stats::{
-        BootstrapConfig, bootstrap_independent_ratio, bootstrap_median, bootstrap_paired_ratio,
-        drifted, summarize,
+        BootstrapConfig, MIN_ROUNDS_FOR_DRIFT, bootstrap_independent_ratio, bootstrap_median,
+        bootstrap_paired_ratio, drifted, summarize,
     },
 };
 use std::fmt::Write as _;
@@ -28,30 +28,77 @@ fn error(message: impl std::fmt::Display) -> BenchError {
     BenchError::Setup(format!("report: {message}"))
 }
 
+/// String fields of the persisted comparison key (`ProtocolKey::to_json`).
+const TEXT_FIELDS: [&str; 15] = [
+    "kernel",
+    "graph_hash",
+    "space",
+    "space_hash",
+    "source_hash",
+    "cpu",
+    "machine",
+    "os",
+    "arch",
+    "target_os",
+    "clang",
+    "flags",
+    "rustc",
+    "harness_profile",
+    "rustflags",
+];
+/// Unsigned integer fields of the persisted comparison key.
+const UINT_FIELDS: [&str; 7] = [
+    "version",
+    "n",
+    "samples",
+    "min_sample_ms",
+    "input_seed",
+    "warmup_ms",
+    "candidate_warmup_ms",
+];
+/// Boolean fields of the persisted comparison key.
+const BOOL_FIELDS: [&str; 1] = ["quick"];
+/// Fields written only for non-V1 schedule spaces.
+const SPACE_FIELDS: [&str; 2] = ["cache", "tile_factors"];
+
 /// Validate the complete persisted comparison key, including fields not printed below.
-/// Equality between two incomplete objects is not evidence of matching provenance.
+/// Equality between two incomplete objects is not evidence of matching provenance, and an
+/// unknown field is provenance nobody checks, so the key must be exactly what the writer emits.
 fn validate_protocol(protocol: &Value) -> Result<(), String> {
-    for field in [
-        "kernel",
-        "graph_hash",
-        "space",
-        "space_hash",
-        "source_hash",
-        "cpu",
-        "machine",
-        "os",
-        "arch",
-        "target_os",
-        "clang",
-        "flags",
-        "rustc",
-        "harness_profile",
-        "rustflags",
-    ] {
-        protocol.get(field)?.text()?;
+    let Value::Object(fields) = protocol else {
+        return Err("protocol must be an object".into());
+    };
+    let v1 = protocol
+        .get("space")
+        .and_then(Value::text)
+        .map_err(|e| format!("protocol space: {e}"))?
+        == "v1";
+    for key in fields.keys() {
+        let known = TEXT_FIELDS.contains(&key.as_str())
+            || UINT_FIELDS.contains(&key.as_str())
+            || BOOL_FIELDS.contains(&key.as_str())
+            || (!v1 && SPACE_FIELDS.contains(&key.as_str()));
+        if !known {
+            return Err(format!("unknown protocol field {key}"));
+        }
     }
-    for field in ["warmup_ms", "candidate_warmup_ms"] {
-        protocol.get(field)?.uint::<u64>()?;
+    for field in TEXT_FIELDS {
+        protocol
+            .get(field)
+            .and_then(Value::text)
+            .map_err(|e| format!("protocol {field}: {e}"))?;
+    }
+    for field in UINT_FIELDS {
+        protocol
+            .get(field)
+            .and_then(Value::uint::<u64>)
+            .map_err(|e| format!("protocol {field}: {e}"))?;
+    }
+    for field in BOOL_FIELDS {
+        protocol
+            .get(field)
+            .and_then(Value::boolean)
+            .map_err(|e| format!("protocol {field}: {e}"))?;
     }
     match protocol.get("space")?.text()? {
         "v1" => {}
@@ -69,6 +116,13 @@ fn validate_protocol(protocol: &Value) -> Result<(), String> {
                 previous = factor;
             }
             let cache = protocol.get("cache")?;
+            if let Value::Object(cache_fields) = cache
+                && let Some(key) = cache_fields
+                    .keys()
+                    .find(|k| !["l1_bytes", "l2_bytes", "line_bytes"].contains(&k.as_str()))
+            {
+                return Err(format!("unknown protocol cache field {key}"));
+            }
             if cache != &Value::Null
                 && crate::space::CacheInfo::new(
                     cache.get("l1_bytes")?.uint()?,
@@ -119,21 +173,46 @@ fn parse_row(row: &Value) -> Result<Row, String> {
     }
     let count = row.get("samples")?.uint::<usize>()?;
     let raw = row.get("rounds")?.array()?;
-    if count == 0 || count != raw.len() || count != protocol.get("samples")?.uint::<usize>()? {
-        return Err("wrong raw round count".into());
+    let declared = protocol.get("samples")?.uint::<usize>()?;
+    if count == 0 || count != raw.len() || count != declared {
+        return Err(format!(
+            "wrong raw round count: {} rounds, samples {count}, protocol samples {declared}",
+            raw.len()
+        ));
     }
     let mut rounds = Vec::with_capacity(count);
     let mut measurement_ns = 0u128;
     let minimum_ns = u128::from(protocol.get("min_sample_ms")?.uint::<u64>()?) * 1_000_000;
     for (index, value) in raw.iter().enumerate() {
-        let round = RoundSample {
-            round_index: value.get("round_index")?.uint()?,
-            elapsed_ns: value.get("elapsed_ns")?.uint()?,
-            iterations: value.get("iterations")?.uint()?,
-            gflops: value.get("gflops")?.number()?,
+        let field = |name: &str| {
+            value
+                .get(name)
+                .map_err(|e| format!("round {index} {name}: {e}"))
         };
-        if round.round_index != index || round.elapsed_ns == 0 || round.iterations == 0 {
-            return Err("invalid raw round timing or order".into());
+        let round = RoundSample {
+            round_index: field("round_index")?
+                .uint()
+                .map_err(|e| format!("round {index} round_index: {e}"))?,
+            elapsed_ns: field("elapsed_ns")?
+                .uint()
+                .map_err(|e| format!("round {index} elapsed_ns: {e}"))?,
+            iterations: field("iterations")?
+                .uint()
+                .map_err(|e| format!("round {index} iterations: {e}"))?,
+            gflops: field("gflops")?
+                .number()
+                .map_err(|e| format!("round {index} gflops: {e}"))?,
+        };
+        if round.round_index != index {
+            return Err(format!(
+                "invalid raw round order: round {index} has round_index {}",
+                round.round_index
+            ));
+        }
+        if round.elapsed_ns == 0 || round.iterations == 0 {
+            return Err(format!(
+                "invalid raw round timing: round {index} needs positive elapsed_ns and iterations"
+            ));
         }
         if u128::from(round.elapsed_ns) < minimum_ns {
             return Err("raw round is below the protocol minimum duration".into());
@@ -201,8 +280,11 @@ pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {
         }
         let parse = || -> Result<Option<Row>, String> {
             let value = json::parse(line)?;
+            if !matches!(value, Value::Object(_)) {
+                return Err("expected one JSON object per line".into());
+            }
             if let Ok(kind) = value.get("kind") {
-                if kind.text()? == "peak" {
+                if kind.text().map_err(|e| format!("kind: {e}"))? == "peak" {
                     return Ok(None);
                 }
                 return Err("expected live measurements, not offline curve records".into());
@@ -217,6 +299,18 @@ pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {
         return Err(error("no measurement records"));
     }
     Ok(rows)
+}
+
+/// The Drift column. With fewer than `MIN_ROUNDS_FOR_DRIFT` rounds the check never ran, so a
+/// stored `false` would read as "no drift" when nothing was tested.
+fn drift_cell(row: &Row) -> &'static str {
+    if row.rounds.len() < MIN_ROUNDS_FOR_DRIFT {
+        "not evaluated"
+    } else if row.drift {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 fn cell(text: &str) -> String {
@@ -300,7 +394,7 @@ pub fn markdown(text: &str, top: usize, bootstrap: BootstrapConfig) -> Result<St
                 ci.lower,
                 ci.upper,
                 row.rounds.len(),
-                row.drift
+                drift_cell(row)
             )
             .unwrap();
         }
@@ -415,10 +509,119 @@ pub fn compare(
             },
             row.median,
             row.rounds.len(),
-            row.drift
+            drift_cell(row)
         )
         .unwrap();
     }
     writeln!(out, "\nMedian ratio A/B: {:.6}; 95% CI [{:.6}, {:.6}].\n\nIntervals are conditional on the selected winners and supplied rounds; they do not adjust for winner selection or independent process restarts.", ci.estimate, ci.lower, ci.upper).unwrap();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{protocol::ProtocolKey, space::CacheInfo};
+
+    fn key(space: &str, cache: Option<CacheInfo>, tile_factors: Option<Vec<usize>>) -> Value {
+        let key = ProtocolKey {
+            version: crate::protocol::VERSION,
+            kernel: "matmul".into(),
+            n: 64,
+            graph_hash: "0123456789abcdef".into(),
+            space: space.into(),
+            space_hash: "0011223344556677".into(),
+            cache,
+            tile_factors,
+            source_hash: "ffeeddccbbaa9988".into(),
+            cpu: "cpu".into(),
+            machine: "machine".into(),
+            os: "os".into(),
+            arch: "aarch64".into(),
+            target_os: "macos".into(),
+            clang: "clang".into(),
+            flags: "-O3".into(),
+            rustc: "rustc".into(),
+            harness_profile: "release".into(),
+            rustflags: String::new(),
+            samples: 30,
+            min_sample_ms: 10,
+            input_seed: 1,
+            quick: false,
+            warmup_ms: 300,
+            candidate_warmup_ms: 50,
+        };
+        json::parse(&key.to_json()).unwrap()
+    }
+
+    fn keys() -> Vec<Value> {
+        vec![
+            key("v1", None, None),
+            key("v2", None, Some(vec![2, 4, 8])),
+            key(
+                "v2",
+                Some(CacheInfo::new(32 * 1024, 1024 * 1024, 64).unwrap()),
+                Some(vec![4, 16]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn writer_output_is_a_complete_key() {
+        for key in keys() {
+            validate_protocol(&key).unwrap();
+        }
+    }
+
+    /// Guards against a new `ProtocolKey` field being written but never required here, and
+    /// against a required field silently becoming optional.
+    #[test]
+    fn removing_or_nulling_any_written_field_is_rejected() {
+        for key in keys() {
+            let Value::Object(fields) = &key else {
+                unreachable!()
+            };
+            for name in fields.keys() {
+                let mut removed = fields.clone();
+                removed.remove(name);
+                let err = validate_protocol(&Value::Object(removed)).unwrap_err();
+                assert!(err.contains(name.as_str()), "{name}: {err}");
+                if name == "cache" {
+                    continue; // null is the written value for unknown hardware
+                }
+                let mut nulled = fields.clone();
+                nulled.insert(name.clone(), Value::Null);
+                assert!(validate_protocol(&Value::Object(nulled)).is_err(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        for key in keys() {
+            let Value::Object(mut fields) = key else {
+                unreachable!()
+            };
+            fields.insert("extra".into(), Value::String("x".into()));
+            let err = validate_protocol(&Value::Object(fields)).unwrap_err();
+            assert!(err.contains("unknown protocol field extra"), "{err}");
+        }
+        // Space-specific fields are not accepted on V1, where the writer never emits them.
+        let Value::Object(mut v1) = key("v1", None, None) else {
+            unreachable!()
+        };
+        v1.insert("cache".into(), Value::Null);
+        assert!(validate_protocol(&Value::Object(v1)).is_err());
+        let Value::Object(mut v2) = key(
+            "v2",
+            Some(CacheInfo::new(32 * 1024, 1024 * 1024, 64).unwrap()),
+            Some(vec![4]),
+        ) else {
+            unreachable!()
+        };
+        let Some(Value::Object(cache)) = v2.get_mut("cache") else {
+            unreachable!()
+        };
+        cache.insert("l3_bytes".into(), Value::Number("1".into()));
+        assert!(validate_protocol(&Value::Object(v2)).is_err());
+    }
 }

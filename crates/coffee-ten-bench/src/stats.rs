@@ -186,6 +186,24 @@ mod tests {
         assert!(drifted(&nine));
     }
 
+    #[test]
+    fn one_round_is_every_statistic() {
+        let s = summarize(&[3.25]).unwrap();
+        assert_eq!((s.min, s.p25, s.median, s.p75), (3.25, 3.25, 3.25, 3.25));
+    }
+
+    #[test]
+    fn empty_and_short_runs_never_report_drift() {
+        // Any length below MIN_ROUNDS_FOR_DRIFT, even with a 1000x jump, is not evaluated
+        // and returns false: absence of a check, not evidence of a stable run.
+        for len in 0..MIN_ROUNDS_FOR_DRIFT {
+            let rates: Vec<f64> = (0..len)
+                .map(|i| if i < len / 2 { 1.0 } else { 1000.0 })
+                .collect();
+            assert!(!drifted(&rates), "{len}");
+        }
+    }
+
     fn shuffled_orders(seed: u64) -> Vec<Vec<usize>> {
         let mut rng = Rng::new(seed);
         (0..10)

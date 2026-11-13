@@ -19,8 +19,9 @@ ranking of the supplied rows, not a new search decision.
 The 95% percentile bootstrap uses N4, with defaults `--seed 1 --resamples 10000`.
 Intervals cover uncertainty across the supplied rounds, not independent process restarts
 or the effect of choosing the best observed candidate. `--top` defaults to 10. Quick
-logs carry a prominent smoke-data label. Drift flags are retained. Markdown table text
-is escaped, and an input-byte fingerprint identifies the exact log.
+logs carry a prominent smoke-data label. Drift flags are retained; with fewer than 10
+rounds (two disjoint windows of 5) the check cannot run, and the Drift column says
+`not evaluated` instead of `false`. Markdown table text is escaped, and an input-byte fingerprint identifies the exact log.
 
 Time totals cover **all** rows of each protocol, including rows outside top-k. Measurement
 time is the sum of raw round durations. Compilation is summed successful compiler API work,
@@ -28,6 +29,8 @@ including each recorded reference compilation; parallel work is not elapsed wall
 Warmup/setup are excluded from measurement costs. The reader checks raw rate/timing,
 aggregate bits, raw acquisition order, metadata consistency, drift and cost totals before
 rendering. Malformed inputs fail without partial output.
+Each non-blank line must hold exactly one JSON object (LF or CRLF endings; no byte-order
+mark); errors cite the physical line number, blank lines included.
 
 The saved synthetic fixture `crates/coffee-ten-bench/tests/fixtures/report.jsonl` is
 checked against a Markdown golden through both the API and the actual command in CI.
@@ -39,6 +42,10 @@ cargo run --release -p coffee-ten-bench -- report --compare A.jsonl B.jsonl
 ```
 
 Each file must contain exactly one N2 protocol key, and the keys must be equal in full.
+The key must also be complete and closed: every field `ProtocolKey::to_json` writes is
+required with its type (`cache` and `tile_factors` only for non-V1 spaces), and an unknown
+field is rejected. Two files that both lack, say, `source_hash` are therefore not comparable,
+even though their incomplete keys are equal. Errors name the offending field.
 Mixed-key files are rejected rather than silently choosing a compatible subset. The first
 row with the highest lower median is the winner of each file. The reported ratio is
 `median(best A) / median(best B)`, with the 95% bootstrap interval and both schedules.
