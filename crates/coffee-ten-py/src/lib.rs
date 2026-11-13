@@ -353,7 +353,15 @@ fn run<'py>(
     let mut graph = Graph::new();
     let output_id = lower(&output.expr, &mut graph, &mut HashMap::new()).map_err(value_error)?;
 
-    let arrays = read_inputs(inputs)?;
+    let known: Vec<&str> = graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Input { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let arrays = read_inputs(inputs, &known)?;
     let named_arrays: Vec<(&str, &DenseTensor<f32>)> = arrays
         .iter()
         .map(|(name, array)| (name.as_str(), array))
@@ -364,16 +372,31 @@ fn run<'py>(
 }
 
 /// Reads the keyword arguments of `run` or `Kernel.__call__`: name and float32 array.
-fn read_inputs(inputs: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, DenseTensor<f32>)>> {
-    let mut arrays = Vec::new();
-    if let Some(inputs) = inputs {
-        for (key, value) in inputs.iter() {
-            let name: String = key.extract()?;
-            let array = read_input(&name, &value)?;
-            arrays.push((name, array));
+///
+/// Names are checked against `known` before any array is read, so a misspelled input is
+/// reported as `unknown input` even when its array would also be rejected.
+fn read_inputs(
+    inputs: Option<&Bound<'_, PyDict>>,
+    known: &[&str],
+) -> PyResult<Vec<(String, DenseTensor<f32>)>> {
+    let Some(inputs) = inputs else {
+        return Ok(Vec::new());
+    };
+    let mut named = Vec::with_capacity(inputs.len());
+    for (key, value) in inputs.iter() {
+        let name: String = key.extract()?;
+        if !known.contains(&name.as_str()) {
+            return Err(value_error(format!("unknown input {name}")));
         }
+        named.push((name, value));
     }
-    Ok(arrays)
+    named
+        .into_iter()
+        .map(|(name, value)| {
+            let array = read_input(&name, &value)?;
+            Ok((name, array))
+        })
+        .collect()
 }
 
 /// Builds the graph node of `expr`; a subtree shared by `Arc` becomes one node.
@@ -489,13 +512,8 @@ impl PyKernel {
         inputs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         let (input_buffers, other_buffers) = self.buffers.split_at(self.input_count);
-        let mut arrays = read_inputs(inputs)?;
-        if let Some((name, _)) = arrays
-            .iter()
-            .find(|(name, _)| !input_buffers.iter().any(|buffer| &buffer.name == name))
-        {
-            return Err(value_error(format!("unknown input {name}")));
-        }
+        let known: Vec<&str> = input_buffers.iter().map(|b| b.name.as_str()).collect();
+        let mut arrays = read_inputs(inputs, &known)?;
 
         let mut storage: Vec<Vec<f32>> = Vec::with_capacity(self.buffers.len());
         for buffer in input_buffers {
