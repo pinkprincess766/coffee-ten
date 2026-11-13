@@ -31,6 +31,8 @@ pub const BENCH_FLAGS: &[&str] = &[
 ];
 
 const CLANG: &str = "clang";
+/// How many lines of clang's stderr `CompileError::ClangFailed` shows.
+const STDERR_LINES: usize = 20;
 const ENTRY_SYMBOL: &[u8] = b"ct_entry\0";
 
 /// `void ct_entry(float *const *bufs)`: the fixed-arity entry point of every library.
@@ -46,7 +48,13 @@ pub enum CompileError {
     /// `clang` could not be started because it does not exist.
     ClangNotFound(String),
     /// clang ran and exited with an error (`status` is `None` if killed by a signal).
-    ClangFailed { status: Option<i32>, stderr: String },
+    /// `command` is the command line as run; `stderr` is complete, while `Display` shows
+    /// only its first `STDERR_LINES` lines.
+    ClangFailed {
+        command: String,
+        status: Option<i32>,
+        stderr: String,
+    },
     /// The shared library could not be loaded or has no entry point.
     Load(String),
 }
@@ -57,10 +65,29 @@ impl fmt::Display for CompileError {
             Self::Codegen(e) => write!(f, "codegen failed: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::ClangNotFound(e) => write!(f, "clang not found: {e}"),
-            Self::ClangFailed { status, stderr } => match status {
-                Some(code) => write!(f, "clang exited with status {code}:\n{stderr}"),
-                None => write!(f, "clang was killed by a signal:\n{stderr}"),
-            },
+            Self::ClangFailed {
+                command,
+                status,
+                stderr,
+            } => {
+                match status {
+                    Some(code) => write!(f, "clang exited with status {code}")?,
+                    None => write!(f, "clang was killed by a signal")?,
+                }
+                write!(f, "\ncommand: {command}")?;
+                let lines: Vec<&str> = stderr.lines().collect();
+                if lines.is_empty() {
+                    return write!(f, "\nstderr: (empty)");
+                }
+                write!(f, "\nstderr:")?;
+                for line in lines.iter().take(STDERR_LINES) {
+                    write!(f, "\n{line}")?;
+                }
+                if lines.len() > STDERR_LINES {
+                    write!(f, "\n... {} more lines", lines.len() - STDERR_LINES)?;
+                }
+                Ok(())
+            }
             Self::Load(e) => write!(f, "cannot load library: {e}"),
         }
     }
@@ -271,31 +298,30 @@ fn clang_version() -> Result<&'static str, CompileError> {
 
 /// Runs `clang args` and returns its stdout.
 fn clang_stdout(args: &[&str]) -> Result<String, CompileError> {
-    let output = Command::new(CLANG)
-        .args(args)
-        .output()
-        .map_err(clang_spawn_error)?;
+    let mut command = Command::new(CLANG);
+    command.args(args);
+    let output = command.output().map_err(clang_spawn_error)?;
     if !output.status.success() {
-        return Err(clang_failed(&output));
+        return Err(clang_failed(&command, &output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn run_clang(flags: &[&str], source: &Path, out: &Path) -> Result<(), CompileError> {
-    let output = Command::new(CLANG)
+    let mut command = Command::new(CLANG);
+    command
         .args(flags)
         .args(["-shared", "-fPIC", "-o"])
         .arg(out)
         .arg(source)
         // glibc keeps `expf` in libm, not libc, so a shared library using it must link
         // it; after the source, since linkers resolve left to right. Harmless on macOS.
-        .arg("-lm")
-        .output()
-        .map_err(clang_spawn_error)?;
+        .arg("-lm");
+    let output = command.output().map_err(clang_spawn_error)?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(clang_failed(&output))
+        Err(clang_failed(&command, &output))
     }
 }
 
@@ -307,10 +333,33 @@ fn clang_spawn_error(e: std::io::Error) -> CompileError {
     }
 }
 
-fn clang_failed(output: &std::process::Output) -> CompileError {
+fn clang_failed(command: &Command, output: &std::process::Output) -> CompileError {
     CompileError::ClangFailed {
+        command: command_line(command),
         status: output.status.code(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// `command` as one line: program and arguments separated by spaces, each word that is empty
+/// or has a character outside `[A-Za-z0-9_./=+:,@%-]` single-quoted for a POSIX shell.
+fn command_line(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|word| shell_word(&word.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./=+:,@%-".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -692,9 +741,35 @@ mod tests {
         let dir = TempDir::new("fail");
         let flags = ["-std=c99", "-Werror", "-Wthis-flag-does-not-exist"];
         match compile_with_flags(&matmul(), &dir.0, &flags) {
-            Err(CompileError::ClangFailed { status, stderr }) => {
+            Err(error @ CompileError::ClangFailed { .. }) => {
+                let CompileError::ClangFailed {
+                    command,
+                    status,
+                    stderr,
+                } = &error
+                else {
+                    unreachable!()
+                };
                 assert!(status.is_some_and(|code| code != 0));
-                assert!(!stderr.is_empty());
+                assert!(stderr.contains("-Wthis-flag-does-not-exist"), "{stderr}");
+                // The command is the one that ran: the flags in order, then the fixed tail.
+                assert!(
+                    command.starts_with(
+                        "clang -std=c99 -Werror -Wthis-flag-does-not-exist -shared -fPIC -o "
+                    ),
+                    "{command}"
+                );
+                assert!(command.ends_with(".c -lm"), "{command}");
+                // The message names the command and quotes clang's first stderr lines.
+                let message = error.to_string();
+                let first = stderr.lines().next().unwrap();
+                assert!(
+                    message.starts_with(&format!(
+                        "clang exited with status {}\ncommand: {command}\nstderr:\n{first}",
+                        status.unwrap()
+                    )),
+                    "{message}"
+                );
             }
             other => panic!("expected ClangFailed, got {other:?}"),
         }
@@ -705,6 +780,55 @@ mod tests {
             .filter(|name| !name.to_string_lossy().ends_with(".c"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn clang_failure_message_shows_the_first_stderr_lines() {
+        let stderr: String = (1..=25).map(|n| format!("line {n}\n")).collect();
+        let error = CompileError::ClangFailed {
+            command: "clang -O2 x.c".to_string(),
+            status: Some(1),
+            stderr,
+        };
+        let expected: String = std::iter::once("clang exited with status 1".to_string())
+            .chain(["command: clang -O2 x.c".to_string(), "stderr:".to_string()])
+            .chain((1..=20).map(|n| format!("line {n}")))
+            .chain(["... 5 more lines".to_string()])
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(error.to_string(), expected);
+
+        let exactly: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let error = CompileError::ClangFailed {
+            command: "clang".to_string(),
+            status: None,
+            stderr: exactly,
+        };
+        let message = error.to_string();
+        assert!(
+            message.starts_with("clang was killed by a signal\ncommand: clang\nstderr:\nline 1\n")
+        );
+        assert!(message.ends_with("\nline 20"), "{message}");
+
+        let error = CompileError::ClangFailed {
+            command: "clang".to_string(),
+            status: Some(2),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "clang exited with status 2\ncommand: clang\nstderr: (empty)"
+        );
+    }
+
+    #[test]
+    fn command_line_quotes_only_words_that_need_it() {
+        let mut command = Command::new("clang");
+        command.args(["-O2", "-march=native", "", "a b", "it's", "/tmp/x_1.c"]);
+        assert_eq!(
+            command_line(&command),
+            r"clang -O2 -march=native '' 'a b' 'it'\''s' /tmp/x_1.c"
+        );
     }
 
     #[test]
