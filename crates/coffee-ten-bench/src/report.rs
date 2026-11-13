@@ -24,8 +24,15 @@ pub(crate) struct Row {
     pub drift: bool,
 }
 
+/// Errors that carry the usage text are about the command line (`BenchError::Usage`, exit 2);
+/// everything else is about the input data (`BenchError::Setup`, exit 1).
 fn error(message: impl std::fmt::Display) -> BenchError {
-    BenchError::Setup(format!("report: {message}"))
+    let message = format!("report: {message}");
+    if message.ends_with(USAGE) {
+        BenchError::Usage(message)
+    } else {
+        BenchError::Setup(message)
+    }
 }
 
 /// String fields of the persisted comparison key (`ProtocolKey::to_json`).
@@ -252,12 +259,20 @@ fn drift_cell(row: &Row) -> &'static str {
     }
 }
 
+/// Text from the log as inert Markdown: no HTML, no table breaks, no code spans, no
+/// emphasis, no links. Every special character becomes a numeric entity that renders as itself.
 fn cell(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('|', "&#124;")
         .replace('`', "&#96;")
+        .replace('\\', "&#92;")
+        .replace('*', "&#42;")
+        .replace('_', "&#95;")
+        .replace('[', "&#91;")
+        .replace(']', "&#93;")
+        .replace('~', "&#126;")
         .replace(['\n', '\r'], " ")
 }
 
@@ -315,6 +330,14 @@ pub fn markdown(text: &str, top: usize, bootstrap: BootstrapConfig) -> Result<St
             out.push_str("\n**Quick smoke data; not a performance measurement.**\n");
         }
         writeln!(out, "\nRecords: {}. Measurement: {measured} ns. Compilation API work: {compiled} ns (includes reference; summed work, not wall time).\n", entries.len()).unwrap();
+        // Costs above cover every record; say how many of them the table below ranks.
+        writeln!(
+            out,
+            "Showing {} of {} records (--top {top}).\n",
+            top.min(entries.len()),
+            entries.len()
+        )
+        .unwrap();
         out.push_str("| Rank | Group | Schedule | Median GFLOP/s | 95% CI | Rounds | Drift |\n| --- | --- | --- | ---: | --- | ---: | --- |\n");
         entries.sort_by(|a, b| b.median.total_cmp(&a.median));
         for (rank, row) in entries.into_iter().take(top).enumerate() {
@@ -398,11 +421,35 @@ pub fn command(args: impl IntoIterator<Item = String>) -> Result<String, BenchEr
     }
 }
 
-fn best(rows: &[Row]) -> Result<&Row, BenchError> {
+/// Each differing protocol field with both values as JSON, sorted by field name, so a mismatch
+/// says what to fix (a different build, machine, flag or sampling) without diffing logs by hand.
+fn key_diff(a: &Value, a_name: &str, b: &Value, b_name: &str) -> String {
+    let show = |key: &Value, field: &str| {
+        key.get(field)
+            .map_or_else(|_| "missing".to_string(), Value::to_json)
+    };
+    a.differing_keys(b)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|field| {
+            format!(
+                "{field} ({a_name}: {}, {b_name}: {})",
+                show(a, field),
+                show(b, field)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn best<'a>(rows: &'a [Row], file: &str) -> Result<&'a Row, BenchError> {
     let mut best = &rows[0];
     for row in &rows[1..] {
-        if row.protocol != best.protocol {
-            return Err(error("comparison requires exactly one protocol per file"));
+        if row.protocol != rows[0].protocol {
+            return Err(error(format!(
+                "comparison requires exactly one protocol per file; {file} mixes keys: {}",
+                key_diff(&rows[0].protocol, "first", &row.protocol, "later")
+            )));
         }
         if row.median > best.median {
             best = row;
@@ -421,10 +468,13 @@ pub fn compare(
 ) -> Result<String, BenchError> {
     let a_rows = read(a)?;
     let b_rows = read(b)?;
-    let a_best = best(&a_rows)?;
-    let b_best = best(&b_rows)?;
+    let a_best = best(&a_rows, "A")?;
+    let b_best = best(&b_rows, "B")?;
     if a_best.protocol != b_best.protocol {
-        return Err(error("protocol key mismatch between A and B"));
+        return Err(error(format!(
+            "protocol key mismatch between A and B: {}",
+            key_diff(&a_best.protocol, "A", &b_best.protocol, "B")
+        )));
     }
     let bootstrap = if paired {
         bootstrap_paired_ratio

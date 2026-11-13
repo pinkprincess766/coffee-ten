@@ -18,7 +18,8 @@ ranking of the supplied rows, not a new search decision.
 
 The 95% percentile bootstrap uses N4, with defaults `--seed 1 --resamples 10000`.
 Intervals cover uncertainty across the supplied rounds, not independent process restarts
-or the effect of choosing the best observed candidate. `--top` defaults to 10. Quick
+or the effect of choosing the best observed candidate. `--top` defaults to 10; each table states
+`Showing k of m records` so a truncated table is not mistaken for the whole run. Quick
 logs carry a prominent smoke-data label. Drift flags are retained; with fewer than 10
 rounds (two disjoint windows of 5) the check cannot run, and the Drift column says
 `not evaluated` instead of `false`. Markdown table text is escaped, and an input-byte fingerprint identifies the exact log.
@@ -48,7 +49,9 @@ The key must also be complete and closed: every field `ProtocolKey::to_json` wri
 required with its type (`cache` and `tile_factors` only for non-V1 spaces), and an unknown
 field is rejected. Two files that both lack, say, `source_hash` are therefore not comparable,
 even though their incomplete keys are equal. Errors name the offending field.
-Mixed-key files are rejected rather than silently choosing a compatible subset. The first
+Mixed-key files are rejected rather than silently choosing a compatible subset. Both errors
+list every differing key field with its two values as JSON, e.g.
+`source_hash (A: "ffee…", B: "1111…")`. The first
 row with the highest lower median is the winner of each file. The reported ratio is
 `median(best A) / median(best B)`, with the 95% bootstrap interval and both schedules.
 
@@ -58,3 +61,9 @@ design actually paired the observations; this is an explicit caller assertion, p
 the report. Paired mode uses N4's shared-index resampling and checks matching index sets.
 `--seed` and `--resamples` apply to either mode. Neither interval corrects winner-selection
 bias or captures variation across process restarts. No search/acquisition behavior changes.
+
+## Exit status
+
+`report` and `curve` exit 0 on success, 2 when the command line is wrong (the message ends
+with the usage), and 1 when the input is rejected (unreadable file, invalid record, protocol
+mismatch, or a value such as `--top 0` that parses but is refused by the analysis).

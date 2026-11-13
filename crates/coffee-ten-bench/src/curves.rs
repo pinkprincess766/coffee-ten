@@ -66,7 +66,6 @@ pub fn csv(replays: &[Replay]) -> Result<String, BenchError> {
     Ok(out)
 }
 
-/// Uses the same complete-table validation and seeded sample as N3. No timing or log writes.
 /// `coffee-ten-bench curve` usage. Errors print this, not the `search` usage the arguments are
 /// partly parsed with.
 pub const USAGE: &str = "usage: coffee-ten-bench curve --n <N> --budget <M> --replay <complete-table.jsonl> \
@@ -77,6 +76,7 @@ fn usage(msg: impl std::fmt::Display) -> BenchError {
     BenchError::Usage(format!("curve: {msg}\n{USAGE}"))
 }
 
+/// Uses the same complete-table validation and seeded sample as N3. No timing or log writes.
 pub fn command(args: impl IntoIterator<Item = String>) -> Result<String, BenchError> {
     let args: Vec<String> = args.into_iter().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {

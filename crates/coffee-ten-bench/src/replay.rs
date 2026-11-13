@@ -102,18 +102,10 @@ fn read_entry(row: &Value, key: &ProtocolKey, class: OrderClass) -> Result<Entry
 /// another machine is diagnosed without diffing JSON by hand. Values are not printed: some are
 /// long (`flags`, `cpu`), and the field names are enough to find the flag or file to fix.
 fn key_mismatch(found: &Value, expected: &Value) -> String {
-    let (Value::Object(found), Value::Object(expected)) = (found, expected) else {
-        return "protocol key mismatch: protocol must be an object".into();
-    };
-    let mut fields: Vec<&str> = expected
-        .keys()
-        .chain(found.keys())
-        .map(String::as_str)
-        .filter(|k| found.get(*k) != expected.get(*k))
-        .collect();
-    fields.sort_unstable();
-    fields.dedup();
-    format!("protocol key mismatch: {}", fields.join(", "))
+    match found.differing_keys(expected) {
+        Some(fields) => format!("protocol key mismatch: {}", fields.join(", ")),
+        None => "protocol key mismatch: protocol must be an object".into(),
+    }
 }
 
 /// Validates the entire table before selecting any candidates. Does not compile or run C.

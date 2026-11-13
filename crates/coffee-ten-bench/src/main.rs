@@ -33,6 +33,15 @@ fn raise_qos() {
 #[cfg(not(target_os = "macos"))]
 fn raise_qos() {}
 
+/// Exit status of an offline subcommand (`report`, `curve`): 2 for a wrong command line, as the
+/// harness's own argument errors, and 1 when the input data are rejected, as `search --replay`.
+fn exit_code(e: &coffee_ten_bench::BenchError) -> ExitCode {
+    match e {
+        coffee_ten_bench::BenchError::Usage(_) => ExitCode::from(2),
+        _ => ExitCode::FAILURE,
+    }
+}
+
 /// `coffee-ten-bench space --n <N>`: lists the schedule space, measures nothing.
 fn space_main(args: impl Iterator<Item = String>) -> ExitCode {
     let mut args = args.peekable();
@@ -146,7 +155,7 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("error: {e}");
-                ExitCode::from(2)
+                exit_code(&e)
             }
         };
     }
@@ -159,7 +168,7 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("error: {e}");
-                ExitCode::from(2)
+                exit_code(&e)
             }
         };
     }
