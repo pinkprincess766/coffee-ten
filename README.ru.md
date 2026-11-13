@@ -343,6 +343,32 @@ for i in 0..4:
 match: preserving
 ```
 
+Чтение сохранённых прогонов: `report`, `report --compare` и `curve` ничего не компилируют и
+не замеряют. Флаги — те же, что в `coffee-ten-bench <команда> --help`.
+
+```sh
+# Ранжированные Markdown-таблицы одного прогона (docs/reports.md).
+cargo run --release -p coffee-ten-bench -- report \
+  bench/results/2026-11-07-n20-v1-n256.jsonl --top 10 > report.md
+# Лучшая медиана прогона A к прогону B с бутстреп-интервалом; у обоих файлов должен быть
+# один ключ протокола (docs/reports.md#comparing-runs-n12). Здесь — тестовые фикстуры.
+cargo run --release -p coffee-ten-bench -- report --compare \
+  crates/coffee-ten-bench/tests/fixtures/report-b.jsonl \
+  crates/coffee-ten-bench/tests/fixtures/report.jsonl
+# Кривые случайного поиска, воспроизведённые из полной таблицы, в CSV (docs/replay-curves.md).
+cargo run --release -p coffee-ten-bench -- curve --n 256 --budget 1000 \
+  --samples 5 --min-sample-ms 10 --space v1 --seeds 1,2,3,5 \
+  --replay bench/results/2026-11-07-n20-v1-n256.jsonl > curves.csv
+```
+
+Параметры `report`: `--top <K>` (по умолчанию 10), `--seed <SEED>` (по умолчанию 1),
+`--resamples <B>` (по умолчанию 10000); `report --compare` принимает `--paired`, `--seed` и
+`--resamples`. `curve` требует точного ключа таблицы (исходники, профиль, машина,
+тулчейн). Команда выше — та, что записана для таблицы N20 в
+[docs/n20-mac.md](docs/n20-mac.md); она работает только со сборкой коммита, снявшего таблицу, на
+той же машине, а в другом окружении завершается ошибкой, например
+`replay: unknown CPU/platform/compiler identity`.
+
 ## Приложение B. Основания
 
 Каждый раздел называет идею, на которой стоит код, где он находится и что его проверяет.
