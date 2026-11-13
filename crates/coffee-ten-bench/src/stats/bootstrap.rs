@@ -36,9 +36,20 @@ pub struct BootstrapInterval {
 pub enum BootstrapError {
     EmptyRounds,
     ZeroResamples,
-    InvalidRate { round_index: usize },
-    DuplicateRound { round_index: usize },
-    UnmatchedRounds,
+    InvalidRate {
+        round_index: usize,
+    },
+    DuplicateRound {
+        round_index: usize,
+    },
+    /// Paired resampling needs the same round IDs on both sides. `round_index` is the smallest
+    /// ID present on only one side, `in_numerator` says which.
+    UnmatchedRounds {
+        numerator_rounds: usize,
+        denominator_rounds: usize,
+        round_index: usize,
+        in_numerator: bool,
+    },
     InvalidRatio,
 }
 
@@ -56,7 +67,17 @@ impl fmt::Display for BootstrapError {
                 )
             }
             Self::DuplicateRound { round_index } => write!(f, "duplicate round {round_index}"),
-            Self::UnmatchedRounds => write!(f, "paired bootstrap needs identical round-index sets"),
+            Self::UnmatchedRounds {
+                numerator_rounds,
+                denominator_rounds,
+                round_index,
+                in_numerator,
+            } => write!(
+                f,
+                "paired bootstrap needs identical round-index sets: A has {numerator_rounds} rounds, \
+                 B has {denominator_rounds}; round {round_index} is only in {}",
+                if *in_numerator { "A" } else { "B" }
+            ),
             Self::InvalidRatio => write!(f, "median ratio must be finite and positive"),
         }
     }
@@ -162,6 +183,24 @@ pub fn bootstrap_median(
 /// Bootstrap `median(numerator) / median(denominator)`, drawing the same round IDs
 /// for both sides of every replicate. This is not the median of per-round ratios.
 /// Missing/duplicate IDs are errors; no intersection, truncation or independent draws.
+/// The smallest round ID in exactly one of two ID-sorted, duplicate-free lists, and whether it
+/// is in `a`. `None` when the ID sets are equal.
+fn first_unmatched(a: &[&RoundSample], b: &[&RoundSample]) -> Option<(usize, bool)> {
+    let (mut i, mut j) = (0, 0);
+    loop {
+        match (a.get(i), b.get(j)) {
+            (None, None) => return None,
+            (Some(x), None) => return Some((x.round_index, true)),
+            (None, Some(y)) => return Some((y.round_index, false)),
+            (Some(x), Some(y)) => match x.round_index.cmp(&y.round_index) {
+                std::cmp::Ordering::Equal => (i, j) = (i + 1, j + 1),
+                std::cmp::Ordering::Less => return Some((x.round_index, true)),
+                std::cmp::Ordering::Greater => return Some((y.round_index, false)),
+            },
+        }
+    }
+}
+
 /// The caller must establish that equal IDs represent genuinely paired observations
 /// and validate log/protocol provenance; equal counters from unrelated runs do not do so.
 pub fn bootstrap_paired_ratio(
@@ -174,12 +213,13 @@ pub fn bootstrap_paired_ratio(
     }
     let a = ordered(numerator)?;
     let b = ordered(denominator)?;
-    if a.len() != b.len()
-        || a.iter()
-            .zip(&b)
-            .any(|(a, b)| a.round_index != b.round_index)
-    {
-        return Err(BootstrapError::UnmatchedRounds);
+    if let Some((round_index, in_numerator)) = first_unmatched(&a, &b) {
+        return Err(BootstrapError::UnmatchedRounds {
+            numerator_rounds: a.len(),
+            denominator_rounds: b.len(),
+            round_index,
+            in_numerator,
+        });
     }
     let a_rates: Vec<_> = a.iter().map(|r| r.gflops).collect();
     let b_rates: Vec<_> = b.iter().map(|r| r.gflops).collect();
@@ -362,16 +402,29 @@ mod tests {
             bootstrap_median(&duplicate, config),
             Err(BootstrapError::DuplicateRound { round_index: 10 })
         );
+        let short = &valid[..2];
         assert_eq!(
-            bootstrap_paired_ratio(&valid, &valid[..2], config),
-            Err(BootstrapError::UnmatchedRounds)
+            bootstrap_paired_ratio(&valid, short, config),
+            Err(BootstrapError::UnmatchedRounds {
+                numerator_rounds: valid.len(),
+                denominator_rounds: 2,
+                round_index: valid[2].round_index,
+                in_numerator: true,
+            })
         );
+        assert!(matches!(
+            bootstrap_paired_ratio(short, &valid, config),
+            Err(BootstrapError::UnmatchedRounds {
+                in_numerator: false,
+                ..
+            })
+        ));
         let mut different = valid.clone();
         different[1].round_index += 1;
-        assert_eq!(
+        assert!(matches!(
             bootstrap_paired_ratio(&valid, &different, config),
-            Err(BootstrapError::UnmatchedRounds)
-        );
+            Err(BootstrapError::UnmatchedRounds { .. })
+        ));
         for (a, b) in [(f64::MAX, f64::MIN_POSITIVE), (f64::MIN_POSITIVE, f64::MAX)] {
             assert_eq!(
                 bootstrap_paired_ratio(&rounds(&[a]), &rounds(&[b]), config),
@@ -412,5 +465,51 @@ mod tests {
         assert_eq!((exact.estimate, exact.lower, exact.upper), (2.0, 2.0, 2.0));
         assert!(bootstrap_independent_ratio(&[], &a, config).is_err());
         assert!(bootstrap_independent_ratio(&a, &rounds(&[0.0]), config).is_err());
+    }
+
+    #[test]
+    fn unmatched_pairs_name_the_first_id_on_only_one_side() {
+        let with_ids = |ids: &[usize]| -> Vec<RoundSample> {
+            ids.iter()
+                .map(|&round_index| RoundSample {
+                    round_index,
+                    elapsed_ns: 1,
+                    iterations: 1,
+                    gflops: 1.0,
+                })
+                .collect()
+        };
+        let config = BootstrapConfig::default();
+        for (a, b, expected) in [
+            (&[0, 1, 2][..], &[0, 1, 2][..], None),
+            (&[2, 0, 1], &[1, 2, 0], None), // input order does not matter
+            (&[0, 1, 2], &[0, 1], Some((2, true))),
+            (&[0, 1], &[0, 1, 2], Some((2, false))),
+            (&[0, 2, 4], &[0, 3, 4], Some((2, true))),
+            (&[0, 3, 4], &[0, 2, 4], Some((2, false))),
+            (&[5, 6], &[0, 1], Some((0, false))),
+        ] {
+            let got = match bootstrap_paired_ratio(&with_ids(a), &with_ids(b), config) {
+                Ok(_) => None,
+                Err(BootstrapError::UnmatchedRounds {
+                    numerator_rounds,
+                    denominator_rounds,
+                    round_index,
+                    in_numerator,
+                }) => {
+                    assert_eq!((numerator_rounds, denominator_rounds), (a.len(), b.len()));
+                    Some((round_index, in_numerator))
+                }
+                Err(other) => panic!("{a:?} {b:?}: {other}"),
+            };
+            assert_eq!(got, expected, "{a:?} {b:?}");
+        }
+        let err = bootstrap_paired_ratio(&with_ids(&[0, 1, 2]), &with_ids(&[0, 2]), config)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "paired bootstrap needs identical round-index sets: A has 3 rounds, B has 2; round 1 is only in A"
+        );
     }
 }
