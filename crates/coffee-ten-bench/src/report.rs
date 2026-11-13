@@ -323,8 +323,10 @@ fn check_known_fields(row: &Value) -> Result<(), String> {
 pub(crate) fn read(text: &str) -> Result<Vec<Row>, BenchError> {
     let mut rows = Vec::new();
     for (index, line) in text.lines().enumerate() {
+        // As in `bench/validate.py`: every line is a record, so a blank one is an error
+        // (an interrupted or hand-edited append), not something to step over.
         if line.trim().is_empty() {
-            continue;
+            return Err(error(format!("line {}: empty JSONL line", index + 1)));
         }
         let parse = || -> Result<Option<Row>, String> {
             let value = json::parse(line)?;

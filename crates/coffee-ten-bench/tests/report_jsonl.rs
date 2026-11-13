@@ -1,4 +1,5 @@
-//! Line handling of the JSONL reader behind `report`: endings, blank lines, truncation and
+//! Line handling of the JSONL reader behind `report`: endings, blank lines (rejected, as in
+//! `bench/validate.py`), truncation and
 //! records that are not measurement objects.
 use coffee_ten_bench::{report, stats::BootstrapConfig};
 
@@ -18,17 +19,45 @@ fn error(text: &str) -> String {
 }
 
 #[test]
-fn crlf_and_blank_lines_read_like_the_plain_file() {
+fn crlf_and_unterminated_files_read_like_the_plain_file() {
     let plain = report::markdown(LOG, 2, CONFIG).unwrap();
     let crlf = LOG.replace('\n', "\r\n");
-    let spaced = format!("\n  \n{}\n\t\n", LOG.replace('\n', "\n\n"));
     let unterminated = LOG.trim_end_matches('\n');
-    for variant in [crlf.as_str(), spaced.as_str(), unterminated] {
+    for variant in [crlf.as_str(), unterminated] {
         assert_ne!(variant, LOG);
         let out = report::markdown(variant, 2, CONFIG).unwrap();
         // Same tables; only the fingerprint of the exact input bytes differs.
         assert_eq!(body(&out), body(&plain));
         assert_ne!(out, plain);
+    }
+}
+
+#[test]
+fn blank_and_whitespace_lines_are_errors_with_their_line_number() {
+    let lines: Vec<_> = LOG.lines().collect();
+    for (text, line) in [
+        (format!("\n{LOG}"), 1),
+        (format!("{}\n\n{}\n", lines[0], lines[1..].join("\n")), 2),
+        (
+            format!(
+                "{}\n  \t\n{}\n",
+                lines[..2].join("\n"),
+                lines[2..].join("\n")
+            ),
+            3,
+        ),
+        (format!("{LOG}\n"), 5),
+        (format!("{LOG} \r\n"), 5),
+        (LOG.replace('\n', "\r\n").replacen("\r\n", "\r\n\r\n", 1), 2),
+    ] {
+        assert_eq!(
+            error(&text),
+            format!("report: line {line}: empty JSONL line")
+        );
+        let compared = report::compare(LOG, &text, CONFIG, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(compared, format!("report: line {line}: empty JSONL line"));
     }
 }
 
@@ -49,8 +78,9 @@ fn errors_report_the_physical_line_number() {
         "{}",
         error(&truncated)
     );
-    // Blank lines still count, so the number matches what an editor shows.
-    let shifted = format!("\n\n{truncated}");
+    // Peak lines (checked, then set aside) count like any other line, so the number
+    // matches what an editor shows.
+    let shifted = format!("{}\n{}\n{truncated}", lines[0], lines[0]);
     assert!(
         error(&shifted).starts_with("report: line 6: "),
         "{}",

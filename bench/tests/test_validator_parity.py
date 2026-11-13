@@ -33,11 +33,9 @@ def find_binary():
 
 BINARY = find_binary()
 
-# validate.py rejects these, report accepts them. report skips blank lines and checks
-# protocol fingerprints and harness_profile for presence and type, not format. Closing a gap:
-# move it out of here.
+# validate.py rejects these, report accepts them. report checks protocol fingerprints and
+# harness_profile for presence and type, not format. Closing a gap: move it out of here.
 PYTHON_ONLY_REJECTS = {
-    "blank line between records",
     "protocol: source_hash not 16 hex digits",
     "protocol: space_hash not 16 hex digits",
     "protocol: unsupported harness_profile",

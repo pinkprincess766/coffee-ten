@@ -5,7 +5,8 @@ cargo run --release -p coffee-ten-bench -- report run.jsonl --top 10 > report.md
 ```
 
 This reads the log and writes Markdown to stdout. It compiles no kernels, acquires no
-timings and changes no input files. Peak rows are skipped. Offline replay curve rows are
+timings and changes no input files. Peak rows are checked as in `bench/validate.py`, then
+left out of the tables. Offline replay curve rows are
 rejected. N1 raw rounds and N2 protocol metadata are required: legacy aggregate-only logs
 cannot supply confidence intervals or measured costs and produce an explicit error.
 
@@ -30,8 +31,9 @@ including each recorded reference compilation; parallel work is not elapsed wall
 Warmup/setup are excluded from measurement costs. The reader checks raw rate/timing,
 aggregate bits, raw acquisition order, metadata consistency, drift and cost totals before
 rendering. Malformed inputs fail without partial output.
-Each non-blank line must hold exactly one JSON object (LF or CRLF endings; no byte-order
-mark); errors cite the physical line number, blank lines included.
+Each line must hold exactly one JSON object (LF or CRLF endings; no byte-order mark); a
+blank or whitespace-only line is an error, as in `bench/validate.py`. Errors cite the
+physical line number.
 
 The saved synthetic fixture `crates/coffee-ten-bench/tests/fixtures/report.jsonl` is
 checked against a Markdown golden through both the API and the actual command in CI.
