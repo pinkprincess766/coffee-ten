@@ -24,8 +24,15 @@ pub(crate) struct Row {
     pub drift: bool,
 }
 
+/// Errors that carry the usage text are about the command line (`BenchError::Usage`, exit 2);
+/// everything else is about the input data (`BenchError::Setup`, exit 1).
 fn error(message: impl std::fmt::Display) -> BenchError {
-    BenchError::Setup(format!("report: {message}"))
+    let message = format!("report: {message}");
+    if message.ends_with(USAGE) {
+        BenchError::Usage(message)
+    } else {
+        BenchError::Setup(message)
+    }
 }
 
 /// String fields of the persisted comparison key (`ProtocolKey::to_json`).
