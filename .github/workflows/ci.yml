@@ -99,6 +99,12 @@ jobs:
           key: cargo-ubuntu-latest-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-ubuntu-latest-${{ github.job }}-
       - run: bench/run.sh --quick --sizes 64 --pause 0 --yes
+      # Plan item P39: the saved N20 report is exactly what `report` makes of its saved log.
+      - name: Regenerate the N20 report and diff it against the committed one
+        run: |
+          target/release/coffee-ten-bench report \
+            bench/results/2026-11-07-n20-v1-n256.jsonl --top 10 \
+            | diff -u bench/results/2026-11-07-n20-v1-n256.report.md -
       - name: Check the JSONL it wrote
         run: |
           python3 -m unittest discover -s bench/tests -v
