@@ -120,7 +120,8 @@ def test_input_size_boundary():
     assert ct.input("edge", (MAX_ELEMENTS,)).shape == (MAX_ELEMENTS,)
     with pytest.raises(ValueError, match="has too many elements$"):
         ct.input("past", (MAX_ELEMENTS + 1,))
-    # Split across two dimensions: exactly MAX_ELEMENTS is allowed, one more row is not.
+    # Split across two dimensions: the largest multiple of 7 that fits is allowed, one more
+    # row is not.
     rows = MAX_ELEMENTS // 7
     ct.input("edge2", (rows, 7))
     with pytest.raises(ValueError, match="has too many elements$"):
