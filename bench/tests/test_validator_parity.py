@@ -33,11 +33,9 @@ def find_binary():
 
 BINARY = find_binary()
 
-# validate.py rejects these, report accepts them. report only needs the fields it reads,
-# skips peak lines unread, and checks protocol fingerprints and
+# validate.py rejects these, report accepts them. report checks protocol fingerprints and
 # harness_profile for presence and type, not format. Closing a gap: move it out of here.
 PYTHON_ONLY_REJECTS = {
-    "malformed peak line",
     "protocol: source_hash not 16 hex digits",
     "protocol: space_hash not 16 hex digits",
     "protocol: unsupported harness_profile",
@@ -62,7 +60,7 @@ def mutate(row, path, value=None, delete=False):
 
 def cases():
     lines = FIXTURE.read_text().splitlines()
-    # Line 0 is report's stand-in peak line; validate.py needs a real one.
+    # A real peak line from bench/results; the fixture's own is synthetic but valid too.
     peak, records = PEAK.read_text().strip(), lines[1:]
     row = json.loads(records[0])
     rest = "\n".join(records[1:]) + "\n"
@@ -133,7 +131,10 @@ def cases():
         ("duplicate key", records[0][:-1] + ',"n":' + str(row["n"]) + "}\n" + rest),
         ("offline curve record", '{"kind":"replay_curve"}\n' + rest),
         ("blank line between records", records[0] + "\n\n" + rest),
-        ("malformed peak line", lines[0] + "\n" + records[0] + "\n" + rest),
+        ("malformed peak line", '{"kind":"peak","fixture":true}\n' + records[0] + "\n" + rest),
+        ("peak line with an extra field", peak[:-1] + ',"extra":1}\n' + "\n".join(records) + "\n"),
+        ("peak line with unordered statistics",
+         peak.replace('"median":', '"median":-', 1) + "\n" + "\n".join(records) + "\n"),
     ]:
         out[name] = text
     return out

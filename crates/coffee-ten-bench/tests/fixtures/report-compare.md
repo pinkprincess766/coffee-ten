@@ -1,6 +1,6 @@
 # Run comparison
 
-A fingerprint: `dba5227762af97b9`. B fingerprint: `cd0e590f0c28fdc1`.
+A fingerprint: `081ee30d6c09ae9c`. B fingerprint: `607f6a4ff4823fc0`.
 
 **Quick smoke data; not a performance measurement.**
 

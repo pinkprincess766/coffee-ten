@@ -5,7 +5,8 @@ cargo run --release -p coffee-ten-bench -- report run.jsonl --top 10 > report.md
 ```
 
 This reads the log and writes Markdown to stdout. It compiles no kernels, acquires no
-timings and changes no input files. Peak rows are skipped. Offline replay curve rows are
+timings and changes no input files. Peak rows are checked as in `bench/validate.py`, then
+left out of the tables. Offline replay curve rows are
 rejected. N1 raw rounds and N2 protocol metadata are required: legacy aggregate-only logs
 cannot supply confidence intervals or measured costs and produce an explicit error.
 
