@@ -19,8 +19,9 @@ ranking of the supplied rows, not a new search decision.
 The 95% percentile bootstrap uses N4, with defaults `--seed 1 --resamples 10000`.
 Intervals cover uncertainty across the supplied rounds, not independent process restarts
 or the effect of choosing the best observed candidate. `--top` defaults to 10. Quick
-logs carry a prominent smoke-data label. Drift flags are retained. Markdown table text
-is escaped, and an input-byte fingerprint identifies the exact log.
+logs carry a prominent smoke-data label. Drift flags are retained; with fewer than 10
+rounds (two disjoint windows of 5) the check cannot run, and the Drift column says
+`not evaluated` instead of `false`. Markdown table text is escaped, and an input-byte fingerprint identifies the exact log.
 
 Time totals cover **all** rows of each protocol, including rows outside top-k. Measurement
 time is the sum of raw round durations. Compilation is summed successful compiler API work,

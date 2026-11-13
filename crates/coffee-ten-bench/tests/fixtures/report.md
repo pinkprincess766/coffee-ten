@@ -19,5 +19,5 @@ Records: 3. Measurement: 56000000 ns. Compilation API work: 650 ns (includes ref
 
 | Rank | Group | Schedule | Median GFLOP/s | 95% CI | Rounds | Drift |
 | --- | --- | --- | ---: | --- | ---: | --- |
-| 1 | random | vectorize(1, j) | 4.000000 | [2.000000, 8.000000] | 3 | false |
-| 2 | random | split(1, j, jo, ji, 2) | 4.000000 | [2.000000, 8.000000] | 3 | false |
+| 1 | random | vectorize(1, j) | 4.000000 | [2.000000, 8.000000] | 3 | not evaluated |
+| 2 | random | split(1, j, jo, ji, 2) | 4.000000 | [2.000000, 8.000000] | 3 | not evaluated |
