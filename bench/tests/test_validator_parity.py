@@ -33,13 +33,9 @@ def find_binary():
 
 BINARY = find_binary()
 
-# validate.py rejects these, report accepts them. report checks protocol fingerprints and
-# harness_profile for presence and type, not format. Closing a gap: move it out of here.
-PYTHON_ONLY_REJECTS = {
-    "protocol: source_hash not 16 hex digits",
-    "protocol: space_hash not 16 hex digits",
-    "protocol: unsupported harness_profile",
-}
+# Closed in the matching report checks: both validators now require 16 lowercase hex
+# digits for protocol fingerprints and harness_profile of debug or release.
+PYTHON_ONLY_REJECTS = set()
 # The reverse: a peak-only log is a valid log, but report has no measurements to rank.
 REPORT_ONLY_REJECTS = {"only a peak line"}
 KNOWN_GAPS = {name: (False, True) for name in PYTHON_ONLY_REJECTS}
@@ -112,6 +108,7 @@ def cases():
         ("rounds below min_sample_ms", "min_sample_ms", 10_000),
         ("source_hash not 16 hex digits", "source_hash", "0123"),
         ("space_hash not 16 hex digits", "space_hash", "ABCDEF0123456789"),
+        ("graph_hash not 16 hex digits", "graph_hash", "not-a-fingerprint"),
         ("unsupported harness_profile", "harness_profile", "fast"),
     ]:
         record(f"protocol: {name}", mutate(row, ["protocol", field], value))
