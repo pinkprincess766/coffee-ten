@@ -155,6 +155,9 @@ fn peak_kind_is_a_number_on_model_and_a_path_on_compare() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../bench/results/2026-10-28-adcf09c-peak.jsonl"
     );
-    assert!(run(&["compare", "--from", run_log, "--peak", peak]).status.success());
+    assert!(
+        run(&["compare", "--from", run_log, "--peak", peak])
+            .status
+            .success()
+    );
 }
-
