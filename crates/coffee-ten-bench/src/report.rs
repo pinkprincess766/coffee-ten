@@ -158,7 +158,10 @@ fn validate_protocol(protocol: &Value) -> Result<(), String> {
 
 /// 16 lowercase hex digits, the persisted form of `source_hash` / `space_hash` / `graph_hash`.
 fn is_fingerprint(value: &str) -> bool {
-    value.len() == 16 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Record metadata that the report does not use but `bench/validate.py` requires, checked
