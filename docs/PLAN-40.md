@@ -11,8 +11,8 @@
 
 ## Статус на 13.11.2026
 
-Все пункты P1–P40 и вставка V1–V5 сделаны отдельными PR; статус — на момент этого PR
-(P37 идёт последним). План — #199.
+Все пункты P1–P40 и вставка V1–V5 сделаны отдельными PR; P1–P36 и P38–P40 слиты,
+P37 — этот PR. План — #199.
 
 | Пункт | PR | Статус | Суть |
 | --- | --- | --- | --- |
@@ -53,14 +53,14 @@
 | P30 | [#229](https://github.com/pinkprincess766/coffee-ten/pull/229) | слит | Позиция ошибки в тексте расписания |
 | P31 | [#230](https://github.com/pinkprincess766/coffee-ten/pull/230) | слит | `space`: ошибки аргументов |
 | P32 | [#231](https://github.com/pinkprincess766/coffee-ten/pull/231) | слит | `model`: `--peak` и `--from` |
-| P33 | [#234](https://github.com/pinkprincess766/coffee-ten/pull/234) | открыт | Пример `--compare` в `docs/reports.md` |
-| P34 | [#235](https://github.com/pinkprincess766/coffee-ten/pull/235) | открыт | Схема раунда и ошибки |
-| P35 | [#236](https://github.com/pinkprincess766/coffee-ten/pull/236) | открыт | Команды в README |
-| P36 | [#237](https://github.com/pinkprincess766/coffee-ten/pull/237) | открыт | `MIN_ROUNDS_FOR_DRIFT` в `docs/protocol.md` |
+| P33 | [#234](https://github.com/pinkprincess766/coffee-ten/pull/234) | слит | Пример `--compare` в `docs/reports.md` |
+| P34 | [#235](https://github.com/pinkprincess766/coffee-ten/pull/235) | слит | Схема раунда и ошибки |
+| P35 | [#236](https://github.com/pinkprincess766/coffee-ten/pull/236) | слит | Команды в README |
+| P36 | [#237](https://github.com/pinkprincess766/coffee-ten/pull/237) | слит | `MIN_ROUNDS_FOR_DRIFT` в `docs/protocol.md` |
 | P37 | этот PR | открыт | Этот статус и бэклог |
 | P38 | [#232](https://github.com/pinkprincess766/coffee-ten/pull/232) | слит | CI: `cargo doc` |
-| P39 | [#238](https://github.com/pinkprincess766/coffee-ten/pull/238) | открыт | CI: golden отчёта N20, отчёт перегенерирован |
-| P40 | [#233](https://github.com/pinkprincess766/coffee-ten/pull/233) | открыт | CI: `compileall` и `bench/tests` |
+| P39 | [#238](https://github.com/pinkprincess766/coffee-ten/pull/238) | слит | CI: golden отчёта N20, отчёт перегенерирован |
+| P40 | [#233](https://github.com/pinkprincess766/coffee-ten/pull/233) | слит | CI: `compileall` и `bench/tests` |
 
 ## Бэклог после плана (каждое — только с «ок» Никиты)
 
@@ -148,7 +148,7 @@ C9 — кэш расписаний; потоки; GP и любые модели 
 - Приёмка: 3 и 9 раундов → `not evaluated`; 10 ровных → `false`; 10 со скачком → `true`; golden обновлён.
 - Ограничения: только отображение; флаг `drift` в JSONL и его проверка не меняются.
 - Сохранённый `bench/results/2026-11-07-n20-v1-n256.report.md` перегенерируется в P39
-  ([#238](https://github.com/pinkprincess766/coffee-ten/pull/238), открыт на момент P37) с «ок» Никиты.
+  ([#238](https://github.com/pinkprincess766/coffee-ten/pull/238), слит) с «ок» Никиты.
 
 ### P3 — JSON/JSONL-ридер (Вера)
 - Цель: закрепить поведение на CRLF, пустых строках, обрезанной последней записи, BOM, склеенных записях.
@@ -377,7 +377,7 @@ C9 — кэш расписаний; потоки; GP и любые модели 
 ### P39 — CI: golden отчёта по реальному логу N20
 - Цель: `report` на `bench/results/2026-11-07-n20-v1-n256.jsonl` совпадает с сохранённым `.report.md`.
 - Приёмка: шаг падает при расхождении.
-- [#238](https://github.com/pinkprincess766/coffee-ten/pull/238) (открыт на момент P37): отчёт перегенерирован
+- [#238](https://github.com/pinkprincess766/coffee-ten/pull/238) (слит): отчёт перегенерирован
   с «ок» Никиты (Drift `false` → `not evaluated` и строка `Showing 10 of 7335 records`),
   шаг в bench-smoke сравнивает его с выводом `report`.
 
