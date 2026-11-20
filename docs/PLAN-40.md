@@ -68,7 +68,7 @@ P37 — этот PR. План — #199.
 
 - Валидатор (#214): формат `source_hash`/`space_hash` (16 строчных hex-цифр) и допустимые значения
   `harness_profile` — `report` проверяет только наличие и тип; касается ключа протокола N2.
-  Сделано (этот PR): `validate.py` и `report` одинаково требуют 16 строчных hex-цифр для
+  Сделано ([#243](https://github.com/pinkprincess766/coffee-ten/pull/243)): `validate.py` и `report` одинаково требуют 16 строчных hex-цифр для
   `graph_hash`/`space_hash`/`source_hash` и `harness_profile` `debug` или `release`.
 - `compile()` глубоких выражений: C вкладывает скобки на каждую операцию, clang отказывает
   глубже 256 (`-fbracket-depth`), хотя билдер (1000 уровней) и lowering (1000 узлов) их
@@ -128,7 +128,7 @@ C9 — кэш расписаний; потоки; GP и любые модели 
 - **V5** — Python API: `numpy.ma.MaskedArray` на входе `run()`/`Kernel` — `TypeError`
   вместо тихого игнорирования маски.
 - Формат `source_hash`/`space_hash` и `harness_profile` (касается ключа протокола) —
-  закрыто в этом PR, см. «Бэклог после плана».
+  закрыто в [#243](https://github.com/pinkprincess766/coffee-ten/pull/243), см. «Бэклог после плана».
 
 ## Пакет 1 — слит (#194–#198)
 
