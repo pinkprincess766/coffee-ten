@@ -125,6 +125,18 @@ fn zero_timings_and_non_finite_rates_name_the_round() {
 }
 
 #[test]
+fn report_rejects_a_round_with_null_gflops() {
+    let good = "{\"round_index\":1,\"elapsed_ns\":8000000,\"iterations\":1000000,\"gflops\":2.0}";
+    let bad = "{\"round_index\":1,\"elapsed_ns\":8000000,\"iterations\":1000000,\"gflops\":null}";
+    let text = LOG.replacen(good, bad, 1);
+    assert_ne!(text, LOG);
+    assert_eq!(
+        error(&text),
+        "report: line 2: round 1 gflops: expected finite number"
+    );
+}
+
+#[test]
 fn rates_at_the_extremes_of_timing_stay_exact() {
     // One iteration over u64::MAX nanoseconds is a tiny but finite, positive rate; the
     // report recomputes it from the timing rather than trusting the stored value.

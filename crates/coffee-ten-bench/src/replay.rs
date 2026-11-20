@@ -869,6 +869,11 @@ mod tests {
         }
     }
     #[test]
+    fn replay_rejects_a_round_with_null_gflops() {
+        let err = error_of(&change_round("gflops", Value::Null));
+        assert_eq!(err, "replay: line 1: round 0 gflops: expected finite number");
+    }
+    #[test]
     fn a_protocol_mismatch_names_the_differing_fields() {
         let text = table();
         // A replay run with other flags than the table's acquisition.
