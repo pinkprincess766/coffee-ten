@@ -78,8 +78,10 @@ P37 — этот PR. План — #199.
 - `--peak` в `model` — число (GFLOP/s), а в `model compare` — путь к файлу с peak-строкой.
 - `curve` не может выполнить «каждая команда из README запускается» вне Мака: replay требует
   точного ключа машины/тулчейна/исходников (#236).
-- `bench/README.md` разрешает `rounds[].gflops` = `null`, а `report`/`replay` его отклоняют
-  (`expected finite number`, #235).
+- `rounds[].gflops` = `null`: `report`/`replay` отклоняют (`expected finite number`, #235).
+  Сделано ([#240](https://github.com/pinkprincess766/coffee-ten/pull/240)): README и схема
+  требуют конечное положительное число; добавлен явный тест отказа `report` и `replay`
+  на `gflops: null`.
 - Граница дрейфа 5 % в плавающей точке: `1.0 → 1.05` помечается, `3.0 → 3.15` — нет
   (#215). Смена порога или арифметики — изменение протокола.
 - Манифест `bench/results/2026-11-07-n20-manifest.json` хранит SHA-256 и размер старого

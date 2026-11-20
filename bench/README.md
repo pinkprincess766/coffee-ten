@@ -89,7 +89,7 @@ search lines have `group`; the files `run.sh` writes have none.
 | `p75` | number or null | GFLOP/s | r[3(n-1)/4] | harness |
 | `min` | number or null | GFLOP/s | r[0], the slowest sample | harness |
 | `drift` | bool | - | median of the first 5 rounds and of the last 5 differ by more than 5% of the first; always `false` below 10 samples | harness |
-| `rounds` | array | mixed | ordered objects: `round_index` (zero-based shared round), `elapsed_ns` (integer nanoseconds), `iterations` (kernel calls), `gflops` (raw rate, number or null); excludes warmup | harness |
+| `rounds` | array | mixed | ordered objects: `round_index` (zero-based shared round), `elapsed_ns` (integer nanoseconds), `iterations` (kernel calls), `gflops` (raw rate, finite positive number; `null` is not allowed); excludes warmup | harness |
 | `protocol` | object | mixed | versioned reproducibility key; fields and compatibility rules in [protocol.md](../docs/protocol.md) | harness |
 | `measurement_ns` | integer | ns | sum of raw round elapsed times, excluding warmup and setup | harness |
 | `compilation_ns` | integer | ns | this variant's successful compiler API call, including cache lookup and library loading | harness |
@@ -109,9 +109,11 @@ search lines have `group`; the files `run.sh` writes have none.
 | `group` | string | - | `search` lines only, always last; which part of the search measured the line (below) | search |
 
 A rate that is NaN or infinite is written as `null`; all other numbers are the shortest text
-that reads back to the same value. The variant text as typed on the command line is not
-logged; `schedule` is its canonical form. Files from before `search` have the same 23 fields
-without `group`.
+that reads back to the same value. For `rounds[].gflops`, `null` is not a valid log value:
+`report`, `replay` and `validate.py` refuse it (`expected finite number`, or
+`expected finite positive rate` in the Python validator). The variant text as typed on the
+command line is not logged; `schedule` is its canonical form. Files from before `search`
+have the same 23 fields without `group`.
 
 New records retain `rounds` in acquisition order. The original aggregate fields use precisely
 these raw `gflops` values with the existing lower-median rule; the common `drift` flag is

@@ -151,5 +151,6 @@ Then the record's own fields must equal what its rounds give, checked in this or
 (`inconsistent measurement cost: measurement_ns <stored>, raw rounds sum to <sum>`) and
 `drift` (`inconsistent drift: stored flag differs from raw rounds`).
 
-`bench/README.md` describes `gflops` as "number or null" on the writer side. The reader does
-not accept `null`: such a round is refused with `expected finite number`.
+`bench/README.md` and this schema agree: `gflops` must be a finite positive number. The
+harness writer would emit `null` for a NaN or infinite rate, but the reader refuses that
+value with `expected finite number`.
