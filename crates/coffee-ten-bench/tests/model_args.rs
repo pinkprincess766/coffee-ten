@@ -29,7 +29,7 @@ fn peak_must_be_a_finite_number_greater_than_zero() {
             &["--n", "8", "--peak", value],
             2,
             &format!(
-                "error: --peak needs a finite number greater than 0, got {value:?}\n{USAGE}\n"
+                "error: --peak needs a finite GFLOP/s number greater than 0, not a path to a peak file, got {value:?}\n{USAGE}\n"
             ),
         );
     }
@@ -109,7 +109,9 @@ fn from_must_name_a_non_empty_file() {
     assert_error(
         &["compare", "--from", run_log, "--peak", ""],
         2,
-        &usage_error("--peak"),
+        &format!(
+            "error: --peak needs a path to a peak file (not a GFLOP/s number), got \"\"\n{USAGE}\n"
+        ),
     );
     assert_error(
         &["compare", "--from", run_log, "--peak", empty],
@@ -117,4 +119,45 @@ fn from_must_name_a_non_empty_file() {
         &empty_file("--peak", empty),
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn peak_kind_is_a_number_on_model_and_a_path_on_compare() {
+    // A path-like value on `model --peak` is already a usage error (exit 2).
+    assert_error(
+        &["--n", "8", "--peak", "bench/results/peak.jsonl"],
+        2,
+        &format!(
+            "error: --peak needs a finite GFLOP/s number greater than 0, not a path to a peak file, got \"bench/results/peak.jsonl\"\n{USAGE}\n"
+        ),
+    );
+    // A number or a missing path on `model compare --peak` is already a data error (exit 1).
+    let run_log = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../bench/results/2026-10-18-4928ffa.jsonl"
+    );
+    for value in ["129.2", "missing-peak-file.jsonl"] {
+        let out = run(&["compare", "--from", run_log, "--peak", value]);
+        assert_eq!(out.status.code(), Some(1), "{value}");
+        assert!(out.stdout.is_empty(), "{value}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            err.starts_with(
+                "error: --peak needs a path to a peak file (not a GFLOP/s number); cannot read "
+            ),
+            "{value}: {err}"
+        );
+        assert!(err.contains(value), "{err}");
+    }
+    // Valid inputs of each kind are unchanged.
+    assert!(run(&["--n", "8", "--peak", "129.2"]).status.success());
+    let peak = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../bench/results/2026-10-28-adcf09c-peak.jsonl"
+    );
+    assert!(
+        run(&["compare", "--from", run_log, "--peak", peak])
+            .status
+            .success()
+    );
 }
