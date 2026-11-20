@@ -143,7 +143,25 @@ fn validate_protocol(protocol: &Value) -> Result<(), String> {
         }
         _ => return Err("unsupported schedule space".into()),
     }
+    for field in ["graph_hash", "space_hash", "source_hash"] {
+        let value = protocol.get(field)?.text()?;
+        if !is_fingerprint(value) {
+            return Err(format!("{field}: expected 16 lowercase hex digits"));
+        }
+    }
+    let profile = protocol.get("harness_profile")?.text()?;
+    if !["debug", "release"].contains(&profile) {
+        return Err("unsupported harness profile".into());
+    }
     Ok(())
+}
+
+/// 16 lowercase hex digits, the persisted form of `source_hash` / `space_hash` / `graph_hash`.
+fn is_fingerprint(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Record metadata that the report does not use but `bench/validate.py` requires, checked
@@ -804,5 +822,47 @@ mod tests {
         };
         cache.insert("l3_bytes".into(), Value::Number("1".into()));
         assert!(validate_protocol(&Value::Object(v2)).is_err());
+    }
+
+    fn with_text_field(field: &str, value: &str) -> Value {
+        let Value::Object(mut fields) = key("v1", None, None) else {
+            unreachable!()
+        };
+        fields.insert(field.into(), Value::String(value.into()));
+        Value::Object(fields)
+    }
+
+    #[test]
+    fn source_hash_must_be_16_lowercase_hex_digits() {
+        assert_eq!(
+            validate_protocol(&with_text_field("source_hash", "0123")).unwrap_err(),
+            "source_hash: expected 16 lowercase hex digits"
+        );
+    }
+
+    #[test]
+    fn space_hash_must_be_16_lowercase_hex_digits() {
+        assert_eq!(
+            validate_protocol(&with_text_field("space_hash", "ABCDEF0123456789")).unwrap_err(),
+            "space_hash: expected 16 lowercase hex digits"
+        );
+    }
+
+    #[test]
+    fn graph_hash_must_be_16_lowercase_hex_digits() {
+        assert_eq!(
+            validate_protocol(&with_text_field("graph_hash", "not-a-fingerprint")).unwrap_err(),
+            "graph_hash: expected 16 lowercase hex digits"
+        );
+    }
+
+    #[test]
+    fn harness_profile_must_be_debug_or_release() {
+        assert_eq!(
+            validate_protocol(&with_text_field("harness_profile", "fast")).unwrap_err(),
+            "unsupported harness profile"
+        );
+        validate_protocol(&with_text_field("harness_profile", "debug")).unwrap();
+        validate_protocol(&with_text_field("harness_profile", "release")).unwrap();
     }
 }
