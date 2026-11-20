@@ -330,6 +330,31 @@ for i in 0..4:
 match: preserving
 ```
 
+Reading saved runs: `report`, `report --compare` and `curve` compile and time nothing. Their
+flags are those of `coffee-ten-bench <command> --help`.
+
+```sh
+# Ranked Markdown tables of one run (docs/reports.md).
+cargo run --release -p coffee-ten-bench -- report \
+  bench/results/2026-11-07-n20-v1-n256.jsonl --top 10 > report.md
+# Best median of run A over run B with a bootstrap interval; both files need the same
+# protocol key (docs/reports.md#comparing-runs-n12). Here: the test fixtures.
+cargo run --release -p coffee-ten-bench -- report --compare \
+  crates/coffee-ten-bench/tests/fixtures/report-b.jsonl \
+  crates/coffee-ten-bench/tests/fixtures/report.jsonl
+# Random-search curves replayed from a complete table, as CSV (docs/replay-curves.md).
+cargo run --release -p coffee-ten-bench -- curve --n 256 --budget 1000 \
+  --samples 5 --min-sample-ms 10 --space v1 --seeds 1,2,3,5 \
+  --replay bench/results/2026-11-07-n20-v1-n256.jsonl > curves.csv
+```
+
+`report` options: `--top <K>` (default 10), `--seed <SEED>` (default 1), `--resamples <B>`
+(default 10000); `report --compare` takes `--paired`, `--seed` and `--resamples`. `curve`
+needs the exact source/profile/machine/toolchain key of the table. The command above is the
+one [docs/n20-mac.md](docs/n20-mac.md) records for the N20 table; it works only with a build
+of the acquisition commit on that machine, and elsewhere stops with an error such as
+`replay: unknown CPU/platform/compiler identity`.
+
 ## Appendix B. Basis
 
 Each section names the idea the code rests on, where it lives and what checks it.

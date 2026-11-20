@@ -57,6 +57,23 @@ the two windows cannot be disjoint, so the check does not run and the stored fla
 false. Thus the default five-round search and quick mode have no drift evidence, not a
 positive finding of stability. No samples are silently dropped or remeasured by this rule.
 
+The constants are in `crates/coffee-ten-bench/src/stats.rs`: `DRIFT_ROUNDS = 5` (the window
+at each end), `DRIFT_LIMIT = 0.05` and `MIN_ROUNDS_FOR_DRIFT = 2 * DRIFT_ROUNDS = 10`;
+`drifted` returns false below `MIN_ROUNDS_FOR_DRIFT`. The JSONL field stays a plain bool, so a
+`false` there does not say whether the check ran; outputs that show it tell the cases apart
+by the number of rounds:
+
+- `report` and `report --compare`: the Drift column reads `not evaluated` below 10 rounds,
+  otherwise `true` or `false` (`drift_cell` in `crates/coffee-ten-bench/src/report.rs`;
+  pinned for 3 and 9 rounds by `crates/coffee-ten-bench/tests/report_drift.rs`).
+- The harness console table: the `drift` column reads `-` below 10 samples, otherwise
+  `no` or `true` (`print_table` in `crates/coffee-ten-bench/src/main.rs`).
+
+Readers do not trust the stored flag: `report` and `replay` recompute it from the raw rounds
+and refuse a record whose flag differs (`inconsistent drift: stored flag differs from raw
+rounds`, `check_aggregates` in `crates/coffee-ten-bench/src/rounds.rs`). In particular a
+stored `true` with fewer than 10 rounds is rejected.
+
 ### Conditions and deviations
 
 `bench/run.sh` normally builds release binaries, records peak once, then runs four variants
