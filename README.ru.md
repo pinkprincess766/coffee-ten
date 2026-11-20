@@ -118,7 +118,9 @@ Python Tensor          crates/coffee-ten-py         трассирует выр�
 векторная итерация (#97, по кодогенерации #96; новой точки нет); см.
 [Model group errors after C4](BENCHMARKS.md#model-group-errors-after-c4-v14v17).
 `coffee-ten-bench model compare --from <results.jsonl>` выводит модель рядом с замерами,
-с ранговой корреляцией Spearman и медианной ошибкой.
+с ранговой корреляцией Spearman и медианной ошибкой. В `model compare` `--peak` — путь
+к файлу со строкой `bench/peak` (если в файле результатов её нет). В самом `model`
+`--peak` — число GFLOP/s, а не путь.
 
 ### 2.4 Измерения
 
@@ -197,7 +199,8 @@ tiled + vec, регистровый тайл 4×16), сессия S3, медиа
 не покрывает; ручной микробенч воспроизводит скорости прогона 4 (#99). Вопрос открыт
 ([прогон 4](BENCHMARKS.md#hypothesis-a-spec-71-run-4-met-c4-out-of-sample-two-of-three-groups)).
 
-Одна команда воспроизводит числа прогона 4 (модель v1.8, строка `bench/peak` P7):
+Одна команда воспроизводит числа прогона 4 (модель v1.8, строка `bench/peak` P7).
+`--peak` здесь — путь к этому файлу:
 
 ```sh
 cargo run --release -p coffee-ten-bench -- model compare \

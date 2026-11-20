@@ -111,7 +111,9 @@ column reload (#90, `fma_col_reload`), unrolled column load (#93, #94, `fma_col_
 and a short vectorized loop as one vector iteration (#97, after the codegen of #96; no new
 point); see [Model group errors after C4](BENCHMARKS.md#model-group-errors-after-c4-v14v17).
 `coffee-ten-bench model compare --from <results.jsonl>` prints the model against
-measurements, with Spearman rank correlation and median error.
+measurements, with Spearman rank correlation and median error. On `model compare`,
+`--peak` is a path to a file with a `bench/peak` line (used when the results file has
+none). On `model` itself, `--peak` is a GFLOP/s number, not a path.
 
 ### 2.4 Measurement
 
@@ -185,7 +187,8 @@ reload of v1.6 in vector code, which the model does not cover; a hand microbench
 reproduces run 4's rates (#99). Open
 ([run 4](BENCHMARKS.md#hypothesis-a-spec-71-run-4-met-c4-out-of-sample-two-of-three-groups)).
 
-One command reproduces the run 4 numbers (model v1.8, P7 `bench/peak` line):
+One command reproduces the run 4 numbers (model v1.8, P7 `bench/peak` line).
+`--peak` here is a path to that file:
 
 ```sh
 cargo run --release -p coffee-ten-bench -- model compare \

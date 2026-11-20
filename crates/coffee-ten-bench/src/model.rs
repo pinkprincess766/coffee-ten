@@ -1124,10 +1124,12 @@ pub fn rank_matmul(machine: &Machine, n: usize) -> Result<Vec<Ranked>, BenchErro
 }
 
 pub const USAGE: &str = "usage: coffee-ten-bench model --n <N> [--from <results.jsonl>] [--peak <GFLOPS>] \
-     [--mem-gbs <GBS>] [--l2-gbs <GBS>]  (flags after --from override it)\n       \
+     [--mem-gbs <GBS>] [--l2-gbs <GBS>]  (flags after --from override it; --peak is a GFLOP/s \
+     number, not a file path)\n       \
      coffee-ten-bench model compare --from <results.jsonl> [--peak <peak.jsonl>] [--group <name>]\n       \
-       compare: --peak takes the machine from that file's peak line (for results files without \
-     one); --group keeps only records whose \"group\" field equals <name> (e.g. random)";
+       compare: --peak is a path to a file with a peak line, not a GFLOP/s number, and takes \
+     the machine from that line (for results files without one); --group keeps only records \
+     whose \"group\" field equals <name> (e.g. random)";
 
 /// Read a numeric field without depending on JSON spacing or key order.
 fn number_after(line: &str, key: &str) -> Option<f64> {
@@ -1340,12 +1342,24 @@ fn from_note(
 /// with nothing but whitespace is refused here, so the error names the file.
 fn read_results(flag: &str, path: &str) -> Result<String, BenchError> {
     if path.is_empty() {
+        let expected = if flag == "--peak" {
+            "a path to a peak file (not a GFLOP/s number)"
+        } else {
+            "a file path"
+        };
         return Err(BenchError::Usage(format!(
-            "{flag} needs a file path, got \"\"\n{USAGE}"
+            "{flag} needs {expected}, got \"\"\n{USAGE}"
         )));
     }
-    let text =
-        std::fs::read_to_string(path).map_err(|e| model_err(format!("cannot read {path}: {e}")))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        if flag == "--peak" {
+            model_err(format!(
+                "--peak needs a path to a peak file (not a GFLOP/s number); cannot read {path}: {e}"
+            ))
+        } else {
+            model_err(format!("cannot read {path}: {e}"))
+        }
+    })?;
     if text.trim().is_empty() {
         return Err(model_err(format!(
             "{flag} {path}: the file is empty, so it has no peak line and no records"
@@ -1393,7 +1407,17 @@ pub fn parse_model_args<I: IntoIterator<Item = String>>(
                     chain_measured(&text),
                 );
             }
-            "--peak" => machine.peak_gflops = speed()?,
+            "--peak" => {
+                // Same acceptance rule as `speed`, with a message that names the expected kind.
+                machine.peak_gflops = match value.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => v,
+                    _ => {
+                        return Err(usage(format!(
+                            "--peak needs a finite GFLOP/s number greater than 0, not a path to a peak file, got {value:?}"
+                        )));
+                    }
+                };
+            }
             "--mem-gbs" => machine.mem_gbs = speed()?,
             "--l2-gbs" => machine.l2_gbs = speed()?,
             _ => return Err(usage(format!("unknown argument {flag}"))),
