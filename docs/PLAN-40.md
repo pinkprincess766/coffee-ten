@@ -11,8 +11,7 @@
 
 ## Статус на 13.11.2026
 
-Все пункты P1–P40 и вставка V1–V5 сделаны отдельными PR; P1–P36 и P38–P40 слиты,
-P37 — этот PR. План — #199.
+Все пункты P1–P40 и вставка V1–V5 сделаны отдельными PR и слиты. План — #199.
 
 | Пункт | PR | Статус | Суть |
 | --- | --- | --- | --- |
@@ -57,7 +56,7 @@ P37 — этот PR. План — #199.
 | P34 | [#235](https://github.com/pinkprincess766/coffee-ten/pull/235) | слит | Схема раунда и ошибки |
 | P35 | [#236](https://github.com/pinkprincess766/coffee-ten/pull/236) | слит | Команды в README |
 | P36 | [#237](https://github.com/pinkprincess766/coffee-ten/pull/237) | слит | `MIN_ROUNDS_FOR_DRIFT` в `docs/protocol.md` |
-| P37 | этот PR | открыт | Этот статус и бэклог |
+| P37 | [#239](https://github.com/pinkprincess766/coffee-ten/pull/239) | слит | Этот статус и бэклог |
 | P38 | [#232](https://github.com/pinkprincess766/coffee-ten/pull/232) | слит | CI: `cargo doc` |
 | P39 | [#238](https://github.com/pinkprincess766/coffee-ten/pull/238) | слит | CI: golden отчёта N20, отчёт перегенерирован |
 | P40 | [#233](https://github.com/pinkprincess766/coffee-ten/pull/233) | слит | CI: `compileall` и `bench/tests` |
@@ -84,6 +83,9 @@ P37 — этот PR. План — #199.
   Сделано ([#240](https://github.com/pinkprincess766/coffee-ten/pull/240)): README и схема
   требуют конечное положительное число; добавлен явный тест отказа `report` и `replay`
   на `gflops: null`.
+- Если раунд даёт NaN/inf, харнесс пишет `rounds[].gflops` как `null`, и `report`/`replay`
+  такую запись отклоняют. Это намеренно: сломанный замер сообщается, а не проглатывается;
+  оставляем как есть.
 - Граница дрейфа 5 % в плавающей точке: `1.0 → 1.05` помечается, `3.0 → 3.15` — нет
   (#215). Смена порога или арифметики — изменение протокола.
 - Манифест `bench/results/2026-11-07-n20-manifest.json` хранит SHA-256 и размер старого
